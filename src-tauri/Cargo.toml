@@ -1,0 +1,31 @@
+[package]
+name = "codex-provider-switcher-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_provider_switcher_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "codex-provider-switcher"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+codex-provider-switcher-core = { path = "../crates/switcher-core" }
+codex-provider-switcher-credentials = { path = "../crates/credential-store" }
+codex-provider-switcher-launcher = { path = "../crates/platform-launcher" }
+directories.workspace = true
+fs4.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { version = "2.11.5", features = [] }
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zeroize.workspace = true

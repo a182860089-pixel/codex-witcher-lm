@@ -1,0 +1,437 @@
+#[cfg(target_os = "macos")]
+pub fn open_codex() -> Result<String, String> {
+    let mut bundles = discover_signed_codex_bundles()?;
+    if bundles.len() != 1 {
+        return Err(
+            "expected exactly one OpenAI-signed com.openai.codex application bundle".to_string(),
+        );
+    }
+    let bundle = bundles.pop().expect("bundle count was checked");
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(&bundle)
+        .status()
+        .map_err(|_| "could not invoke macOS Launch Services".to_string())?;
+    if !status.success() {
+        return Err("the official Codex application could not be opened".to_string());
+    }
+    Ok("signed-bundle:com.openai.codex@2DC432GLL2".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn discover_signed_codex_bundles() -> Result<Vec<std::path::PathBuf>, String> {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    const MAX_MDFIND_BYTES: usize = 1024 * 1024;
+    let mut candidates = vec![
+        PathBuf::from("/Applications/ChatGPT.app"),
+        PathBuf::from("/Applications/Codex.app"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(&home).join("Applications/ChatGPT.app"));
+        candidates.push(PathBuf::from(home).join("Applications/Codex.app"));
+    }
+
+    let spotlight = Command::new("/usr/bin/mdfind")
+        .arg("kMDItemCFBundleIdentifier == \"com.openai.codex\"")
+        .output()
+        .map_err(|_| "could not query macOS application registration".to_string())?;
+    if !spotlight.status.success() || spotlight.stdout.len() > MAX_MDFIND_BYTES {
+        return Err("macOS application registration query failed".to_string());
+    }
+    let discovered = std::str::from_utf8(&spotlight.stdout)
+        .map_err(|_| "macOS application registration returned invalid text".to_string())?;
+    candidates.extend(
+        discovered
+            .lines()
+            .filter(|line| !line.is_empty())
+            .take(65)
+            .map(PathBuf::from),
+    );
+    if discovered.lines().filter(|line| !line.is_empty()).count() > 64 {
+        return Err("too many Codex bundle candidates were registered".to_string());
+    }
+
+    let mut verified = BTreeSet::new();
+    for candidate in candidates {
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if canonical.extension().and_then(|value| value.to_str()) != Some("app")
+            || !canonical.join("Contents/Info.plist").is_file()
+            || !bundle_identifier_matches(&canonical)
+            || !bundle_signature_matches(&canonical)
+        {
+            continue;
+        }
+        verified.insert(canonical);
+    }
+    Ok(verified.into_iter().collect())
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_identifier_matches(bundle: &std::path::Path) -> bool {
+    std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+        .arg(bundle.join("Contents/Info.plist"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|value| value.trim() == "com.openai.codex")
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_signature_matches(bundle: &std::path::Path) -> bool {
+    code_signature_matches(bundle, true)
+}
+
+#[cfg(target_os = "macos")]
+fn code_signature_matches(path: &std::path::Path, deep: bool) -> bool {
+    const TEAM_ID: &str = "2DC432GLL2";
+    const REQUIREMENT: &str =
+        "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\"";
+    let mut verify = std::process::Command::new("/usr/bin/codesign");
+    verify.arg("--verify");
+    if deep {
+        verify.arg("--deep");
+    }
+    let verified = verify
+        .args(["--strict", "--test-requirement"])
+        .arg(format!("={REQUIREMENT}"))
+        .arg(path)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !verified {
+        return false;
+    }
+    let Ok(details) = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(path)
+        .output()
+    else {
+        return false;
+    };
+    details.status.success()
+        && String::from_utf8(details.stderr)
+            .ok()
+            .is_some_and(|stderr| {
+                stderr
+                    .lines()
+                    .any(|line| line.trim() == format!("TeamIdentifier={TEAM_ID}"))
+            })
+}
+
+#[cfg(target_os = "macos")]
+pub fn authorize_codex_parent() -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    unsafe extern "C" {
+        fn proc_pidpath(pid: libc::c_int, buffer: *mut c_void, buffer_size: u32) -> libc::c_int;
+    }
+
+    let parent_pid = unsafe { libc::getppid() };
+    if parent_pid <= 1 {
+        return Err("credential helper caller identity is unavailable".to_string());
+    }
+    let mut buffer = vec![0_u8; 4096];
+    let length = unsafe {
+        proc_pidpath(
+            parent_pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return Err("credential helper caller identity is unavailable".to_string());
+    }
+    buffer.truncate(length as usize);
+    if let Some(nul) = buffer.iter().position(|byte| *byte == 0) {
+        buffer.truncate(nul);
+    }
+    let executable = PathBuf::from(std::ffi::OsString::from_vec(buffer))
+        .canonicalize()
+        .map_err(|_| "credential helper caller path is unavailable".to_string())?;
+    let bundle = executable
+        .ancestors()
+        .find(|path| {
+            path.extension().and_then(|value| value.to_str()) == Some("app")
+                && bundle_identifier_matches(path)
+        })
+        .ok_or_else(|| "credential helper caller is not the Codex app".to_string())?;
+    if !bundle_signature_matches(bundle) || !code_signature_matches(&executable, false) {
+        return Err("credential helper caller signature is not trusted".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn open_codex() -> Result<String, String> {
+    with_windows_runtime(open_codex_windows)
+}
+
+#[cfg(windows)]
+fn open_codex_windows() -> Result<String, String> {
+    use windows::ApplicationModel::PackageSignatureKind;
+    use windows::Management::Deployment::PackageManager;
+    use windows::core::HSTRING;
+
+    let manager =
+        PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
+    let packages = manager
+        .FindPackagesByUserSecurityId(&HSTRING::new())
+        .map_err(|_| "Windows package discovery failed".to_string())?;
+    let mut candidates = Vec::new();
+    for package in packages {
+        let id = package
+            .Id()
+            .map_err(|_| "Windows package identity could not be read".to_string())?;
+        if id
+            .Name()
+            .map_err(|_| "Windows package identity could not be read".to_string())?
+            .to_string()
+            != "OpenAI.Codex"
+        {
+            continue;
+        }
+        if package
+            .IsResourcePackage()
+            .map_err(|_| "Windows package identity could not be read".to_string())?
+            || package
+                .IsDevelopmentMode()
+                .map_err(|_| "Windows package identity could not be read".to_string())?
+            || package
+                .SignatureKind()
+                .map_err(|_| "Windows package identity could not be read".to_string())?
+                != PackageSignatureKind::Store
+            || !package
+                .Status()
+                .and_then(|status| status.VerifyIsOK())
+                .map_err(|_| "Windows package status could not be read".to_string())?
+        {
+            continue;
+        }
+        candidates.push(package);
+    }
+    if candidates.len() != 1 {
+        return Err(
+            "expected exactly one registered official OpenAI.Codex Store package".to_string(),
+        );
+    }
+
+    let package = candidates.pop().expect("candidate count was checked");
+    let family_name = package
+        .Id()
+        .and_then(|id| id.FamilyName())
+        .map_err(|_| "Windows package family identity could not be read".to_string())?
+        .to_string();
+    let entries = package
+        .GetAppListEntriesAsync()
+        .and_then(|operation| operation.join())
+        .map_err(|_| "Codex application registration could not be read".to_string())?;
+    let mut launchable = Vec::new();
+    for entry in entries {
+        let app_user_model_id = entry
+            .AppUserModelId()
+            .map_err(|_| "Codex application identity could not be read".to_string())?
+            .to_string();
+        if valid_app_user_model_id(&app_user_model_id)
+            && app_user_model_id.starts_with(&format!("{family_name}!"))
+        {
+            launchable.push(entry);
+        }
+    }
+    if launchable.len() != 1 {
+        return Err(
+            "expected exactly one launchable application in the OpenAI.Codex package".to_string(),
+        );
+    }
+    let launched = launchable
+        .pop()
+        .expect("launchable count was checked")
+        .LaunchAsync()
+        .and_then(|operation| operation.join())
+        .map_err(|_| "Windows could not activate Codex".to_string())?;
+    if !launched {
+        return Err("Windows declined to activate Codex".to_string());
+    }
+    Ok(format!("store-package:{family_name}"))
+}
+
+#[cfg(windows)]
+pub fn authorize_codex_parent() -> Result<(), String> {
+    with_windows_runtime(authorize_codex_parent_windows)
+}
+
+#[cfg(windows)]
+fn authorize_codex_parent_windows() -> Result<(), String> {
+    use std::mem;
+
+    use windows::ApplicationModel::PackageSignatureKind;
+    use windows::Management::Deployment::PackageManager;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::CreateToolhelp32Snapshot;
+    use windows::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W;
+    use windows::Win32::System::Diagnostics::ToolHelp::Process32FirstW;
+    use windows::Win32::System::Diagnostics::ToolHelp::Process32NextW;
+    use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPPROCESS;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::System::Threading::OpenProcess;
+    use windows::Win32::System::Threading::PROCESS_NAME_WIN32;
+    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    use windows::Win32::System::Threading::QueryFullProcessImageNameW;
+    use windows::core::HSTRING;
+    use windows::core::PWSTR;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|_| "credential helper caller identity is unavailable".to_string())?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut parent_pid = None;
+    let current_pid = unsafe { GetCurrentProcessId() };
+    let first = unsafe { Process32FirstW(snapshot, &mut entry) };
+    if first.is_ok() {
+        loop {
+            if entry.th32ProcessID == current_pid {
+                parent_pid = Some(entry.th32ParentProcessID);
+                break;
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    let parent_pid = parent_pid
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "credential helper caller identity is unavailable".to_string())?;
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) }
+        .map_err(|_| "credential helper caller identity is unavailable".to_string())?;
+    let mut path_buffer = vec![0_u16; 32_768];
+    let mut path_length = path_buffer.len() as u32;
+    let path_result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(path_buffer.as_mut_ptr()),
+            &mut path_length,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    path_result.map_err(|_| "credential helper caller path is unavailable".to_string())?;
+    path_buffer.truncate(path_length as usize);
+    let parent_path = String::from_utf16(&path_buffer)
+        .map_err(|_| "credential helper caller path is unavailable".to_string())?;
+
+    let manager =
+        PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
+    let packages = manager
+        .FindPackagesByUserSecurityId(&HSTRING::new())
+        .map_err(|_| "Windows package discovery failed".to_string())?;
+    let mut matching_packages = 0_usize;
+    for package in packages {
+        let is_official = package
+            .Id()
+            .and_then(|id| id.Name())
+            .is_ok_and(|name| name == "OpenAI.Codex")
+            && package.IsResourcePackage().is_ok_and(|value| !value)
+            && package.IsDevelopmentMode().is_ok_and(|value| !value)
+            && package
+                .SignatureKind()
+                .is_ok_and(|kind| kind == PackageSignatureKind::Store)
+            && package
+                .Status()
+                .and_then(|status| status.VerifyIsOK())
+                .is_ok_and(|value| value);
+        if !is_official {
+            continue;
+        }
+        let Ok(installed_path) = package.InstalledPath() else {
+            continue;
+        };
+        if path_is_within_case_insensitive(&parent_path, &installed_path.to_string()) {
+            matching_packages += 1;
+        }
+    }
+    if matching_packages != 1 {
+        return Err("credential helper caller is not the official Codex Store package".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn with_windows_runtime<T: Send + 'static>(
+    operation: fn() -> Result<T, String>,
+) -> Result<T, String> {
+    std::thread::spawn(move || {
+        use windows::Win32::System::WinRT::RO_INIT_MULTITHREADED;
+        use windows::Win32::System::WinRT::RoInitialize;
+        use windows::Win32::System::WinRT::RoUninitialize;
+
+        struct RuntimeGuard;
+        impl Drop for RuntimeGuard {
+            fn drop(&mut self) {
+                unsafe { RoUninitialize() };
+            }
+        }
+
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
+            .map_err(|_| "Windows Runtime initialization failed".to_string())?;
+        let _guard = RuntimeGuard;
+        operation()
+    })
+    .join()
+    .map_err(|_| "Windows Runtime worker failed".to_string())?
+}
+
+#[cfg(windows)]
+fn path_is_within_case_insensitive(child: &str, parent: &str) -> bool {
+    let child = child.replace('/', "\\");
+    let parent = parent.trim_end_matches(['\\', '/']).replace('/', "\\");
+    child
+        .get(..parent.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&parent))
+        && child.as_bytes().get(parent.len()) == Some(&b'\\')
+}
+
+#[cfg(windows)]
+fn valid_app_user_model_id(value: &str) -> bool {
+    let Some((family, app)) = value.split_once('!') else {
+        return false;
+    };
+    !family.is_empty()
+        && family.len() <= 128
+        && !app.is_empty()
+        && app.len() <= 64
+        && family
+            .bytes()
+            .chain(app.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn open_codex() -> Result<String, String> {
+    Err("opening Codex is supported only on macOS and Windows".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn authorize_codex_parent() -> Result<(), String> {
+    Err("credential helper caller verification is supported only on macOS and Windows".to_string())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn validates_app_user_model_ids() {
+        assert!(valid_app_user_model_id("OpenAI.Codex_test!App"));
+        assert!(!valid_app_user_model_id("OpenAI.Codex test!App"));
+        assert!(!valid_app_user_model_id("OpenAI.Codex_test"));
+    }
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Codex Provider Switcher">
+  <rect width="512" height="512" rx="112" fill="#18201d"/>
+  <path d="M122 178h268M122 334h268" fill="none" stroke="#f3f0e6" stroke-width="44" stroke-linecap="round"/>
+  <circle cx="202" cy="178" r="66" fill="#dd5a32" stroke="#18201d" stroke-width="20"/>
+  <circle cx="326" cy="334" r="66" fill="#f3f0e6" stroke="#18201d" stroke-width="20"/>
+  <circle cx="326" cy="334" r="26" fill="#314a3b"/>
+</svg>

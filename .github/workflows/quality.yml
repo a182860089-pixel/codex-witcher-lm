@@ -1,0 +1,57 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Enable pinned pnpm
+        run: corepack enable && corepack prepare pnpm@10.32.0 --activate
+      - name: Install web dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check web and runtime
+        run: pnpm check && pnpm test && pnpm web:build
+      - name: Install stable Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+      - name: Check Rust core
+        run: cargo fmt --all -- --check && cargo test -p codex-provider-switcher-core -p codex-provider-switcher-credentials -p codex-provider-switcher-launcher
+
+  native-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Enable pinned pnpm
+        run: corepack enable && corepack prepare pnpm@10.32.0 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install stable Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Test native boundaries
+        run: cargo test -p codex-provider-switcher-core -p codex-provider-switcher-credentials -p codex-provider-switcher-launcher
+      - name: Build native desktop package
+        run: pnpm tauri build
+      - name: Smoke-test macOS DMG install and removal
+        if: startsWith(matrix.os, 'macos-')
+        run: bash ci/smoke-package-macos.sh
+      - name: Smoke-test Windows NSIS install and uninstall
+        if: startsWith(matrix.os, 'windows-')
+        shell: pwsh
+        run: ./ci/smoke-package-windows.ps1
