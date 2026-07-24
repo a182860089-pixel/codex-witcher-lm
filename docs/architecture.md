@@ -23,9 +23,16 @@ Rust application boundary
         +-- native Keychain / Credential Manager
         +-- config + internal-state transaction
         +-- exact backup / conflict-aware restore
+        +-- tray + background-login lifecycle
+        |
+        +-- atomic active Route
+        |        |
+        |        `-- authenticated http://127.0.0.1:15722/v1
+        |                 `-- selected HTTPS Responses provider
         |
         +-- ~/.codex/config.toml
         +-- ~/.codex/provider-switcher/profiles.json
+        +-- ~/.codex/provider-switcher/proxy.json
         `-- ~/.codex/provider-switcher/models.json
 ```
 
@@ -33,7 +40,9 @@ On launch, `inspect_state` resolves `CODEX_HOME`, reads `config.toml`, and
 reports the active provider name and ID, model, Base URL, and credential kind.
 It does not return an inline token or resolve a provider's environment
 variable. The renderer cannot choose filesystem targets or submit rendered
-TOML.
+TOML. `proxy_status` separately reads the keyless proxy state and starts the
+loopback listener when fast switching was previously enabled. Background login
+startup uses the same path without showing the main window.
 
 ## Connection and discovery flow
 
@@ -59,7 +68,8 @@ The HTTP client uses system proxy settings, follows no redirects, permits
 remote HTTPS and loopback HTTP only, and enforces an eight-second connection
 timeout, a 15-second request timeout, and a 2 MiB response limit. A model-list
 response is UI discovery data, not a Codex rich model catalog. The app writes
-only the model IDs explicitly selected by the user.
+only the model IDs explicitly selected by the user. This upstream discovery
+shape is separate from the rich Codex catalog served later by the local proxy.
 
 The API Key is cleared from the WebView after discovery. A zeroizing Rust vault
 holds it until save, cancel, eviction, or expiry. The vault allows at most
@@ -74,20 +84,97 @@ The store accepts at most 64 profiles and is serialized under an exclusive
 lock with a private atomic write.
 
 Each saved connection card has its own model picker. Switching reloads the
-saved profile server-side and passes its selected model through the same
-validation and transaction path as first-time save-and-switch. Removing a
-shortcut removes only the `profiles.json` entry; it does not silently alter the
-current Codex configuration or delete an endpoint credential.
+saved profile server-side and validates that the selected model still belongs
+to it. In the default local-proxy mode, a running proxy swaps the complete
+immutable route without rewriting Codex configuration. In direct mode, the
+choice passes through the original configuration transaction.
+
+Removing a shortcut removes only the `profiles.json` entry; it does not
+silently alter the current Codex configuration or delete an endpoint
+credential. The UI must not remove the route currently used by an enabled
+proxy.
+
+## Local proxy data plane
+
+Fast switching uses a managed provider named `cps-local` at
+`http://127.0.0.1:15722/v1`. The host, scheme, path, and fixed port are
+validated; `localhost`, IPv6 loopback, and remote listeners are not accepted.
+The listener exposes:
+
+- authenticated `POST /responses` and `/v1/responses`
+- authenticated `POST /responses/compact` and `/v1/responses/compact`
+- authenticated `GET /models`, `/v1/models`, and `/health`
+
+The entry bearer is a random 32-byte value encoded for header use and stored in
+the OS credential manager under a loopback endpoint fingerprint. Codex obtains
+that entry bearer through the stable command helper. It is distinct from every
+upstream provider key.
+
+For each request, the proxy validates exactly one entry bearer by comparing
+SHA-256 digests in constant time. It removes the client authorization,
+credential-like, forwarding, and hop-by-hop headers, including header names
+declared by `Connection`; it then injects the selected upstream bearer. The
+request body must be a bounded JSON object, and its `model` field is replaced
+with the active route's selected model.
+
+The active Route contains the provider Base URL, upstream bearer, selected
+model, and checked model metadata. It is immutable and replaced atomically.
+When both identifiers are available, requests with the same `thread_id` and
+`turn_id` use one pinned Route across Responses and compaction even if the user
+switches meanwhile. A later turn resolves the then-active Route. The bounded
+pin table evicts old entries; callers may explicitly release a completed turn.
+
+The upstream client accepts HTTPS plus loopback HTTP, follows no redirects, and
+uses a retry policy that never replays a request automatically. Response status
+and safe headers are preserved, while hop-by-hop response headers and
+`Set-Cookie` are removed. Response bodies, including SSE, are forwarded as byte
+streams rather than buffered to completion.
+
+The local `/models` response is generated from the checked models on the active
+Route and includes an ETag. It is a wire response, not a
+`model_catalog_json` file. `/health` returns only listener, route summary,
+pin-count, and request counters; neither endpoint returns credentials or the
+upstream URL.
+
+`proxy.json` schema v2 persists only enabled state, selected profile/model IDs,
+fixed port, revision, restart notice, and a credential-free
+`activationTransactionId`. A new activation preallocates this non-nil UUID
+before applying configuration; hot Route changes preserve it and disabled
+state clears it. Enabling fast switching also enables background login startup.
+Closing the window hides it in the tray; quitting is blocked while the proxy
+remains enabled. Windows writes the current-user `Run` entry as an exactly
+quoted executable path plus `--background`, records `StartupApproved`, and
+reads both values back before reporting success; disable removes both values
+idempotently. macOS uses its LaunchAgent integration. Disabling resolves
+`backups/<activationTransactionId>/manifest.json` and restores only that
+validated Applied `cps-local` activation with matching paths and transaction
+identity. Unchanged config and catalog files are restored exactly. If their
+whole-file hashes differ only because unrelated valid TOML changed, disable
+revalidates the managed loopback binding and helper, journals `Detaching`, and
+restores only `model_provider`, `model`, and
+`model_providers.cps-local` from the original config while preserving unrelated
+edits. A changed managed field, malformed TOML, missing backup, or mismatched
+recovery point fails closed for manual review. The backup manifest remains
+schema v1.
 
 ## Native configuration layer
 
-The manager writes only documented Codex settings:
+Direct mode writes only the selected upstream provider's documented Codex
+settings:
 
 - `model_provider`
 - `model`
 - `model_providers.<id>` with `wire_api = "responses"`
 - `model_providers.<id>.auth` pointing back to this signed executable's
   `credential get <endpoint-fingerprint>` mode
+
+On the first local-proxy enable, the same transaction instead writes
+`model_provider = "cps-local"`, the chosen model, `wire_api = "responses"`,
+`supports_websockets = false`, the strict loopback Base URL, and a helper
+account bound to the proxy entry token. It does not put the upstream Base URL or
+upstream key in Codex configuration. If Codex was not already using that exact
+managed provider, the UI requires a full Codex restart. Once active, later
+Route changes take effect on the next turn without another config edit.
 
 The manager does not add `model_catalog_json`. If the user's configuration
 already has a `model_catalog_json` value, `toml_edit` preserves it unchanged.
@@ -98,6 +185,10 @@ catalog pointer.
 The auth argument is an `endpoint-v1-...` fingerprint over the provider ID and
 normalized base URL. Reusing a provider ID with a different endpoint therefore
 requires a new Keychain/Credential Manager authorization.
+
+The local proxy uses a separate `proxy-client-v1-...` account derived from the
+strict loopback URL. The helper verifies that this account is bound to exactly
+one managed `cps-local` provider table before returning its token.
 
 On apply, the app installs a content-addressed copy of its command helper under
 `$CODEX_HOME/provider-switcher/helpers/<sha256>/`. Configuration points to that
@@ -128,11 +219,14 @@ The configuration transaction follows this sequence:
 6. Replace internal model state and configuration, then mark the manifest
    `Applied`.
 
-Restore first verifies both applied hashes. It refuses to overwrite any edit
-made after the switch. It journals `Restoring` before the first target change,
-so startup recovery can finish an interrupted restore. Existing files are
-restored byte-for-byte after their backup hashes pass; transaction-created
-files are removed.
+Restore first verifies both applied hashes. Exact restore journals `Restoring`
+before the first target change, so startup recovery can finish an interrupted
+restore. Existing files are restored byte-for-byte after their backup hashes
+pass; transaction-created files are removed. Local-proxy disable has a narrower
+conflict fallback: after revalidating every Switcher-owned proxy field, it
+journals `Detaching` and compare-and-swap replaces only those owned fields with
+their original values. It does not rewrite the internal catalog in that
+fallback because Codex never points at it.
 
 Windows uses `ReplaceFileW` for existing files without the ACL/merge-ignore
 flags; new-file moves use `MOVEFILE_WRITE_THROUGH`. Unix replacements preserve
@@ -140,6 +234,18 @@ mode bits. Portable filesystem APIs still leave a very small interval between
 the last content check and replacement/removal, so absolute no-overwrite under
 an uncooperative concurrent writer remains a release blocker rather than an
 MVP guarantee.
+
+The first proxy enable preallocates its transaction UUID, starts and validates
+the listener, enables background startup, persists schema-v2 keyless state with
+that UUID, then applies the config plan under the same backup directory.
+Failure rolls the runtime and state back toward the previous selection. If the
+files were fully applied but the manifest stayed `Prepared`, exact startup
+recovery finalizes it as `Applied`; known partial states roll back and unknown
+states fail closed. A hot Route change updates `proxy.json`; if that write
+fails, the previous Route is restored or the listener is stopped. Disabling
+uses only the recorded activation. It preserves unrelated valid config edits,
+but reports managed-field or unreadable-state conflicts instead of silently
+replacing them.
 
 ## Desktop compatibility layer
 
@@ -158,6 +264,10 @@ Statsig, React Fiber, or a global module loader.
 enabled only after a specific Desktop version, signature/package identity,
 bridge contract, and rollback test are reviewed. Unknown builds remain in safe
 mode, so the current release never injects into Codex Desktop.
+
+The local proxy is independent of this CDP layer. It uses documented provider
+configuration and the Responses wire API; it does not expose or patch the
+Desktop renderer.
 
 ## CDP supervisor boundary
 

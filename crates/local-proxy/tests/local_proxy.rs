@@ -1,0 +1,543 @@
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::State;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, LOCATION};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use codex_provider_switcher_local_proxy::{
+    BearerToken, CodexModelsResponse, LocalProxy, ModelDescriptor, ProxyHandle, ProxyHealth,
+    ProxyStartOptions, RouteConfig,
+};
+use futures_util::{StreamExt, stream};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout};
+
+const ENTRY_TOKEN: &str = "entry-token-for-integration-tests";
+const UPSTREAM_TOKEN: &str = "upstream-token-for-integration-tests";
+
+struct TestServer {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl TestServer {
+    async fn spawn(app: Router) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test upstream");
+        let addr = listener.local_addr().expect("test upstream address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test upstream server");
+        });
+        Self { addr, task }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}/v1", self.addr)
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedRequest {
+    path: String,
+    headers: HeaderMap,
+    body: Value,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    requests: Mutex<Vec<CapturedRequest>>,
+}
+
+impl CaptureState {
+    fn requests(&self) -> Vec<CapturedRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+async fn capture_provider(
+    State(state): State<Arc<CaptureState>>,
+    request: Request<Body>,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let body = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .expect("read captured body");
+    let body = serde_json::from_slice(&body).expect("captured JSON body");
+    state
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(CapturedRequest {
+            path,
+            headers,
+            body,
+        });
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        Json(json!({"ok": true})),
+    )
+        .into_response()
+}
+
+fn bearer(value: &str) -> BearerToken {
+    BearerToken::new(value).expect("valid test bearer")
+}
+
+fn model(slug: &str) -> ModelDescriptor {
+    ModelDescriptor::new(slug, format!("Display {slug}"))
+}
+
+fn route(
+    server: &TestServer,
+    route_id: &str,
+    selected_model: &str,
+    models: Vec<ModelDescriptor>,
+) -> RouteConfig {
+    RouteConfig::new(
+        route_id,
+        server.base_url(),
+        selected_model,
+        models,
+        bearer(UPSTREAM_TOKEN),
+    )
+    .expect("valid local upstream route")
+}
+
+async fn proxy_with_route(route: RouteConfig) -> ProxyHandle {
+    let proxy = LocalProxy::start(ProxyStartOptions::default(), bearer(ENTRY_TOKEN))
+        .await
+        .expect("start local proxy");
+    proxy.set_active_route(route);
+    proxy
+}
+
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .expect("test client")
+}
+
+#[tokio::test]
+async fn authenticates_sanitizes_overwrites_and_exposes_health_and_models() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .route("/v1/responses/compact", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-a",
+        "model-a",
+        vec![model("model-a"), model("model-b")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let unauthorized = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .json(&json!({"model": "client-model"}))
+        .send()
+        .await
+        .expect("unauthorized response");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert!(capture.requests().is_empty());
+
+    let response = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("cookie", "client-cookie=private")
+        .header("x-api-key", "client-sensitive-key")
+        .header("connection", "x-remove")
+        .header("x-remove", "hop-by-hop")
+        .header("x-preserved", "preserved")
+        .header("thread-id", "thread-a")
+        .json(&json!({
+            "model": "client-model",
+            "input": "hello",
+            "client_metadata": {"turn_id": "turn-a"}
+        }))
+        .send()
+        .await
+        .expect("proxied response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("x-models-etag"));
+
+    let compact = client
+        .post(format!("{}/v1/responses/compact", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "thread-a")
+        .json(&json!({
+            "model": "another-client-model",
+            "input": [],
+            "client_metadata": {"turn_id": "turn-a"}
+        }))
+        .send()
+        .await
+        .expect("proxied compact response");
+    assert_eq!(compact.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/v1/responses/compact");
+    for request in &requests {
+        assert_eq!(
+            request.headers[AUTHORIZATION],
+            format!("Bearer {UPSTREAM_TOKEN}")
+        );
+        assert!(!request.headers.contains_key("cookie"));
+        assert!(!request.headers.contains_key("x-api-key"));
+        assert!(!request.headers.contains_key("connection"));
+        assert!(!request.headers.contains_key("x-remove"));
+        assert_eq!(request.body["model"], "model-a");
+    }
+    assert_eq!(requests[0].headers["x-preserved"], "preserved");
+
+    let models = client
+        .get(format!(
+            "{}/v1/models?client_version=1.2.3",
+            proxy.base_url()
+        ))
+        .bearer_auth(ENTRY_TOKEN)
+        .send()
+        .await
+        .expect("models response");
+    assert_eq!(models.status(), StatusCode::OK);
+    let etag = models
+        .headers()
+        .get(ETAG)
+        .expect("models ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let models: CodexModelsResponse = models.json().await.expect("models JSON");
+    assert_eq!(
+        models
+            .models
+            .iter()
+            .map(|item| item.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["model-a", "model-b"]
+    );
+
+    let not_modified = client
+        .get(format!("{}/models", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("if-none-match", etag)
+        .send()
+        .await
+        .expect("conditional models response");
+    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+
+    let health: ProxyHealth = client
+        .get(format!("{}/health", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .send()
+        .await
+        .expect("health response")
+        .json()
+        .await
+        .expect("health JSON");
+    assert!(health.running);
+    assert_eq!(health.listen_addr, proxy.listen_addr());
+    assert_eq!(health.active_route.unwrap().selected_model, "model-a");
+    assert_eq!(health.forwarded_requests, 2);
+    assert_eq!(health.last_upstream_status, Some(200));
+
+    proxy.shutdown().await.expect("stop proxy");
+}
+
+#[derive(Default)]
+struct MarkerState {
+    requests: AtomicUsize,
+    seen_models: Mutex<Vec<String>>,
+    marker: &'static str,
+}
+
+async fn marker_provider(
+    State(state): State<Arc<MarkerState>>,
+    request: Request<Body>,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::AcqRel);
+    let body = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .expect("read marker request");
+    let body: Value = serde_json::from_slice(&body).expect("marker request JSON");
+    state
+        .seen_models
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(body["model"].as_str().unwrap().to_string());
+    Json(json!({"provider": state.marker})).into_response()
+}
+
+async fn marker_server(marker: &'static str) -> (TestServer, Arc<MarkerState>) {
+    let state = Arc::new(MarkerState {
+        marker,
+        ..MarkerState::default()
+    });
+    let server = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(marker_provider))
+            .route("/v1/responses/compact", post(marker_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    (server, state)
+}
+
+#[tokio::test]
+async fn hot_switches_new_turns_but_pins_responses_and_compact_for_the_same_turn() {
+    let (upstream_a, state_a) = marker_server("a").await;
+    let (upstream_b, state_b) = marker_server("b").await;
+    let proxy = proxy_with_route(route(
+        &upstream_a,
+        "route-a",
+        "model-a",
+        vec![model("model-a")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let request = |path: &str, turn_id: &str| {
+        client
+            .post(format!("{}{path}", proxy.base_url()))
+            .bearer_auth(ENTRY_TOKEN)
+            .header("thread-id", "thread-one")
+            .json(&json!({
+                "model": "ignored-client-model",
+                "client_metadata": {"turn_id": turn_id}
+            }))
+    };
+
+    let first: Value = request("/responses", "turn-one")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["provider"], "a");
+
+    proxy.set_active_route(route(
+        &upstream_b,
+        "route-b",
+        "model-b",
+        vec![model("model-b")],
+    ));
+
+    let same_turn: Value = request("/responses/compact", "turn-one")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let new_turn: Value = request("/responses", "turn-two")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(same_turn["provider"], "a");
+    assert_eq!(new_turn["provider"], "b");
+    assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
+    assert_eq!(state_b.requests.load(Ordering::Acquire), 1);
+    assert_eq!(
+        *state_a
+            .seen_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["model-a", "model-a"]
+    );
+    assert_eq!(
+        *state_b
+            .seen_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["model-b"]
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn sse_provider() -> Response {
+    let chunks = stream::unfold(0_u8, |index| async move {
+        match index {
+            0 => Some((
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"data: first\n\n")),
+                1,
+            )),
+            1 => {
+                sleep(Duration::from_millis(250)).await;
+                Some((
+                    Ok::<Bytes, Infallible>(Bytes::from_static(b"data: second\n\n")),
+                    2,
+                ))
+            }
+            _ => None,
+        }
+    });
+    let mut response = Response::new(Body::from_stream(chunks));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("SSE content type"),
+    );
+    response
+}
+
+#[tokio::test]
+async fn forwards_sse_as_an_unbuffered_byte_stream() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(sse_provider))).await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse",
+        "model-sse",
+        vec![model("model-sse")],
+    ))
+    .await;
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("SSE response");
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+
+    let mut stream = response.bytes_stream();
+    let first = timeout(Duration::from_millis(150), stream.next())
+        .await
+        .expect("first SSE chunk arrived before the second was produced")
+        .expect("first SSE item")
+        .expect("first SSE bytes");
+    assert_eq!(first.as_ref(), b"data: first\n\n");
+
+    let mut all = first.to_vec();
+    while let Some(chunk) = stream.next().await {
+        all.extend_from_slice(&chunk.expect("remaining SSE bytes"));
+    }
+    assert_eq!(all, b"data: first\n\ndata: second\n\n");
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct RedirectState {
+    source_hits: AtomicUsize,
+    target_hits: AtomicUsize,
+}
+
+async fn redirect_source(State(state): State<Arc<RedirectState>>) -> Redirect {
+    state.source_hits.fetch_add(1, Ordering::AcqRel);
+    Redirect::temporary("/v1/redirect-target")
+}
+
+async fn redirect_target(State(state): State<Arc<RedirectState>>) -> StatusCode {
+    state.target_hits.fetch_add(1, Ordering::AcqRel);
+    StatusCode::OK
+}
+
+#[tokio::test]
+async fn never_follows_upstream_redirects() {
+    let state = Arc::new(RedirectState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(redirect_source))
+            .route("/v1/redirect-target", get(redirect_target))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-redirect",
+        "model-redirect",
+        vec![model("model-redirect")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("redirect response");
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(response.headers()[LOCATION], "/v1/redirect-target");
+    assert_eq!(state.source_hits.load(Ordering::Acquire), 1);
+    assert_eq!(state.target_hits.load(Ordering::Acquire), 0);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct FailureState {
+    hits: AtomicUsize,
+}
+
+async fn failing_provider(State(state): State<Arc<FailureState>>) -> StatusCode {
+    state.hits.fetch_add(1, Ordering::AcqRel);
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[tokio::test]
+async fn never_retries_an_upstream_request() {
+    let state = Arc::new(FailureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(failing_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-failure",
+        "model-failure",
+        vec![model("model-failure")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("failure response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(state.hits.load(Ordering::Acquire), 1);
+
+    proxy.shutdown().await.unwrap();
+}

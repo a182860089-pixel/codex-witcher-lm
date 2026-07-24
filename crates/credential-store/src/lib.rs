@@ -2,7 +2,10 @@
 const SERVICE: &str = "dev.codex-provider-switcher.credentials";
 
 pub fn validate_account(account: &str) -> Result<(), String> {
-    let Some(fingerprint) = account.strip_prefix("endpoint-v1-") else {
+    let fingerprint = account
+        .strip_prefix("endpoint-v1-")
+        .or_else(|| account.strip_prefix("proxy-client-v1-"));
+    let Some(fingerprint) = fingerprint else {
         return Err("invalid provider credential account".to_string());
     };
     if fingerprint.len() != 64
@@ -107,6 +110,12 @@ mod tests {
         assert!(
             validate_account(
                 "endpoint-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_account(
+                "proxy-client-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             )
             .is_ok()
         );

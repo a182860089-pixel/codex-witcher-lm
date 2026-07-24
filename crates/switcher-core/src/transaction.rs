@@ -12,10 +12,15 @@ use fs4::FileExt;
 use serde::Deserialize;
 use serde::Serialize;
 use tempfile::NamedTempFile;
+use toml_edit::DocumentMut;
+use toml_edit::Item;
+use toml_edit::Table;
 use uuid::Uuid;
 
 use crate::config::ConfigPlan;
+use crate::config::LOCAL_PROXY_PROVIDER_ID;
 use crate::config::sha256_hex;
+use crate::config::verify_proxy_config_binding;
 use crate::error::Result;
 use crate::error::SwitcherError;
 
@@ -25,6 +30,7 @@ pub enum BackupStatus {
     Prepared,
     Applied,
     Restoring,
+    Detaching,
     Restored,
 }
 
@@ -47,6 +53,15 @@ pub struct BackupManifest {
     pub status: BackupStatus,
     pub config: FileSnapshot,
     pub catalog: FileSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_detach: Option<ProxyDetachJournal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyDetachJournal {
+    pub before_sha256: String,
+    pub after_existed: bool,
+    pub after_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +101,20 @@ pub fn apply_config_plan(
     backup_root: &Path,
     plan: &ConfigPlan,
 ) -> Result<ApplyResult> {
+    apply_config_plan_with_transaction_id(config_path, backup_root, plan, Uuid::new_v4())
+}
+
+pub fn apply_config_plan_with_transaction_id(
+    config_path: &Path,
+    backup_root: &Path,
+    plan: &ConfigPlan,
+    transaction_id: Uuid,
+) -> Result<ApplyResult> {
+    if transaction_id.is_nil() {
+        return Err(SwitcherError::Validation(
+            "transaction ID must not be nil".to_string(),
+        ));
+    }
     ensure_regular_or_missing(config_path)?;
     ensure_regular_or_missing(&plan.catalog_path)?;
     fs::create_dir_all(parent(config_path)?)?;
@@ -101,12 +130,17 @@ pub fn apply_config_plan(
         .open(&lock_path)?;
     FileExt::lock(&lock)?;
 
-    let result = apply_locked(config_path, backup_root, plan);
+    let result = apply_locked(config_path, backup_root, plan, transaction_id);
     FileExt::unlock(&lock)?;
     result
 }
 
-fn apply_locked(config_path: &Path, backup_root: &Path, plan: &ConfigPlan) -> Result<ApplyResult> {
+fn apply_locked(
+    config_path: &Path,
+    backup_root: &Path,
+    plan: &ConfigPlan,
+    transaction_id: Uuid,
+) -> Result<ApplyResult> {
     let current_config = read_optional(config_path)?;
     let current_config_contents = current_config.as_deref().unwrap_or_default();
     let current_hash = sha256_hex(current_config_contents);
@@ -121,7 +155,6 @@ fn apply_locked(config_path: &Path, backup_root: &Path, plan: &ConfigPlan) -> Re
     let current_catalog = read_optional(&plan.catalog_path)?;
     let expected_config = ExpectedFileState::from_contents(current_config.as_deref());
     let expected_catalog = ExpectedFileState::from_contents(current_catalog.as_deref());
-    let transaction_id = Uuid::new_v4();
     let transaction_dir = backup_root.join(transaction_id.to_string());
     create_private_transaction_dir(&transaction_dir)?;
     let config_backup = snapshot_backup(
@@ -165,6 +198,7 @@ fn apply_locked(config_path: &Path, backup_root: &Path, plan: &ConfigPlan) -> Re
             applied_sha256: sha256_hex(plan.rendered_catalog.as_bytes()),
             backup_file: catalog_backup,
         },
+        proxy_detach: None,
     };
     let manifest_path = transaction_dir.join("manifest.json");
     write_manifest(&manifest_path, &manifest)?;
@@ -217,6 +251,30 @@ pub fn restore_backup(
     FileExt::lock(&lock)?;
 
     let result = restore_locked(manifest_path, manifest);
+    FileExt::unlock(&lock)?;
+    result
+}
+
+pub fn restore_proxy_config_preserving_unrelated_changes(
+    manifest_path: &Path,
+    expected_config_path: &Path,
+    expected_catalog_path: &Path,
+    expected_proxy_base_url: &str,
+) -> Result<RestoreResult> {
+    let manifest =
+        load_scoped_manifest(manifest_path, expected_config_path, expected_catalog_path)?;
+    ensure_regular_or_missing(&manifest.config.path)?;
+
+    let lock_path = lock_path_for(&manifest.config.path);
+    ensure_regular_or_missing(&lock_path)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    FileExt::lock(&lock)?;
+
+    let result = detach_proxy_config_locked(manifest_path, manifest, expected_proxy_base_url);
     FileExt::unlock(&lock)?;
     result
 }
@@ -279,6 +337,49 @@ pub fn recover_prepared_backup(
 
 pub fn backup_matches_applied(manifest: &BackupManifest) -> Result<bool> {
     Ok(snapshot_matches_applied(&manifest.config)? && snapshot_matches_applied(&manifest.catalog)?)
+}
+
+pub fn verify_backup_integrity(
+    manifest_path: &Path,
+    expected_config_path: &Path,
+    expected_catalog_path: &Path,
+) -> Result<()> {
+    let manifest =
+        load_scoped_manifest(manifest_path, expected_config_path, expected_catalog_path)?;
+    read_verified_backup(&manifest.config)?;
+    read_verified_backup(&manifest.catalog)?;
+    Ok(())
+}
+
+pub fn verify_proxy_detach_recoverable(
+    manifest_path: &Path,
+    expected_config_path: &Path,
+    expected_catalog_path: &Path,
+) -> Result<()> {
+    let manifest =
+        load_scoped_manifest(manifest_path, expected_config_path, expected_catalog_path)?;
+    if manifest.status != BackupStatus::Detaching {
+        return Err(SwitcherError::Validation(
+            "the proxy detach journal is not active".to_string(),
+        ));
+    }
+    read_verified_backup(&manifest.config)?;
+    read_verified_backup(&manifest.catalog)?;
+    let journal = manifest.proxy_detach.as_ref().ok_or_else(|| {
+        SwitcherError::Validation("the proxy detach journal is incomplete".to_string())
+    })?;
+    let current = read_optional(&manifest.config.path)?;
+    if current
+        .as_deref()
+        .is_some_and(|contents| sha256_hex(contents) == journal.before_sha256)
+        || detached_state_matches(journal, current.as_deref())
+    {
+        Ok(())
+    } else {
+        Err(SwitcherError::Conflict(
+            "the Codex configuration changed while the proxy was being detached".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +516,156 @@ fn restore_locked(manifest_path: &Path, mut manifest: BackupManifest) -> Result<
         transaction_id: manifest.transaction_id,
         manifest_finalized,
     })
+}
+
+fn detach_proxy_config_locked(
+    manifest_path: &Path,
+    mut manifest: BackupManifest,
+    expected_proxy_base_url: &str,
+) -> Result<RestoreResult> {
+    if manifest.provider_id != LOCAL_PROXY_PROVIDER_ID
+        || !matches!(
+            manifest.status,
+            BackupStatus::Applied | BackupStatus::Detaching
+        )
+    {
+        return Err(SwitcherError::Validation(
+            "only an active local-proxy transaction can be safely detached".to_string(),
+        ));
+    }
+    let original = read_verified_backup(&manifest.config)?;
+    read_verified_backup(&manifest.catalog)?;
+    let current = read_optional(&manifest.config.path)?;
+    if manifest.status == BackupStatus::Applied {
+        let current = current.as_deref().ok_or_else(|| {
+            SwitcherError::Conflict("the active Codex configuration is missing".to_string())
+        })?;
+        let current_text = std::str::from_utf8(&current).map_err(|_| SwitcherError::InvalidUtf8)?;
+        verify_proxy_config_binding(current_text, expected_proxy_base_url)?;
+        let current_document = current_text.parse::<DocumentMut>()?;
+        if current_document.get("model").and_then(Item::as_str) != Some(manifest.model_id.as_str())
+        {
+            return Err(SwitcherError::Conflict(
+                "the managed local proxy model changed after activation".to_string(),
+            ));
+        }
+        let merged = merge_proxy_owned_config(current, original.as_deref().unwrap_or_default())?;
+        let remove_after = !manifest.config.existed && merged.trim().is_empty();
+        manifest.proxy_detach = Some(ProxyDetachJournal {
+            before_sha256: sha256_hex(current),
+            after_existed: !remove_after,
+            after_sha256: (!remove_after).then(|| sha256_hex(merged.as_bytes())),
+        });
+        manifest.status = BackupStatus::Detaching;
+        write_manifest(manifest_path, &manifest)?;
+    }
+
+    let journal = manifest.proxy_detach.as_ref().ok_or_else(|| {
+        SwitcherError::Validation("the proxy detach journal is incomplete".to_string())
+    })?;
+    let current_is_before = current
+        .as_deref()
+        .is_some_and(|contents| sha256_hex(contents) == journal.before_sha256);
+    let current_is_after = detached_state_matches(journal, current.as_deref());
+    if !current_is_before && !current_is_after {
+        return Err(SwitcherError::Conflict(
+            "the Codex configuration changed while the proxy was being detached".to_string(),
+        ));
+    }
+    if current_is_before {
+        let current = current
+            .as_deref()
+            .expect("a before-state hash requires existing contents");
+        let merged = merge_proxy_owned_config(current, original.as_deref().unwrap_or_default())?;
+        let remove_after = !manifest.config.existed && merged.trim().is_empty();
+        let after_sha256 = (!remove_after).then(|| sha256_hex(merged.as_bytes()));
+        if journal.after_existed != !remove_after || journal.after_sha256 != after_sha256 {
+            return Err(SwitcherError::Conflict(
+                "the proxy detach plan no longer matches its journal".to_string(),
+            ));
+        }
+        let expected = ExpectedFileState::from_contents(Some(current));
+        if remove_after {
+            remove_file_expected(&manifest.config.path, &expected)?;
+        } else if merged.as_bytes() != current {
+            atomic_write_expected(&manifest.config.path, &expected, merged.as_bytes())?;
+        }
+    }
+
+    manifest.status = BackupStatus::Restored;
+    let manifest_finalized = write_manifest(manifest_path, &manifest).is_ok();
+    Ok(RestoreResult {
+        transaction_id: manifest.transaction_id,
+        manifest_finalized,
+    })
+}
+
+fn detached_state_matches(journal: &ProxyDetachJournal, current: Option<&[u8]>) -> bool {
+    match (
+        journal.after_existed,
+        journal.after_sha256.as_deref(),
+        current,
+    ) {
+        (false, None, None) => true,
+        (true, Some(expected), Some(contents)) => sha256_hex(contents) == expected,
+        _ => false,
+    }
+}
+
+fn merge_proxy_owned_config(current: &[u8], original: &[u8]) -> Result<String> {
+    let current = std::str::from_utf8(current).map_err(|_| SwitcherError::InvalidUtf8)?;
+    let original = std::str::from_utf8(original).map_err(|_| SwitcherError::InvalidUtf8)?;
+    let mut current = if current.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        current.parse::<DocumentMut>()?
+    };
+    let original = if original.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        original.parse::<DocumentMut>()?
+    };
+
+    for key in ["model_provider", "model"] {
+        restore_document_item(&mut current, &original, key);
+    }
+
+    let original_had_providers = original.as_table().contains_key("model_providers");
+    let original_proxy = original
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(LOCAL_PROXY_PROVIDER_ID))
+        .cloned();
+    if current.as_table().contains_key("model_providers") {
+        let providers = current["model_providers"].as_table_mut().ok_or_else(|| {
+            SwitcherError::Validation("model_providers must remain a TOML table".to_string())
+        })?;
+        match original_proxy {
+            Some(item) => {
+                providers.insert(LOCAL_PROXY_PROVIDER_ID, item);
+            }
+            None => {
+                providers.remove(LOCAL_PROXY_PROVIDER_ID);
+            }
+        }
+        if !original_had_providers && providers.is_empty() {
+            current.as_table_mut().remove("model_providers");
+        }
+    } else if let Some(item) = original_proxy {
+        let mut providers = Table::new();
+        providers.insert(LOCAL_PROXY_PROVIDER_ID, item);
+        current["model_providers"] = Item::Table(providers);
+    }
+
+    Ok(current.to_string())
+}
+
+fn restore_document_item(current: &mut DocumentMut, original: &DocumentMut, key: &str) {
+    if let Some(item) = original.get(key) {
+        current.as_table_mut().insert(key, item.clone());
+    } else {
+        current.as_table_mut().remove(key);
+    }
 }
 
 fn verify_applied_hash(snapshot: &FileSnapshot) -> Result<()> {
@@ -936,6 +1187,7 @@ mod tests {
     use crate::domain::ProviderProfile;
     use crate::domain::ReasoningEffort;
     use crate::plan_config;
+    use crate::plan_proxy_config;
 
     use super::*;
 
@@ -988,6 +1240,43 @@ mod tests {
         restore_backup(&applied.manifest_path, &config_path, &catalog_path).unwrap();
         assert_eq!(fs::read(&config_path).unwrap(), original);
         assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn apply_uses_the_preallocated_transaction_id() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("codex/config.toml");
+        let catalog_path = root.path().join("codex/switcher/models.json");
+        let backup_root = root.path().join("backups");
+        let transaction_id = Uuid::new_v4();
+        let plan = plan_config(
+            "",
+            &test_profile(),
+            "acme-code",
+            &catalog_path,
+            Some(&root.path().join("switcher")),
+        )
+        .unwrap();
+
+        let applied = apply_config_plan_with_transaction_id(
+            &config_path,
+            &backup_root,
+            &plan,
+            transaction_id,
+        )
+        .unwrap();
+
+        assert_eq!(applied.transaction_id, transaction_id);
+        assert_eq!(
+            applied.manifest_path,
+            backup_root
+                .join(transaction_id.to_string())
+                .join("manifest.json")
+        );
+        assert!(
+            apply_config_plan_with_transaction_id(&config_path, &backup_root, &plan, Uuid::nil(),)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1053,6 +1342,176 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&config_path).unwrap(),
             "model = \"user-edit\"\n"
+        );
+    }
+
+    #[test]
+    fn proxy_detach_restores_owned_fields_and_preserves_unrelated_edits() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let catalog_path = root.path().join("models.json");
+        let original = r#"# user config
+model_provider = "openai"
+model = "official"
+approval_policy = "on-request"
+
+[model_providers.keep]
+name = "Keep"
+base_url = "https://keep.example/v1"
+wire_api = "responses"
+"#;
+        fs::write(&config_path, original).unwrap();
+        let plan = plan_proxy_config(
+            original,
+            &test_profile(),
+            "acme-code",
+            &catalog_path,
+            &root.path().join("switcher"),
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap();
+        let applied = apply_config_plan(&config_path, &root.path().join("backups"), &plan).unwrap();
+        let edited = fs::read_to_string(&config_path).unwrap().replace(
+            "approval_policy = \"on-request\"",
+            "approval_policy = \"never\"\nnew_user_setting = true",
+        );
+        fs::write(&config_path, edited).unwrap();
+
+        assert!(restore_backup(&applied.manifest_path, &config_path, &catalog_path).is_err());
+        let detached = restore_proxy_config_preserving_unrelated_changes(
+            &applied.manifest_path,
+            &config_path,
+            &catalog_path,
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap();
+
+        assert!(detached.manifest_finalized);
+        let restored = fs::read_to_string(&config_path).unwrap();
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(restored.contains("model = \"official\""));
+        assert!(restored.contains("approval_policy = \"never\""));
+        assert!(restored.contains("new_user_setting = true"));
+        assert!(restored.contains("[model_providers.keep]"));
+        assert!(!restored.contains("model_providers.cps-local"));
+        assert!(catalog_path.exists());
+        let manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&applied.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.status, BackupStatus::Restored);
+    }
+
+    #[test]
+    fn proxy_detach_refuses_a_change_to_switcher_owned_fields() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let catalog_path = root.path().join("models.json");
+        let original = "model_provider = \"openai\"\nmodel = \"official\"\n";
+        fs::write(&config_path, original).unwrap();
+        let plan = plan_proxy_config(
+            original,
+            &test_profile(),
+            "acme-code",
+            &catalog_path,
+            &root.path().join("switcher"),
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap();
+        let applied = apply_config_plan(&config_path, &root.path().join("backups"), &plan).unwrap();
+        let edited = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("model = \"acme-code\"", "model = \"user-edit\"");
+        fs::write(&config_path, &edited).unwrap();
+
+        assert!(
+            restore_proxy_config_preserving_unrelated_changes(
+                &applied.manifest_path,
+                &config_path,
+                &catalog_path,
+                "http://127.0.0.1:15722/v1",
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), edited);
+        let manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&applied.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.status, BackupStatus::Applied);
+    }
+
+    #[test]
+    fn proxy_detach_reentry_refuses_an_edit_after_the_journal_was_written() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let catalog_path = root.path().join("models.json");
+        let original = "model_provider = \"openai\"\nmodel = \"official\"\n";
+        fs::write(&config_path, original).unwrap();
+        let plan = plan_proxy_config(
+            original,
+            &test_profile(),
+            "acme-code",
+            &catalog_path,
+            &root.path().join("switcher"),
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap();
+        let applied = apply_config_plan(&config_path, &root.path().join("backups"), &plan).unwrap();
+        let before = fs::read(&config_path).unwrap();
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&applied.manifest_path).unwrap()).unwrap();
+        let original_backup = read_verified_backup(&manifest.config).unwrap();
+        let after = merge_proxy_owned_config(&before, original_backup.as_deref().unwrap()).unwrap();
+        manifest.status = BackupStatus::Detaching;
+        manifest.proxy_detach = Some(ProxyDetachJournal {
+            before_sha256: sha256_hex(&before),
+            after_existed: true,
+            after_sha256: Some(sha256_hex(after.as_bytes())),
+        });
+        write_manifest(&applied.manifest_path, &manifest).unwrap();
+
+        let user_edit = String::from_utf8(before)
+            .unwrap()
+            .replace("model = \"acme-code\"", "model = \"user\"");
+        fs::write(&config_path, &user_edit).unwrap();
+
+        assert!(
+            verify_proxy_detach_recoverable(&applied.manifest_path, &config_path, &catalog_path,)
+                .is_err()
+        );
+        assert!(
+            restore_proxy_config_preserving_unrelated_changes(
+                &applied.manifest_path,
+                &config_path,
+                &catalog_path,
+                "http://127.0.0.1:15722/v1",
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), user_edit);
+    }
+
+    #[test]
+    fn backup_integrity_check_detects_a_missing_original_before_restore() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let catalog_path = root.path().join("models.json");
+        let original = "model_provider = \"openai\"\nmodel = \"official\"\n";
+        fs::write(&config_path, original).unwrap();
+        fs::write(&catalog_path, "{\"models\":[]}").unwrap();
+        let plan = plan_proxy_config(
+            original,
+            &test_profile(),
+            "acme-code",
+            &catalog_path,
+            &root.path().join("switcher"),
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap();
+        let applied = apply_config_plan(&config_path, &root.path().join("backups"), &plan).unwrap();
+        let manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(&applied.manifest_path).unwrap()).unwrap();
+        fs::remove_file(manifest.config.backup_file.unwrap()).unwrap();
+
+        assert!(
+            verify_backup_integrity(&applied.manifest_path, &config_path, &catalog_path).is_err()
         );
     }
 

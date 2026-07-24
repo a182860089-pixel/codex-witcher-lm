@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -18,6 +19,9 @@ use crate::validation::validate_base_url;
 use crate::validation::validate_profile;
 use crate::validation::validate_provider_id;
 
+pub const LOCAL_PROXY_PROVIDER_ID: &str = "cps-local";
+pub const LOCAL_PROXY_PROVIDER_NAME: &str = "Codex Provider Switcher";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigPlan {
     pub expected_config_sha256: String,
@@ -34,6 +38,58 @@ pub fn plan_config(
     selected_model: &str,
     catalog_path: &Path,
     credential_helper: Option<&Path>,
+) -> Result<ConfigPlan> {
+    let credential_account = if profile.credential_required {
+        Some(credential_account_for(&profile.id, &profile.base_url)?)
+    } else {
+        None
+    };
+    plan_config_with_account(
+        existing_config,
+        profile,
+        selected_model,
+        catalog_path,
+        credential_helper,
+        credential_account.as_deref(),
+    )
+}
+
+pub fn plan_proxy_config(
+    existing_config: &str,
+    upstream_profile: &ProviderProfile,
+    selected_model: &str,
+    catalog_path: &Path,
+    credential_helper: &Path,
+    proxy_base_url: &str,
+) -> Result<ConfigPlan> {
+    validate_profile(upstream_profile)?;
+    validate_proxy_base_url(proxy_base_url)?;
+    let proxy_profile = ProviderProfile {
+        id: LOCAL_PROXY_PROVIDER_ID.to_string(),
+        display_name: LOCAL_PROXY_PROVIDER_NAME.to_string(),
+        base_url: proxy_base_url.trim_end_matches('/').to_string(),
+        models: upstream_profile.models.clone(),
+        supports_websockets: false,
+        credential_required: true,
+    };
+    let account = proxy_credential_account_for(proxy_base_url)?;
+    plan_config_with_account(
+        existing_config,
+        &proxy_profile,
+        selected_model,
+        catalog_path,
+        Some(credential_helper),
+        Some(&account),
+    )
+}
+
+fn plan_config_with_account(
+    existing_config: &str,
+    profile: &ProviderProfile,
+    selected_model: &str,
+    catalog_path: &Path,
+    credential_helper: Option<&Path>,
+    credential_account: Option<&str>,
 ) -> Result<ConfigPlan> {
     validate_profile(profile)?;
     if !catalog_path.is_absolute() {
@@ -61,6 +117,11 @@ pub fn plan_config(
         if !helper.is_absolute() {
             return Err(SwitcherError::Validation(
                 "credential helper path must be absolute".to_string(),
+            ));
+        }
+        if credential_account.is_none() {
+            return Err(SwitcherError::Validation(
+                "a credential account is required for this provider".to_string(),
             ));
         }
     }
@@ -96,7 +157,7 @@ pub fn plan_config(
         let mut args = Array::new();
         args.push("credential");
         args.push("get");
-        args.push(credential_account_for(&profile.id, &profile.base_url)?);
+        args.push(credential_account.expect("validated credential account"));
         auth["args"] = value(args);
         auth["timeout_ms"] = value(5_000);
         auth["refresh_interval_ms"] = value(300_000);
@@ -122,6 +183,112 @@ pub fn credential_account_for(provider_id: &str, base_url: &str) -> Result<Strin
     let normalized_url = parsed.as_str().trim_end_matches('/');
     let fingerprint = sha256_hex(format!("{provider_id}\0{normalized_url}").as_bytes());
     Ok(format!("endpoint-v1-{fingerprint}"))
+}
+
+pub fn proxy_credential_account_for(base_url: &str) -> Result<String> {
+    validate_proxy_base_url(base_url)?;
+    let parsed = url::Url::parse(base_url)?;
+    let normalized_url = parsed.as_str().trim_end_matches('/');
+    let fingerprint = sha256_hex(format!("{LOCAL_PROXY_PROVIDER_ID}\0{normalized_url}").as_bytes());
+    Ok(format!("proxy-client-v1-{fingerprint}"))
+}
+
+pub fn verify_proxy_config_binding(config: &str, proxy_base_url: &str) -> Result<PathBuf> {
+    validate_proxy_base_url(proxy_base_url)?;
+    let document = config.parse::<DocumentMut>()?;
+    if document
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        != Some(LOCAL_PROXY_PROVIDER_ID)
+    {
+        return Err(SwitcherError::Validation(
+            "the managed local proxy is not the active provider".to_string(),
+        ));
+    }
+    let provider = document
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(LOCAL_PROXY_PROVIDER_ID))
+        .and_then(|item| item.as_table())
+        .ok_or_else(|| {
+            SwitcherError::Validation("the managed local proxy definition is missing".to_string())
+        })?;
+    if provider.get("base_url").and_then(|item| item.as_str()) != Some(proxy_base_url)
+        || provider.get("wire_api").and_then(|item| item.as_str()) != Some("responses")
+        || provider
+            .get("supports_websockets")
+            .and_then(|item| item.as_bool())
+            != Some(false)
+    {
+        return Err(SwitcherError::Validation(
+            "the managed local proxy definition has changed".to_string(),
+        ));
+    }
+    if provider.get("env_key").is_some()
+        || provider.get("experimental_bearer_token").is_some()
+        || provider.get("requires_openai_auth").is_some()
+    {
+        return Err(SwitcherError::Validation(
+            "the managed local proxy contains an unsupported authentication setting".to_string(),
+        ));
+    }
+
+    let auth = provider
+        .get("auth")
+        .and_then(|item| item.as_table())
+        .ok_or_else(|| {
+            SwitcherError::Validation(
+                "the managed local proxy credential command is missing".to_string(),
+            )
+        })?;
+    let command = auth
+        .get("command")
+        .and_then(|item| item.as_str())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            SwitcherError::Validation(
+                "the managed local proxy credential command is invalid".to_string(),
+            )
+        })?;
+    let expected_cwd = command.parent().ok_or_else(|| {
+        SwitcherError::Validation(
+            "the managed local proxy credential command has no parent".to_string(),
+        )
+    })?;
+    if auth
+        .get("cwd")
+        .and_then(|item| item.as_str())
+        .map(Path::new)
+        != Some(expected_cwd)
+        || auth.get("timeout_ms").and_then(|item| item.as_integer()) != Some(5_000)
+        || auth
+            .get("refresh_interval_ms")
+            .and_then(|item| item.as_integer())
+            != Some(300_000)
+    {
+        return Err(SwitcherError::Validation(
+            "the managed local proxy credential command has changed".to_string(),
+        ));
+    }
+    let account = proxy_credential_account_for(proxy_base_url)?;
+    let expected_args = ["credential", "get", account.as_str()];
+    let args_match = auth
+        .get("args")
+        .and_then(|item| item.as_array())
+        .is_some_and(|args| {
+            args.len() == expected_args.len()
+                && args
+                    .iter()
+                    .zip(expected_args)
+                    .all(|(value, expected)| value.as_str() == Some(expected))
+        });
+    if !args_match {
+        return Err(SwitcherError::Validation(
+            "the managed local proxy credential arguments have changed".to_string(),
+        ));
+    }
+    Ok(command)
 }
 
 pub fn verify_credential_binding(
@@ -150,10 +317,12 @@ pub fn verify_credential_binding(
         let Some(base_url) = provider.get("base_url").and_then(|item| item.as_str()) else {
             continue;
         };
-        let Ok(expected_account) = credential_account_for(provider_id, base_url) else {
-            continue;
-        };
-        if expected_account != account {
+        let endpoint_account = credential_account_for(provider_id, base_url).ok();
+        let proxy_account = (provider_id == LOCAL_PROXY_PROVIDER_ID)
+            .then(|| proxy_credential_account_for(base_url).ok())
+            .flatten();
+        if endpoint_account.as_deref() != Some(account) && proxy_account.as_deref() != Some(account)
+        {
             continue;
         }
         let Some(auth) = provider.get("auth").and_then(|item| item.as_table()) else {
@@ -180,6 +349,21 @@ pub fn verify_credential_binding(
     if matches != 1 {
         return Err(SwitcherError::Validation(
             "credential account is not bound to exactly one managed provider".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proxy_base_url(base_url: &str) -> Result<()> {
+    validate_base_url(base_url)?;
+    let parsed = url::Url::parse(base_url)?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port().is_none()
+        || parsed.path().trim_end_matches('/') != "/v1"
+    {
+        return Err(SwitcherError::Validation(
+            "local proxy URL must be http://127.0.0.1:<port>/v1".to_string(),
         ));
     }
     Ok(())
@@ -325,5 +509,85 @@ mod tests {
             .rendered_config
             .replace("https://api.acme.test/v1", "https://evil.example.test/v1");
         assert!(verify_credential_binding(&tampered, &first_account, &helper).is_err());
+    }
+
+    #[test]
+    fn proxy_plan_keeps_the_upstream_endpoint_and_key_out_of_codex_config() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let plan = plan_proxy_config(
+            "# preserved\napproval_policy = \"on-request\"\n",
+            &profile(),
+            "acme/code",
+            &catalog,
+            &helper,
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap();
+        let account = proxy_credential_account_for("http://127.0.0.1:15722/v1").unwrap();
+
+        assert!(plan.rendered_config.contains("# preserved"));
+        assert!(
+            plan.rendered_config
+                .contains("model_provider = \"cps-local\"")
+        );
+        assert!(
+            plan.rendered_config
+                .contains("base_url = \"http://127.0.0.1:15722/v1\"")
+        );
+        assert!(plan.rendered_config.contains("supports_websockets = false"));
+        assert!(plan.rendered_config.contains(&account));
+        assert!(!plan.rendered_config.contains("https://api.acme.test"));
+        verify_credential_binding(&plan.rendered_config, &account, &helper).unwrap();
+    }
+
+    #[test]
+    fn proxy_account_rejects_ambiguous_or_remote_addresses() {
+        assert!(proxy_credential_account_for("http://localhost:15722/v1").is_err());
+        assert!(proxy_credential_account_for("http://[::1]:15722/v1").is_err());
+        assert!(proxy_credential_account_for("https://127.0.0.1:15722/v1").is_err());
+        assert!(proxy_credential_account_for("http://127.0.0.1:15722/other").is_err());
+    }
+
+    #[test]
+    fn proxy_binding_rejects_managed_field_changes() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan =
+            plan_proxy_config("", &profile(), "acme/code", &catalog, &helper, base_url).unwrap();
+
+        assert_eq!(
+            verify_proxy_config_binding(&plan.rendered_config, base_url).unwrap(),
+            helper
+        );
+        assert!(
+            verify_proxy_config_binding(
+                &plan.rendered_config.replace(
+                    "wire_api = \"responses\"",
+                    "wire_api = \"chat_completions\"",
+                ),
+                base_url,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_proxy_config_binding(
+                &plan
+                    .rendered_config
+                    .replace("supports_websockets = false", "supports_websockets = true"),
+                base_url,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_proxy_config_binding(
+                &plan
+                    .rendered_config
+                    .replace("\"credential\", \"get\"", "\"credential\", \"delete\"",),
+                base_url,
+            )
+            .is_err()
+        );
     }
 }

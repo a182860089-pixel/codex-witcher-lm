@@ -17,7 +17,11 @@ pub use cdp::{
     CdpEndpointKind, CdpTarget, validate_browser_websocket_url, validate_page_target,
     validate_page_target_for_cleanup, validate_page_websocket_url,
 };
-pub use config::{ConfigPlan, credential_account_for, plan_config, verify_credential_binding};
+pub use config::{
+    ConfigPlan, LOCAL_PROXY_PROVIDER_ID, LOCAL_PROXY_PROVIDER_NAME, credential_account_for,
+    plan_config, plan_proxy_config, proxy_credential_account_for, verify_credential_binding,
+    verify_proxy_config_binding,
+};
 pub use discovery::{
     FetchedModel, ModelDiscovery, fetch_models, model_endpoint_candidates, normalize_api_base_url,
 };
@@ -32,8 +36,10 @@ pub use supervisor::{
     allocate_loopback_port,
 };
 pub use transaction::{
-    ApplyResult, BackupManifest, BackupStatus, RecoveryOutcome, RestoreResult, apply_config_plan,
-    backup_matches_applied, create_private_directory, recover_prepared_backup, restore_backup,
-    write_private_file,
+    ApplyResult, BackupManifest, BackupStatus, ProxyDetachJournal, RecoveryOutcome, RestoreResult,
+    apply_config_plan, apply_config_plan_with_transaction_id, backup_matches_applied,
+    create_private_directory, recover_prepared_backup, restore_backup,
+    restore_proxy_config_preserving_unrelated_changes, verify_backup_integrity,
+    verify_proxy_detach_recoverable, write_private_file,
 };
 pub use validation::validate_profile;

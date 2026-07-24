@@ -71,10 +71,12 @@ try {
 
   & $cargo fmt --all -- --check
   if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
-  & $cargo test `
+  & $cargo test --locked `
     -p codex-provider-switcher-core `
     -p codex-provider-switcher-credentials `
-    -p codex-provider-switcher-launcher
+    -p codex-provider-switcher-launcher `
+    -p codex-provider-switcher-local-proxy `
+    -p codex-provider-switcher-desktop
   if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed' }
 
   & $pnpm tauri build

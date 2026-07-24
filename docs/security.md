@@ -7,13 +7,25 @@ Provider API keys are stored under the service
 Credential Manager. Each entry is bound to a SHA-256 fingerprint of the
 provider ID and normalized base URL, so changing the endpoint cannot silently
 reuse an old bearer token through the Switcher UI. The stable helper verifies
-that the fingerprint still matches exactly one managed provider table,
-its own command/working-directory binding, and an official Codex parent
+that the fingerprint still matches exactly one managed provider table, its own
+command/working-directory binding, and an official Codex parent
 process/package before returning a token. The API key is copied out of and then
 immediately cleared from the password field; owned Rust secret buffers are
-zeroized. The Switcher-managed key is never written to TOML, `profiles.json`,
+zeroized.
+
+Fast switching adds a second credential class: a random local-proxy entry
+bearer stored in the same OS credential manager under a
+`proxy-client-v1-...` loopback fingerprint. Codex receives this entry bearer
+through the stable helper and uses it only against
+`http://127.0.0.1:15722/v1`. The proxy uses the entry bearer to authenticate the
+client, then independently loads the selected provider key for the upstream
+request. The two bearers are never interchangeable.
+
+Neither credential is written to TOML, `profiles.json`, `proxy.json`,
 `models.json`, backups, logs, command arguments, renderer injection payloads,
-or CDP state.
+or CDP state. `proxy.json` schema v2 stores only the enabled flag,
+profile/model IDs, credential-free `activationTransactionId`, fixed port,
+revision, and restart notice.
 
 Between model discovery and profile save, the key lives only in a zeroizing
 in-process Rust vault. A session is consumed by save, removed by cancel, or
@@ -55,6 +67,35 @@ redacted and never contain the keyring backend's detailed payload.
   relax Base URL validation or the requirement that the provider implement the
   Responses API when Codex uses it.
 
+## Local proxy threats
+
+- The listener binds only to IPv4 `127.0.0.1` on the managed fixed port.
+  `localhost`, IPv6 loopback, wildcard, and remote bind addresses are rejected.
+- `/health`, `/models`, `/v1/models`, `/responses`, `/v1/responses`, and both
+  compact paths require exactly one valid entry bearer.
+- The proxy stores only the SHA-256 digest needed to verify the entry bearer.
+  Candidate and expected digests are compared in constant time. Invalid auth
+  is rejected before the request body is read or an upstream route is used.
+- Client `Authorization`, cookie, API-key-like, forwarding, proxy-auth, and
+  hop-by-hop headers are removed. Header names nominated by `Connection` are
+  also removed. Only then is the active provider bearer injected.
+- The selected Route is immutable and replaced atomically. When both
+  identifiers are present, a bounded `(thread_id, turn_id)` pin prevents
+  `/responses` and `/responses/compact` for one turn from being split across
+  providers.
+- The proxy overwrites the JSON `model` field with the active selection and
+  bounds request bodies to 16 MiB. Non-object or malformed JSON is rejected.
+- Remote upstreams require HTTPS; plain HTTP is allowed only for loopback
+  providers. The client honors normal system proxy policy, follows no
+  redirects, and disables automatic request retries.
+- Response bodies are streamed without accumulating a full SSE response.
+  Hop-by-hop response headers and `Set-Cookie` are removed.
+- The local model catalog and health body contain no bearer or upstream Base
+  URL. Route and bearer debug output is redacted.
+- The pin table is bounded rather than permanent. The proxy has no authority
+  over another process running as the same OS user; possession of the entry
+  bearer remains the local access boundary.
+
 ## Configuration threats
 
 - Symlink and non-file targets are rejected.
@@ -62,7 +103,15 @@ redacted and never contain the keyring backend's detailed payload.
 - A content digest rejects stale previews and is rechecked immediately before
   replacement.
 - Exact originals are captured before either managed file is replaced.
-- Restore uses applied digests as a second compare-and-swap boundary.
+- Exact restore uses applied digests as a second compare-and-swap boundary.
+- First activation preallocates a non-nil transaction ID, persists it in proxy
+  state, and uses that exact ID for the backup directory and manifest.
+- Disable accepts only the named Applied `cps-local` manifest with exact
+  config/catalog paths, layout, and transaction ID. It restores exact bytes
+  when applied hashes match. Otherwise it may detach only after revalidating
+  the managed loopback provider, selected model, helper integrity, and original
+  backup; the compare-and-swap merge restores only Switcher-owned fields and
+  preserves unrelated valid TOML. Missing or mismatched evidence fails closed.
 - Unix transaction directories use `0700`; backup and manifest files use
   `0600`.
 - Windows transaction directories use a protected current-user DACL, and
@@ -72,8 +121,15 @@ redacted and never contain the keyring backend's detailed payload.
 
 The manager does not edit `auth.json`.
 
-The manager also does not add `model_catalog_json`. A user-owned value already
-present in `config.toml` is left unchanged. The Switcher-managed `models.json`
+In local-proxy mode, the managed Codex provider contains only the strict
+loopback Base URL and a helper reference for the entry bearer. The upstream
+provider URL and key remain outside Codex configuration. Direct mode writes the
+chosen upstream provider metadata but still obtains its key through the stable
+helper.
+
+The manager does not add `model_catalog_json`. A user-owned value already
+present in `config.toml` is left unchanged. The proxy's authenticated
+`/models` response is generated in memory; the Switcher-managed `models.json`
 is internal transaction companion data and is not written into Codex
 configuration as a catalog pointer.
 
@@ -116,9 +172,13 @@ blocked until:
 - Windows executable and per-user NSIS installer are Authenticode-signed with
   timestamping.
 - exact dependency locks and third-party notices are reviewed.
-- install, switch, restart, restore, upgrade, and uninstall pass on real target
-  machines.
+- install, first proxy enable, initial restart, next-turn route switch,
+  background relaunch, disable/restore, upgrade, and uninstall pass on real
+  target machines.
 - backup retention and uninstall choices are implemented without destroying a
   conflicted recovery chain.
+- uninstall removes or safely disables Switcher-owned background-startup state
+  and never leaves an enabled proxy configuration without an available
+  listener or recovery path.
 
 Automatic updates remain disabled until the signing pipeline is stable.

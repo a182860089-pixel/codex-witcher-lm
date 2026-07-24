@@ -16,9 +16,14 @@ use codex_provider_switcher_core::BackupManifest;
 use codex_provider_switcher_core::BackupStatus;
 use codex_provider_switcher_core::CurrentCodexConfig;
 use codex_provider_switcher_core::FetchedModel;
+use codex_provider_switcher_core::LOCAL_PROXY_PROVIDER_ID;
+use codex_provider_switcher_core::ModelSpec;
 use codex_provider_switcher_core::ProfileStore;
 use codex_provider_switcher_core::ProviderProfile;
+use codex_provider_switcher_core::ReasoningEffort;
+use codex_provider_switcher_core::RecoveryOutcome;
 use codex_provider_switcher_core::apply_config_plan;
+use codex_provider_switcher_core::apply_config_plan_with_transaction_id;
 use codex_provider_switcher_core::backup_matches_applied;
 use codex_provider_switcher_core::create_private_directory;
 use codex_provider_switcher_core::credential_account_for;
@@ -28,23 +33,38 @@ use codex_provider_switcher_core::model_endpoint_candidates;
 use codex_provider_switcher_core::normalize_api_base_url;
 use codex_provider_switcher_core::parse_profile_store;
 use codex_provider_switcher_core::plan_config;
+use codex_provider_switcher_core::plan_proxy_config;
+use codex_provider_switcher_core::proxy_credential_account_for;
 use codex_provider_switcher_core::recover_prepared_backup;
 use codex_provider_switcher_core::remove_profile;
 use codex_provider_switcher_core::render_profile_store;
 use codex_provider_switcher_core::restore_backup;
+use codex_provider_switcher_core::restore_proxy_config_preserving_unrelated_changes;
 use codex_provider_switcher_core::upsert_profile;
+use codex_provider_switcher_core::verify_backup_integrity;
 use codex_provider_switcher_core::verify_credential_binding as verify_core_credential_binding;
+use codex_provider_switcher_core::verify_proxy_config_binding as verify_core_proxy_config_binding;
+use codex_provider_switcher_core::verify_proxy_detach_recoverable;
 use codex_provider_switcher_core::write_private_file;
 use codex_provider_switcher_credentials as credentials;
 use codex_provider_switcher_launcher::authorize_codex_parent;
 use codex_provider_switcher_launcher::open_codex as launch_codex;
+use codex_provider_switcher_local_proxy::BearerToken;
+use codex_provider_switcher_local_proxy::LocalProxy;
+use codex_provider_switcher_local_proxy::ModelDescriptor;
+use codex_provider_switcher_local_proxy::ProxyHandle;
+use codex_provider_switcher_local_proxy::ProxyStartOptions;
+use codex_provider_switcher_local_proxy::ReasoningLevelDescriptor;
+use codex_provider_switcher_local_proxy::RouteConfig;
 use directories::BaseDirs;
 use fs4::FileExt;
+use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use tempfile::NamedTempFile;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
@@ -97,6 +117,60 @@ struct CredentialSessionSummary {
     base_url: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalProxyStatus {
+    enabled: bool,
+    running: bool,
+    recovery_required: bool,
+    manual_recovery_required: bool,
+    current_profile_id: Option<String>,
+    current_model_id: Option<String>,
+    requires_codex_restart: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredProxyState {
+    schema_version: u32,
+    enabled: bool,
+    profile_id: Option<String>,
+    model_id: Option<String>,
+    #[serde(default)]
+    activation_transaction_id: Option<Uuid>,
+    port: u16,
+    revision: u64,
+    #[serde(default)]
+    requires_codex_restart: bool,
+}
+
+impl Default for StoredProxyState {
+    fn default() -> Self {
+        Self {
+            schema_version: PROXY_STATE_SCHEMA_VERSION,
+            enabled: false,
+            profile_id: None,
+            model_id: None,
+            activation_transaction_id: None,
+            port: LOCAL_PROXY_PORT,
+            revision: 0,
+            requires_codex_restart: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProxyRuntime {
+    inner: AsyncMutex<ProxyRuntimeState>,
+}
+
+#[derive(Default)]
+struct ProxyRuntimeState {
+    handle: Option<ProxyHandle>,
+    last_error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveProfileInput {
@@ -115,6 +189,17 @@ struct DiscoveryVault(Arc<Mutex<HashMap<Uuid, PendingDiscovery>>>);
 
 const DISCOVERY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_DISCOVERY_SESSIONS: usize = 8;
+const PROXY_STATE_SCHEMA_VERSION: u32 = 2;
+const LOCAL_PROXY_PORT: u16 = 15_722;
+const LOCAL_PROXY_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const AUTOSTART_NAME: &str = "Codex Provider Switcher";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyConfigState {
+    NotSelected,
+    Managed,
+    Changed,
+}
 
 #[tauri::command]
 fn inspect_state() -> Result<AppState, String> {
@@ -167,8 +252,26 @@ fn apply_profile(profile: ProviderProfile, selected_model: String) -> Result<App
         Some(&paths.helper),
     )
     .map_err(redacted_core_error)?;
-    let result =
+    let mut result =
         apply_config_plan(&paths.config, &paths.backups, &plan).map_err(redacted_core_error)?;
+    if !result.manifest_finalized {
+        match recover_prepared_backup(&result.manifest_path, &paths.config, &paths.catalog)
+            .map_err(redacted_core_error)?
+        {
+            RecoveryOutcome::FinalizedApplied => result.manifest_finalized = true,
+            RecoveryOutcome::RolledBack => {
+                return Err(
+                    "the configuration changed incompletely and was safely rolled back".to_string(),
+                );
+            }
+            RecoveryOutcome::NotNeeded => {
+                return Err(
+                    "the configuration recovery record did not reach its expected state"
+                        .to_string(),
+                );
+            }
+        }
+    }
     Ok(ApplySummary {
         transaction_id: result.transaction_id.to_string(),
         backup_manifest: result.manifest_path,
@@ -227,6 +330,13 @@ fn save_profile(
     vault: tauri::State<'_, DiscoveryVault>,
 ) -> Result<(), String> {
     let paths = app_paths()?;
+    if load_proxy_state(&paths).is_ok_and(|state| {
+        state.enabled && state.profile_id.as_deref() == Some(input.profile.id.as_str())
+    }) {
+        return Err(
+            "switch away from this connection before replacing its saved settings".to_string(),
+        );
+    }
     let _profile_lock = lock_profiles(&paths)?;
     let mut store = load_profiles(&paths)?;
     upsert_profile(&mut store, input.profile.clone()).map_err(redacted_core_error)?;
@@ -275,6 +385,21 @@ fn save_profile(
 #[tauri::command]
 fn apply_saved_profile(profile_id: String, selected_model: String) -> Result<ApplySummary, String> {
     let paths = app_paths()?;
+    match load_proxy_state(&paths) {
+        Ok(state)
+            if state.enabled
+                || current_proxy_config_state(&paths, LOCAL_PROXY_PORT)?
+                    != ProxyConfigState::NotSelected =>
+        {
+            return Err("close fast switching before writing a direct configuration".to_string());
+        }
+        Err(_) => {
+            return Err(
+                "repair or close fast switching before writing a direct configuration".to_string(),
+            );
+        }
+        _ => {}
+    }
     let profile = load_profiles(&paths)?
         .profiles
         .into_iter()
@@ -284,8 +409,378 @@ fn apply_saved_profile(profile_id: String, selected_model: String) -> Result<App
 }
 
 #[tauri::command]
+async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalProxyStatus, String> {
+    let paths = app_paths()?;
+    let mut runtime = runtime.inner.lock().await;
+    let config_state = match current_proxy_config_state(&paths, LOCAL_PROXY_PORT) {
+        Ok(state) => state,
+        Err(error) => {
+            if let Some(handle) = runtime.handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            return match load_proxy_state(&paths) {
+                Ok(state) => {
+                    runtime.last_error = Some(error);
+                    let mut status = proxy_status_from(&state, &runtime);
+                    status.recovery_required = true;
+                    status.manual_recovery_required = true;
+                    Ok(status)
+                }
+                Err(_) => Ok(LocalProxyStatus {
+                    enabled: true,
+                    running: false,
+                    recovery_required: true,
+                    manual_recovery_required: true,
+                    current_profile_id: None,
+                    current_model_id: None,
+                    requires_codex_restart: false,
+                    last_error: Some(
+                        "Codex settings and fast-switch recovery state could not be read safely"
+                            .to_string(),
+                    ),
+                }),
+            };
+        }
+    };
+    let config_selected = config_state != ProxyConfigState::NotSelected;
+    let state = match load_proxy_state(&paths) {
+        Ok(state) => state,
+        Err(error) => {
+            if let Some(handle) = runtime.handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            let fallback_state = StoredProxyState::default();
+            return Ok(LocalProxyStatus {
+                enabled: true,
+                running: false,
+                recovery_required: true,
+                manual_recovery_required: config_selected
+                    && !proxy_activation_can_restore_automatically(&paths, &fallback_state),
+                current_profile_id: None,
+                current_model_id: None,
+                requires_codex_restart: config_selected,
+                last_error: Some(error),
+            });
+        }
+    };
+    if state.enabled && config_selected {
+        if let Err(error) = verify_active_proxy_configuration(&paths, &state) {
+            if let Some(handle) = runtime.handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            runtime.last_error = Some(error);
+            let mut status = proxy_status_from(&state, &runtime);
+            status.recovery_required = true;
+            status.manual_recovery_required =
+                !proxy_activation_can_restore_automatically(&paths, &state);
+            return Ok(status);
+        }
+        if runtime
+            .handle
+            .as_ref()
+            .is_none_or(|handle| !handle.health().running)
+        {
+            match load_proxy_route(&paths, &state) {
+                Ok((_, route)) => {
+                    if let Err(error) = start_proxy_handle(&state, &mut runtime, route, false).await
+                    {
+                        runtime.last_error = Some(error);
+                    }
+                }
+                Err(error) => runtime.last_error = Some(error),
+            }
+        }
+        if runtime
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.health().running)
+        {
+            runtime.last_error = None;
+        }
+    } else if state.enabled {
+        if let Some(handle) = runtime.handle.take() {
+            let _ = handle.shutdown().await;
+        }
+        runtime.last_error =
+            Some("fast-switch setup is incomplete; choose a connection again".to_string());
+        let mut status = proxy_status_from(&state, &runtime);
+        status.recovery_required = true;
+        if let Ok(manifest_path) = proxy_activation_manifest_path(&paths, &state)
+            && let Ok(manifest) = read_proxy_activation_manifest_metadata(&paths, &manifest_path)
+            && manifest.status != BackupStatus::Applied
+        {
+            status.manual_recovery_required =
+                !proxy_activation_can_restore_automatically(&paths, &state);
+        }
+        return Ok(status);
+    } else if config_selected {
+        if let Some(handle) = runtime.handle.take() {
+            let _ = handle.shutdown().await;
+        }
+        runtime.last_error = Some(
+            "Codex points to the local proxy but its recovery state is incomplete".to_string(),
+        );
+        let mut status = proxy_status_from(&state, &runtime);
+        status.enabled = true;
+        status.recovery_required = true;
+        status.manual_recovery_required =
+            !proxy_activation_can_restore_automatically(&paths, &state);
+        return Ok(status);
+    } else if let Some(handle) = runtime.handle.take() {
+        let _ = handle.shutdown().await;
+    }
+    Ok(proxy_status_from(&state, &runtime))
+}
+
+#[tauri::command]
+async fn enable_proxy(
+    profile_id: String,
+    selected_model: String,
+    runtime: tauri::State<'_, ProxyRuntime>,
+    app: tauri::AppHandle,
+) -> Result<LocalProxyStatus, String> {
+    let paths = app_paths()?;
+    let mut runtime = runtime.inner.lock().await;
+    require_clean_recovery_state(&paths)?;
+    ensure_stable_helper(&paths)?;
+    let existing = read_config_safely(&paths.config)?;
+    let current = inspect_config(&existing).map_err(redacted_core_error)?;
+    let proxy_base_url = proxy_base_url(LOCAL_PROXY_PORT);
+    let config_needs_write = current.provider_id != LOCAL_PROXY_PROVIDER_ID
+        || current.base_url.as_deref() != Some(proxy_base_url.as_str());
+    if current.provider_id == LOCAL_PROXY_PROVIDER_ID && config_needs_write {
+        return Err(
+            "the reserved local proxy provider has changed; repair it before enabling fast switching"
+                .to_string(),
+        );
+    }
+    let previous = load_proxy_state(&paths).map_err(|_| {
+        "fast-switch recovery state is damaged; repair it before enabling fast switching"
+            .to_string()
+    })?;
+    if previous.enabled && config_needs_write {
+        return Err(
+            "close the incomplete fast-switch activation before enabling a new one".to_string(),
+        );
+    }
+    let requested = proxy_state_for_selection(&previous, &profile_id, &selected_model);
+    let (profile, route) = load_proxy_route(&paths, &requested)?;
+    let plan = config_needs_write
+        .then(|| {
+            plan_proxy_config(
+                &existing,
+                &profile,
+                &selected_model,
+                &paths.catalog,
+                &paths.helper,
+                &proxy_base_url,
+            )
+            .map_err(redacted_core_error)
+        })
+        .transpose()?;
+
+    let mut next = requested;
+    next.requires_codex_restart |= config_needs_write;
+    next.activation_transaction_id = if config_needs_write {
+        Some(Uuid::new_v4())
+    } else {
+        previous
+            .activation_transaction_id
+            .or(recover_proxy_activation_transaction(&paths)?)
+    };
+    if !config_needs_write && next.activation_transaction_id.is_none() {
+        return Err(
+            "Codex already points to the local proxy, but no safe restore point is available"
+                .to_string(),
+        );
+    }
+    if !config_needs_write {
+        verify_active_proxy_configuration(&paths, &next)?;
+    }
+    start_proxy_handle(&next, &mut runtime, route, true).await?;
+
+    if enable_background_startup(&app).is_err() {
+        let _ = disable_background_startup(&app);
+        rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
+        return Err("could not enable automatic startup for fast switching".to_string());
+    }
+    if let Err(error) = write_proxy_state(&paths, &next) {
+        if !previous.enabled {
+            let _ = disable_background_startup(&app);
+        }
+        rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
+        return Err(error);
+    }
+    if let Some(plan) = plan {
+        let transaction_id = next
+            .activation_transaction_id
+            .expect("a new proxy configuration has a preallocated transaction ID");
+        match apply_config_plan_with_transaction_id(
+            &paths.config,
+            &paths.backups,
+            &plan,
+            transaction_id,
+        ) {
+            Ok(result) => {
+                debug_assert_eq!(result.transaction_id, transaction_id);
+                if !result.manifest_finalized {
+                    match recover_prepared_backup(
+                        &result.manifest_path,
+                        &paths.config,
+                        &paths.catalog,
+                    ) {
+                        Ok(RecoveryOutcome::FinalizedApplied) => {}
+                        Ok(RecoveryOutcome::RolledBack) => {
+                            let _ = write_proxy_state(&paths, &previous);
+                            if !previous.enabled {
+                                let _ = disable_background_startup(&app);
+                            }
+                            rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
+                            return Err(
+                                "fast-switch configuration was safely rolled back before activation"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(RecoveryOutcome::NotNeeded) | Err(_) => {
+                            runtime.last_error = Some(
+                                "fast-switch recovery record could not be finalized".to_string(),
+                            );
+                            return Err(
+                                "fast switching was configured, but its recovery record could not be finalized; refresh status before continuing"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = write_proxy_state(&paths, &previous);
+                if !previous.enabled {
+                    let _ = disable_background_startup(&app);
+                }
+                rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
+                return Err(redacted_core_error(error));
+            }
+        }
+    }
+
+    runtime.last_error = None;
+    Ok(proxy_status_from(&next, &runtime))
+}
+
+#[tauri::command]
+async fn switch_proxy_route(
+    profile_id: String,
+    selected_model: String,
+    runtime: tauri::State<'_, ProxyRuntime>,
+) -> Result<LocalProxyStatus, String> {
+    let paths = app_paths()?;
+    let mut runtime = runtime.inner.lock().await;
+    let previous = load_proxy_state(&paths)?;
+    if !previous.enabled {
+        return Err("fast switching is not enabled".to_string());
+    }
+    if current_proxy_config_state(&paths, previous.port)? != ProxyConfigState::Managed {
+        return Err(
+            "fast-switch setup is incomplete; enable it again before switching models".to_string(),
+        );
+    }
+    verify_active_proxy_configuration(&paths, &previous)?;
+    let next = proxy_state_for_selection(&previous, &profile_id, &selected_model);
+    let (_, route) = load_proxy_route(&paths, &next)?;
+    start_proxy_handle(&next, &mut runtime, route, false).await?;
+    if let Err(error) = write_proxy_state(&paths, &next) {
+        rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
+        return Err(error);
+    }
+    runtime.last_error = None;
+    Ok(proxy_status_from(&next, &runtime))
+}
+
+#[tauri::command]
+async fn disable_proxy(
+    runtime: tauri::State<'_, ProxyRuntime>,
+    app: tauri::AppHandle,
+) -> Result<LocalProxyStatus, String> {
+    let paths = app_paths()?;
+    let mut runtime = runtime.inner.lock().await;
+    let (previous, state_was_damaged) = match load_proxy_state(&paths) {
+        Ok(state) => (state, false),
+        Err(_) => (StoredProxyState::default(), true),
+    };
+    let config_state = current_proxy_config_state(&paths, previous.port)?;
+    let config_selected = config_state != ProxyConfigState::NotSelected;
+    if !previous.enabled && !config_selected && !state_was_damaged {
+        let autostart_error = disable_background_startup(&app).err();
+        if let Some(handle) = runtime.handle.take() {
+            let _ = handle.shutdown().await;
+        }
+        runtime.last_error = autostart_error.map(|_| {
+            "automatic startup could not be removed; fast switching remains disabled".into()
+        });
+        return Ok(proxy_status_from(&previous, &runtime));
+    }
+
+    if config_selected {
+        restore_proxy_activation(&paths, &previous)?;
+    } else if previous.enabled
+        && let Ok(manifest_path) = proxy_activation_manifest_path(&paths, &previous)
+        && read_proxy_activation_manifest_metadata(&paths, &manifest_path)?.status
+            != BackupStatus::Applied
+    {
+        finalize_proxy_restore_journal(&paths, &manifest_path)?;
+    }
+    if current_proxy_config_state(&paths, previous.port)? == ProxyConfigState::Managed {
+        return Err(
+            "fast-switch restore completed without detaching the managed local proxy".to_string(),
+        );
+    }
+    let next = StoredProxyState {
+        enabled: false,
+        profile_id: None,
+        model_id: None,
+        activation_transaction_id: None,
+        revision: previous.revision.saturating_add(1),
+        requires_codex_restart: config_selected
+            || previous.enabled
+            || previous.requires_codex_restart,
+        ..previous
+    };
+    let state_write_error = write_proxy_state(&paths, &next).err();
+    let autostart_error = disable_background_startup(&app).err();
+    if let Some(handle) = runtime.handle.take() {
+        let _ = handle.shutdown().await;
+    }
+    if state_write_error.is_some() {
+        runtime.last_error =
+            Some("Codex settings were restored, but fast-switch cleanup is incomplete".to_string());
+        return Err(
+            "Codex settings were restored, but fast-switch cleanup is incomplete; choose close fast switching again"
+                .to_string(),
+        );
+    }
+    runtime.last_error = autostart_error
+        .map(|_| "automatic startup could not be removed; fast switching remains disabled".into());
+    Ok(proxy_status_from(&next, &runtime))
+}
+
+#[tauri::command]
 fn delete_saved_profile(profile_id: String) -> Result<bool, String> {
     let paths = app_paths()?;
+    match load_proxy_state(&paths) {
+        Ok(state) if state.enabled && state.profile_id.as_deref() == Some(profile_id.as_str()) => {
+            return Err(
+                "switch to another connection before removing the active fast-switch route"
+                    .to_string(),
+            );
+        }
+        Err(_) => {
+            return Err(
+                "repair or close fast switching before removing a saved connection".to_string(),
+            );
+        }
+        _ => {}
+    }
     let _profile_lock = lock_profiles(&paths)?;
     let mut store = load_profiles(&paths)?;
     let removed = remove_profile(&mut store, &profile_id).map_err(redacted_core_error)?;
@@ -299,22 +794,60 @@ fn delete_saved_profile(profile_id: String) -> Result<bool, String> {
 #[tauri::command]
 fn restore_latest() -> Result<String, String> {
     let paths = app_paths()?;
-    require_clean_recovery_state(&paths)?;
     let manifest = latest_applied_manifest(&paths)?
         .ok_or_else(|| "no applied switcher backup is available".to_string())?;
     let result =
         restore_backup(&manifest, &paths.config, &paths.catalog).map_err(redacted_core_error)?;
+    if !result.manifest_finalized {
+        recover_prepared_backup(&manifest, &paths.config, &paths.catalog)
+            .map_err(redacted_core_error)?;
+    }
     Ok(result.transaction_id.to_string())
 }
 
 #[tauri::command]
 fn open_codex() -> Result<String, String> {
-    launch_codex()
+    let launched = launch_codex()?;
+    if let Ok(paths) = app_paths()
+        && let Ok(mut state) = load_proxy_state(&paths)
+        && state.requires_codex_restart
+    {
+        state.requires_codex_restart = false;
+        state.revision = state.revision.saturating_add(1);
+        let _ = write_proxy_state(&paths, &state);
+    }
+    Ok(launched)
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _| {
+            if !arguments.iter().any(|argument| argument == "--background") {
+                show_main_window(app);
+            }
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--background"]),
+        ))
         .manage(DiscoveryVault::default())
+        .manage(ProxyRuntime::default())
+        .setup(|app| {
+            setup_tray(app)?;
+            let background = std::env::args_os()
+                .any(|argument| argument == std::ffi::OsStr::new("--background"));
+            start_proxy_on_launch(app.handle().clone(), background);
+            if !background {
+                show_main_window(app.handle());
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             inspect_state,
             discover_models,
@@ -322,12 +855,241 @@ pub fn run() {
             cancel_discovery,
             save_profile,
             apply_saved_profile,
+            proxy_status,
+            enable_proxy,
+            switch_proxy_route,
+            disable_proxy,
             delete_saved_profile,
             restore_latest,
             open_codex,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Codex Provider Switcher");
+        .build(tauri::generate_context!())
+        .expect("failed to build Codex Provider Switcher");
+    app.run(|app, event| match event {
+        tauri::RunEvent::ExitRequested {
+            code: None, api, ..
+        } if proxy_is_enabled_for_tray() => {
+            api.prevent_exit();
+            show_main_window(app);
+        }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => show_main_window(app),
+        _ => {}
+    });
+}
+
+fn start_proxy_on_launch(app: tauri::AppHandle, background: bool) {
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager as _;
+
+        let result = async {
+            let runtime = app.state::<ProxyRuntime>();
+            let mut runtime = runtime.inner.lock().await;
+            let paths = app_paths()?;
+            let state = load_proxy_state(&paths)?;
+            let config_state = current_proxy_config_state(&paths, state.port)?;
+            if !state.enabled {
+                if config_state != ProxyConfigState::NotSelected {
+                    return Err(
+                        "Codex points to the local proxy but its recovery state is incomplete"
+                            .to_string(),
+                    );
+                }
+                let _ = disable_background_startup(&app);
+                if background {
+                    app.exit(0);
+                }
+                return Ok(());
+            }
+            if config_state != ProxyConfigState::Managed {
+                return Err(
+                    "fast-switch setup is incomplete; choose a connection again".to_string()
+                );
+            }
+            verify_active_proxy_configuration(&paths, &state)?;
+            let (_, route) = load_proxy_route(&paths, &state)?;
+            start_proxy_handle(&state, &mut runtime, route, false).await
+        }
+        .await;
+
+        if let Err(error) = result {
+            let runtime = app.state::<ProxyRuntime>();
+            runtime.inner.lock().await.last_error = Some(error);
+            if background {
+                show_main_window(&app);
+            }
+        }
+    });
+}
+
+fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let open_item =
+        tauri::menu::MenuItem::with_id(app, "open-switcher", "打开模型切换", true, None::<&str>)?;
+    let quit_item = tauri::menu::MenuItem::with_id(
+        app,
+        "quit-switcher",
+        "退出（需先关闭快速切换）",
+        true,
+        None::<&str>,
+    )?;
+    let menu = tauri::menu::Menu::with_items(app, &[&open_item, &quit_item])?;
+    let mut tray = tauri::tray::TrayIconBuilder::new()
+        .tooltip("Codex 模型切换")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open-switcher" => show_main_window(app),
+            "quit-switcher" if proxy_is_enabled_for_tray() => show_main_window(app),
+            "quit-switcher" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(windows)]
+fn enable_background_startup(_app: &tauri::AppHandle) -> Result<(), String> {
+    use winreg::RegKey;
+    use winreg::RegValue;
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::KEY_READ;
+    use winreg::enums::KEY_SET_VALUE;
+    use winreg::enums::RegType::REG_BINARY;
+
+    const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    const STARTUP_APPROVED_KEY: &str =
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    const ENABLED: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    let executable = std::env::current_exe()
+        .map_err(|_| "could not resolve the app path for automatic startup".to_string())?;
+    let executable = executable
+        .to_str()
+        .filter(|path| {
+            !path
+                .chars()
+                .any(|character| matches!(character, '"' | '\r' | '\n'))
+        })
+        .ok_or_else(|| "the app path cannot be used for automatic startup".to_string())?;
+    let command = format!("\"{executable}\" --background");
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let result = (|| -> io::Result<()> {
+        let run_key = current_user.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE)?;
+        run_key.set_value(AUTOSTART_NAME, &command)?;
+        let stored_command: String = run_key.get_value(AUTOSTART_NAME)?;
+        if stored_command != command {
+            return Err(io::Error::other(
+                "automatic startup command did not round-trip exactly",
+            ));
+        }
+
+        let approved_key = current_user
+            .create_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_READ | KEY_SET_VALUE)?
+            .0;
+        approved_key.set_raw_value(
+            AUTOSTART_NAME,
+            &RegValue {
+                vtype: REG_BINARY,
+                bytes: ENABLED.to_vec(),
+            },
+        )?;
+        let stored_approval = approved_key.get_raw_value(AUTOSTART_NAME)?;
+        if stored_approval.vtype != REG_BINARY || stored_approval.bytes != ENABLED {
+            return Err(io::Error::other(
+                "automatic startup approval did not round-trip exactly",
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = delete_windows_registry_value(&current_user, RUN_KEY);
+        let _ = delete_windows_registry_value(&current_user, STARTUP_APPROVED_KEY);
+    }
+    result.map_err(|_| "could not enable automatic startup".to_string())
+}
+
+#[cfg(not(windows))]
+fn enable_background_startup(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt as _;
+
+    app.autolaunch()
+        .enable()
+        .map_err(|_| "could not enable automatic startup".to_string())
+}
+
+#[cfg(windows)]
+fn disable_background_startup(_app: &tauri::AppHandle) -> Result<(), String> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    const STARTUP_APPROVED_KEY: &str =
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let run_result = delete_windows_registry_value(&current_user, RUN_KEY);
+    let approval_result = delete_windows_registry_value(&current_user, STARTUP_APPROVED_KEY);
+    if run_result.is_ok() && approval_result.is_ok() {
+        Ok(())
+    } else {
+        Err("could not disable automatic startup".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn delete_windows_registry_value(root: &winreg::RegKey, key_path: &str) -> io::Result<()> {
+    use winreg::enums::KEY_SET_VALUE;
+
+    let key = match root.open_subkey_with_flags(key_path, KEY_SET_VALUE) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match key.delete_value(AUTOSTART_NAME) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_background_startup(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt as _;
+
+    match app.autolaunch().disable() {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().to_ascii_lowercase().contains("not found") => Ok(()),
+        Err(_) => Err("could not disable automatic startup".to_string()),
+    }
+}
+
+fn proxy_is_enabled_for_tray() -> bool {
+    app_paths()
+        .and_then(|paths| load_proxy_state(&paths))
+        .map(|state| state.enabled)
+        .unwrap_or(true)
 }
 
 pub fn credential_cli() -> Option<i32> {
@@ -397,11 +1159,562 @@ fn verify_credential_binding(account: &str) -> Result<(), String> {
     verify_core_credential_binding(&config, account, &current_path).map_err(redacted_core_error)
 }
 
+fn proxy_status_from(state: &StoredProxyState, runtime: &ProxyRuntimeState) -> LocalProxyStatus {
+    let running = runtime
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.health().running);
+    LocalProxyStatus {
+        enabled: state.enabled,
+        running,
+        recovery_required: false,
+        manual_recovery_required: false,
+        current_profile_id: state.profile_id.clone(),
+        current_model_id: state.model_id.clone(),
+        requires_codex_restart: state.requires_codex_restart,
+        last_error: runtime.last_error.clone(),
+    }
+}
+
+fn proxy_state_for_selection(
+    previous: &StoredProxyState,
+    profile_id: &str,
+    model_id: &str,
+) -> StoredProxyState {
+    StoredProxyState {
+        schema_version: PROXY_STATE_SCHEMA_VERSION,
+        enabled: true,
+        profile_id: Some(profile_id.to_string()),
+        model_id: Some(model_id.to_string()),
+        activation_transaction_id: previous.activation_transaction_id,
+        port: previous.port,
+        revision: previous.revision.saturating_add(1),
+        requires_codex_restart: previous.requires_codex_restart,
+    }
+}
+
+fn proxy_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+fn current_proxy_config_state(paths: &AppPaths, port: u16) -> Result<ProxyConfigState, String> {
+    let existing = read_config_safely(&paths.config)?;
+    let current = inspect_config(&existing).map_err(redacted_core_error)?;
+    if current.provider_id != LOCAL_PROXY_PROVIDER_ID {
+        Ok(ProxyConfigState::NotSelected)
+    } else if current.base_url.as_deref() == Some(proxy_base_url(port).as_str()) {
+        Ok(ProxyConfigState::Managed)
+    } else {
+        Ok(ProxyConfigState::Changed)
+    }
+}
+
+fn proxy_activation_can_restore_automatically(paths: &AppPaths, state: &StoredProxyState) -> bool {
+    let Ok(manifest_path) = proxy_activation_manifest_path(paths, state) else {
+        return false;
+    };
+    let Ok(manifest) = read_proxy_activation_manifest_metadata(paths, &manifest_path) else {
+        return false;
+    };
+    if verify_backup_integrity(&manifest_path, &paths.config, &paths.catalog).is_err() {
+        return false;
+    }
+    match manifest.status {
+        BackupStatus::Applied => {
+            backup_matches_applied(&manifest).unwrap_or(false)
+                || verify_active_proxy_configuration(paths, state).is_ok()
+        }
+        BackupStatus::Detaching => {
+            verify_proxy_detach_recoverable(&manifest_path, &paths.config, &paths.catalog).is_ok()
+        }
+        BackupStatus::Prepared | BackupStatus::Restoring => {
+            recover_prepared_backup(&manifest_path, &paths.config, &paths.catalog).is_ok()
+                && proxy_activation_can_restore_automatically(paths, state)
+        }
+        BackupStatus::Restored => false,
+    }
+}
+
+fn proxy_activation_manifest(
+    paths: &AppPaths,
+    state: &StoredProxyState,
+) -> Result<PathBuf, String> {
+    let manifest_path = proxy_activation_manifest_path(paths, state)?;
+    recover_prepared_backup(&manifest_path, &paths.config, &paths.catalog)
+        .map_err(redacted_core_error)?;
+    read_proxy_activation_manifest(paths, &manifest_path)?;
+    Ok(manifest_path)
+}
+
+fn proxy_activation_manifest_path(
+    paths: &AppPaths,
+    state: &StoredProxyState,
+) -> Result<PathBuf, String> {
+    let transaction_id = match state.activation_transaction_id {
+        Some(transaction_id) => transaction_id,
+        None => recover_proxy_activation_transaction(paths)?.ok_or_else(|| {
+            "no safe restore point is available for this fast-switch activation".to_string()
+        })?,
+    };
+    let manifest_path = paths
+        .backups
+        .join(transaction_id.to_string())
+        .join("manifest.json");
+    let manifest = read_proxy_activation_manifest_metadata(paths, &manifest_path)?;
+    if manifest.transaction_id != transaction_id {
+        return Err("fast-switch restore point does not match its transaction".to_string());
+    }
+    Ok(manifest_path)
+}
+
+fn restore_proxy_activation(paths: &AppPaths, state: &StoredProxyState) -> Result<(), String> {
+    let manifest_path = proxy_activation_manifest_path(paths, state)?;
+    let mut manifest = read_proxy_activation_manifest_metadata(paths, &manifest_path)?;
+    if matches!(
+        manifest.status,
+        BackupStatus::Prepared | BackupStatus::Restoring
+    ) {
+        recover_prepared_backup(&manifest_path, &paths.config, &paths.catalog)
+            .map_err(redacted_core_error)?;
+        manifest = read_proxy_activation_manifest_metadata(paths, &manifest_path)?;
+    }
+
+    match manifest.status {
+        BackupStatus::Applied => {
+            let result = match restore_backup(&manifest_path, &paths.config, &paths.catalog) {
+                Ok(result) => result,
+                Err(exact_error) => {
+                    if recover_prepared_backup(&manifest_path, &paths.config, &paths.catalog)
+                        .is_ok()
+                    {
+                        let recovered =
+                            read_proxy_activation_manifest_metadata(paths, &manifest_path)?;
+                        if recovered.status == BackupStatus::Restored {
+                            return Ok(());
+                        }
+                    }
+                    verify_active_proxy_configuration(paths, state)?;
+                    match restore_proxy_config_preserving_unrelated_changes(
+                        &manifest_path,
+                        &paths.config,
+                        &paths.catalog,
+                        &proxy_base_url(state.port),
+                    ) {
+                        Ok(result) => result,
+                        Err(_) => return Err(redacted_core_error(exact_error)),
+                    }
+                }
+            };
+            if !result.manifest_finalized {
+                finalize_proxy_restore_journal(paths, &manifest_path)?;
+            }
+        }
+        BackupStatus::Detaching => {
+            verify_proxy_detach_recoverable(&manifest_path, &paths.config, &paths.catalog)
+                .map_err(redacted_core_error)?;
+            let result = restore_proxy_config_preserving_unrelated_changes(
+                &manifest_path,
+                &paths.config,
+                &paths.catalog,
+                &proxy_base_url(state.port),
+            )
+            .map_err(redacted_core_error)?;
+            if !result.manifest_finalized {
+                finalize_proxy_restore_journal(paths, &manifest_path)?;
+            }
+        }
+        BackupStatus::Restored => {}
+        BackupStatus::Prepared | BackupStatus::Restoring => {
+            return Err("fast-switch recovery journal is still incomplete".to_string());
+        }
+    }
+    finalize_proxy_restore_journal(paths, &manifest_path)
+}
+
+fn finalize_proxy_restore_journal(paths: &AppPaths, manifest_path: &Path) -> Result<(), String> {
+    for _ in 0..2 {
+        let manifest = read_proxy_activation_manifest_metadata(paths, manifest_path)?;
+        match manifest.status {
+            BackupStatus::Restored => return Ok(()),
+            BackupStatus::Prepared | BackupStatus::Restoring => {
+                recover_prepared_backup(manifest_path, &paths.config, &paths.catalog)
+                    .map_err(redacted_core_error)?;
+            }
+            BackupStatus::Detaching => {
+                verify_proxy_detach_recoverable(manifest_path, &paths.config, &paths.catalog)
+                    .map_err(redacted_core_error)?;
+                restore_proxy_config_preserving_unrelated_changes(
+                    manifest_path,
+                    &paths.config,
+                    &paths.catalog,
+                    &proxy_base_url(LOCAL_PROXY_PORT),
+                )
+                .map_err(redacted_core_error)?;
+            }
+            BackupStatus::Applied => {
+                return Err("fast-switch restore did not reach a final state".to_string());
+            }
+        }
+    }
+    let manifest = read_proxy_activation_manifest_metadata(paths, manifest_path)?;
+    if manifest.status == BackupStatus::Restored {
+        Ok(())
+    } else {
+        Err(
+            "Codex settings were restored, but the recovery journal could not be finalized"
+                .to_string(),
+        )
+    }
+}
+
+fn verify_active_proxy_configuration(
+    paths: &AppPaths,
+    state: &StoredProxyState,
+) -> Result<(), String> {
+    let transaction_id = state
+        .activation_transaction_id
+        .ok_or_else(|| "enabled fast-switch state has no activation transaction".to_string())?;
+    let manifest_path = proxy_activation_manifest_path(paths, state)?;
+    recover_prepared_backup(&manifest_path, &paths.config, &paths.catalog)
+        .map_err(redacted_core_error)?;
+    let manifest = read_proxy_activation_manifest_metadata(paths, &manifest_path)?;
+    if manifest.transaction_id != transaction_id || manifest.status != BackupStatus::Applied {
+        return Err("fast-switch restore point does not match its transaction".to_string());
+    }
+    verify_backup_integrity(&manifest_path, &paths.config, &paths.catalog)
+        .map_err(redacted_core_error)?;
+    let config = read_config_safely(&paths.config)?;
+    let current = inspect_config(&config).map_err(redacted_core_error)?;
+    if current.model_id.as_deref() != Some(manifest.model_id.as_str()) {
+        return Err("the managed local proxy model changed after activation".to_string());
+    }
+    let helper = verify_core_proxy_config_binding(&config, &proxy_base_url(state.port))
+        .map_err(redacted_core_error)?;
+    verify_managed_helper(paths, &helper)?;
+    Ok(())
+}
+
+fn recover_proxy_activation_transaction(paths: &AppPaths) -> Result<Option<Uuid>, String> {
+    let Some(manifest_path) = latest_applied_manifest(paths)? else {
+        return Ok(None);
+    };
+    let manifest = match read_proxy_activation_manifest(paths, &manifest_path) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(manifest.transaction_id))
+}
+
+fn read_proxy_activation_manifest(
+    paths: &AppPaths,
+    manifest_path: &Path,
+) -> Result<BackupManifest, String> {
+    let manifest = read_proxy_activation_manifest_metadata(paths, manifest_path)?;
+    if manifest.status != BackupStatus::Applied
+        || !backup_matches_applied(&manifest).map_err(redacted_core_error)?
+    {
+        return Err("fast-switch restore point no longer matches Codex settings".to_string());
+    }
+    Ok(manifest)
+}
+
+fn read_proxy_activation_manifest_metadata(
+    paths: &AppPaths,
+    manifest_path: &Path,
+) -> Result<BackupManifest, String> {
+    match fs::symlink_metadata(manifest_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("fast-switch restore point is not a safe regular file".to_string());
+        }
+        Ok(_) => {}
+        Err(_) => return Err("fast-switch restore point is unavailable".to_string()),
+    }
+    let manifest = serde_json::from_slice::<BackupManifest>(
+        &fs::read(manifest_path)
+            .map_err(|_| "could not read the fast-switch restore point".to_string())?,
+    )
+    .map_err(|_| "fast-switch restore point is invalid".to_string())?;
+    if manifest.schema_version != 1
+        || manifest.provider_id != LOCAL_PROXY_PROVIDER_ID
+        || manifest.config.path != paths.config
+        || manifest.catalog.path != paths.catalog
+        || manifest_path.file_name().and_then(|name| name.to_str()) != Some("manifest.json")
+        || manifest_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some(manifest.transaction_id.to_string().as_str())
+    {
+        return Err("fast-switch restore point metadata is not safely applicable".to_string());
+    }
+    Ok(manifest)
+}
+
+fn verify_managed_helper(paths: &AppPaths, helper: &Path) -> Result<(), String> {
+    let helper_dir = helper
+        .parent()
+        .ok_or_else(|| "managed credential helper has no parent".to_string())?;
+    let helper_root = helper_dir
+        .parent()
+        .ok_or_else(|| "managed credential helper has no private root".to_string())?;
+    if helper_root != paths.state.join("helpers") {
+        return Err("managed credential helper is outside the private helper root".to_string());
+    }
+    let fingerprint = helper_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "managed credential helper has an invalid fingerprint".to_string())?;
+    let expected_name = if cfg!(windows) {
+        "codex-provider-switcher-helper.exe"
+    } else {
+        "codex-provider-switcher-helper"
+    };
+    if helper.file_name().and_then(|name| name.to_str()) != Some(expected_name) {
+        return Err("managed credential helper has an unexpected name".to_string());
+    }
+    for directory in [&paths.state, helper_root, helper_dir] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+            _ => return Err("managed credential helper directory is unsafe".to_string()),
+        }
+    }
+    ensure_regular_source(helper)?;
+    if sha256_file(helper)? != fingerprint.to_ascii_lowercase() {
+        return Err("managed credential helper failed its integrity check".to_string());
+    }
+    Ok(())
+}
+
+fn load_proxy_state(paths: &AppPaths) -> Result<StoredProxyState, String> {
+    let mut state = match fs::symlink_metadata(&paths.proxy_state) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("fast-switch state path is not a safe regular file".to_string());
+        }
+        Ok(_) => {
+            let contents = fs::read_to_string(&paths.proxy_state)
+                .map_err(|_| "could not read fast-switch state".to_string())?;
+            serde_json::from_str::<StoredProxyState>(&contents)
+                .map_err(|_| "fast-switch state is invalid".to_string())?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => StoredProxyState::default(),
+        Err(_) => return Err("could not inspect fast-switch state".to_string()),
+    };
+    if state.schema_version == 1 {
+        if state.enabled && state.activation_transaction_id.is_none() {
+            state.activation_transaction_id =
+                Some(recover_proxy_activation_transaction(paths)?.ok_or_else(|| {
+                    "legacy fast-switch state has no safely matching restore point".to_string()
+                })?);
+        }
+        state.schema_version = PROXY_STATE_SCHEMA_VERSION;
+        write_proxy_state(paths, &state)?;
+    }
+    validate_proxy_state(&state)?;
+    Ok(state)
+}
+
+fn validate_proxy_state(state: &StoredProxyState) -> Result<(), String> {
+    if state.schema_version != PROXY_STATE_SCHEMA_VERSION {
+        return Err("fast-switch state uses an unsupported version".to_string());
+    }
+    if state.port != LOCAL_PROXY_PORT {
+        return Err("fast-switch state contains an unsupported local port".to_string());
+    }
+    if state.enabled
+        && (state.profile_id.as_deref().is_none_or(str::is_empty)
+            || state.model_id.as_deref().is_none_or(str::is_empty)
+            || state.activation_transaction_id.is_none_or(|id| id.is_nil()))
+    {
+        return Err(
+            "enabled fast-switch state has no complete selection or activation transaction"
+                .to_string(),
+        );
+    }
+    if !state.enabled && state.activation_transaction_id.is_some() {
+        return Err(
+            "disabled fast-switch state cannot retain an activation transaction".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn write_proxy_state(paths: &AppPaths, state: &StoredProxyState) -> Result<(), String> {
+    validate_proxy_state(state)?;
+    ensure_state_root(paths)?;
+    let mut rendered = serde_json::to_vec_pretty(state)
+        .map_err(|_| "could not encode fast-switch state".to_string())?;
+    rendered.push(b'\n');
+    write_private_file(&paths.proxy_state, &rendered)
+        .map_err(|_| "could not save fast-switch state".to_string())
+}
+
+fn load_proxy_route(
+    paths: &AppPaths,
+    state: &StoredProxyState,
+) -> Result<(ProviderProfile, RouteConfig), String> {
+    let profile_id = state
+        .profile_id
+        .as_deref()
+        .ok_or_else(|| "choose a saved connection before enabling fast switching".to_string())?;
+    let model_id = state
+        .model_id
+        .as_deref()
+        .ok_or_else(|| "choose a model before enabling fast switching".to_string())?;
+    let profile = load_profiles(paths)?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| "the selected saved connection no longer exists".to_string())?;
+    if !profile.models.iter().any(|model| model.id == model_id) {
+        return Err("the selected model no longer belongs to this connection".to_string());
+    }
+    let account =
+        credential_account_for(&profile.id, &profile.base_url).map_err(redacted_core_error)?;
+    let secret = Zeroizing::new(credentials::get(&account)?);
+    let bearer = BearerToken::new(secret.as_str().to_string()).map_err(|_| {
+        "the saved provider credential cannot be used as a bearer token".to_string()
+    })?;
+    let models = profile.models.iter().map(proxy_model_descriptor).collect();
+    let route = RouteConfig::new(
+        profile.id.clone(),
+        &profile.base_url,
+        model_id,
+        models,
+        bearer,
+    )
+    .map_err(|_| "the selected connection cannot be used by the local proxy".to_string())?;
+    Ok((profile, route))
+}
+
+fn proxy_model_descriptor(model: &ModelSpec) -> ModelDescriptor {
+    ModelDescriptor {
+        slug: model.id.clone(),
+        display_name: model.display_name.clone(),
+        description: (!model.description.is_empty()).then(|| model.description.clone()),
+        context_window: i64::try_from(model.context_window).ok(),
+        max_context_window: i64::try_from(model.context_window).ok(),
+        default_reasoning_level: Some(reasoning_effort_id(&model.default_reasoning).to_string()),
+        supported_reasoning_levels: model
+            .reasoning_levels
+            .iter()
+            .map(|effort| ReasoningLevelDescriptor {
+                effort: reasoning_effort_id(effort).to_string(),
+                description: effort.description().to_string(),
+            })
+            .collect(),
+        supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+        supports_images: model.supports_images,
+    }
+}
+
+fn reasoning_effort_id(effort: &ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+        ReasoningEffort::Ultra => "ultra",
+    }
+}
+
+async fn start_proxy_handle(
+    state: &StoredProxyState,
+    runtime: &mut ProxyRuntimeState,
+    route: RouteConfig,
+    allow_create_token: bool,
+) -> Result<(), String> {
+    if runtime
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.health().running)
+    {
+        runtime
+            .handle
+            .as_ref()
+            .expect("running handle checked above")
+            .set_active_route(route);
+        runtime.last_error = None;
+        return Ok(());
+    }
+    if let Some(stale) = runtime.handle.take() {
+        let _ = stale.shutdown().await;
+    }
+
+    let base_url = proxy_base_url(state.port);
+    let account = proxy_credential_account_for(&base_url).map_err(redacted_core_error)?;
+    let secret = if credentials::exists(&account)? {
+        Zeroizing::new(credentials::get(&account)?)
+    } else if allow_create_token {
+        let secret = Zeroizing::new(generate_proxy_token());
+        credentials::store(&account, secret.as_str())?;
+        secret
+    } else {
+        return Err(
+            "the local proxy credential is missing; enable fast switching again".to_string(),
+        );
+    };
+    let entry_bearer = BearerToken::new(secret.as_str().to_string())
+        .map_err(|_| "the local proxy credential is invalid".to_string())?;
+    let options = ProxyStartOptions {
+        port: state.port,
+        max_request_bytes: LOCAL_PROXY_MAX_REQUEST_BYTES,
+        ..ProxyStartOptions::default()
+    };
+    let handle = LocalProxy::start(options, entry_bearer)
+        .await
+        .map_err(|_| "the local proxy could not start on 127.0.0.1".to_string())?;
+    if handle.listen_addr().port() != state.port {
+        let _ = handle.shutdown().await;
+        return Err("the local proxy started on an unexpected port".to_string());
+    }
+    handle.set_active_route(route);
+    runtime.handle = Some(handle);
+    runtime.last_error = None;
+    Ok(())
+}
+
+async fn rollback_proxy_runtime(
+    paths: &AppPaths,
+    previous: &StoredProxyState,
+    runtime: &mut ProxyRuntimeState,
+) {
+    if previous.enabled {
+        let rollback = match load_proxy_route(paths, previous) {
+            Ok((_, route)) => start_proxy_handle(previous, runtime, route, false).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = rollback {
+            if let Some(handle) = runtime.handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            runtime.last_error = Some(error);
+        }
+    } else if let Some(handle) = runtime.handle.take() {
+        let _ = handle.shutdown().await;
+    }
+}
+
+fn generate_proxy_token() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut token, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    token
+}
+
 struct AppPaths {
     state: PathBuf,
     config: PathBuf,
     catalog: PathBuf,
     profiles: PathBuf,
+    proxy_state: PathBuf,
     backups: PathBuf,
     executable: PathBuf,
     helper: PathBuf,
@@ -433,6 +1746,7 @@ fn app_paths() -> Result<AppPaths, String> {
         config: codex_home.join("config.toml"),
         catalog: state.join("models.json"),
         profiles: state.join("profiles.json"),
+        proxy_state: state.join("proxy.json"),
         backups: state.join("backups"),
         executable,
         helper,
@@ -722,7 +2036,7 @@ fn latest_applied_manifest(paths: &AppPaths) -> Result<Option<PathBuf>, String> 
         let Ok(manifest) = serde_json::from_slice::<BackupManifest>(&bytes) else {
             continue;
         };
-        if manifest.status == BackupStatus::Restored
+        if manifest.status != BackupStatus::Applied
             || !backup_matches_applied(&manifest).unwrap_or(false)
         {
             continue;
@@ -774,5 +2088,58 @@ fn redacted_core_error(error: codex_provider_switcher_core::SwitcherError) -> St
             "Codex configuration is not valid UTF-8".to_string()
         }
         _ => "local configuration operation failed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_state_requires_a_fixed_loopback_port_and_complete_selection() {
+        let mut state = StoredProxyState::default();
+        assert!(validate_proxy_state(&state).is_ok());
+
+        state.enabled = true;
+        assert!(validate_proxy_state(&state).is_err());
+        state.profile_id = Some("profile".to_string());
+        state.model_id = Some("model".to_string());
+        assert!(validate_proxy_state(&state).is_err());
+        state.activation_transaction_id = Some(Uuid::new_v4());
+        assert!(validate_proxy_state(&state).is_ok());
+        state.port += 1;
+        assert!(validate_proxy_state(&state).is_err());
+
+        let mut disabled_with_transaction = StoredProxyState::default();
+        disabled_with_transaction.activation_transaction_id = Some(Uuid::new_v4());
+        assert!(validate_proxy_state(&disabled_with_transaction).is_err());
+    }
+
+    #[test]
+    fn route_selection_is_keyless_and_preserves_restart_notice() {
+        let activation_transaction_id = Uuid::new_v4();
+        let previous = StoredProxyState {
+            requires_codex_restart: true,
+            revision: 7,
+            activation_transaction_id: Some(activation_transaction_id),
+            enabled: true,
+            profile_id: Some("profile-old".to_string()),
+            model_id: Some("model-old".to_string()),
+            ..StoredProxyState::default()
+        };
+        let selected = proxy_state_for_selection(&previous, "profile-a", "model-a");
+
+        assert!(selected.enabled);
+        assert_eq!(selected.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(selected.model_id.as_deref(), Some("model-a"));
+        assert_eq!(selected.revision, 8);
+        assert!(selected.requires_codex_restart);
+        assert_eq!(
+            selected.activation_transaction_id,
+            Some(activation_transaction_id)
+        );
+        let rendered = serde_json::to_string(&selected).unwrap();
+        assert!(!rendered.to_ascii_lowercase().contains("api_key"));
+        assert!(!rendered.to_ascii_lowercase().contains("bearer"));
     }
 }

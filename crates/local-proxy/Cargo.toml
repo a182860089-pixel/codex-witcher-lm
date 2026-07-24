@@ -1,0 +1,22 @@
+[package]
+name = "codex-provider-switcher-local-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap = "1.7"
+axum = { version = "0.8", features = ["http1", "http2", "json", "tokio"] }
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle = "2"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

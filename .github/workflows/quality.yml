@@ -25,7 +25,7 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt
       - name: Check Rust core
-        run: cargo fmt --all -- --check && cargo test -p codex-provider-switcher-core -p codex-provider-switcher-credentials -p codex-provider-switcher-launcher
+        run: cargo fmt --all -- --check && cargo test --locked -p codex-provider-switcher-core -p codex-provider-switcher-credentials -p codex-provider-switcher-launcher -p codex-provider-switcher-local-proxy
 
   native-desktop:
     strategy:
@@ -45,7 +45,7 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install 1.97.1 --profile minimal
       - name: Test native boundaries
-        run: cargo test -p codex-provider-switcher-core -p codex-provider-switcher-credentials -p codex-provider-switcher-launcher
+        run: cargo test --locked -p codex-provider-switcher-core -p codex-provider-switcher-credentials -p codex-provider-switcher-launcher -p codex-provider-switcher-local-proxy -p codex-provider-switcher-desktop
       - name: Build native desktop package
         run: pnpm tauri build
       - name: Smoke-test macOS DMG install and removal

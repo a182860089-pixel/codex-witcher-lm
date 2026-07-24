@@ -11,10 +11,20 @@ manual model ID remains available for compatible services that do not return a
 model list.
 
 Saved connections provide a small model picker for later one-click switching.
-Their metadata lives in a keyless `profiles.json`; API keys stay in macOS
-Keychain or Windows Credential Manager. Applying a model edits the user's
-existing Codex configuration through the hash-checked backup transaction and
-affects new threads after Codex is fully restarted.
+The default 0.2.0 mode runs a local provider on `127.0.0.1`: the first enable
+transactionally points Codex at that provider and may require one full Codex
+restart. After it is active, selecting another saved connection or model
+atomically changes the upstream route for the next turn without rewriting
+Codex configuration. When both identifiers are available, requests from the
+same thread and turn stay on the route with which they started.
+
+The Switcher remains open in the system tray while fast switching is enabled
+and registers itself for background login startup. Direct configuration remains
+available as a fallback; direct switches still require a full Codex restart and
+a new thread.
+
+Saved metadata lives in a keyless `profiles.json`; API keys and the separate
+local-proxy entry token stay in macOS Keychain or Windows Credential Manager.
 
 The app never modifies the signed Codex Desktop package. A narrowly scoped CDP
 adapter exists only as an opt-in compatibility layer for reviewed Desktop
@@ -22,17 +32,16 @@ builds; unknown builds fail closed.
 
 ## Status
 
-This repository contains the novice connection, model-discovery, saved-profile,
-quick-switch, recovery, and native package foundations. The current source has
-passed TypeScript checking, four runtime tests, the production Web build, Rust
-formatting, 42 core tests, one credential test, one launcher test, a native
-Windows desktop `cargo check`, the refreshed Tauri/NSIS build, and an isolated
-NSIS install/remove smoke.
+Version 0.2.0 adds the loopback proxy, local model catalog, atomic route
+switching, turn pinning, tray lifecycle, and background startup implementation,
+with portable proxy unit and integration tests in the source tree.
 
-It is not release-ready: native macOS package evidence, interactive packaged
-behavior, native validation of credential-helper caller checks, Windows
-security metadata, lifecycle cleanup, signing, and live Codex integration
-still require the gates in `docs/release.md`.
+The native Windows checks and NSIS install/remove evidence recorded in the
+documentation belong to the earlier phase-2 source snapshot; they do not prove
+the new 0.2.0 proxy lifecycle. This version is not release-ready until the
+complete checks in `docs/release.md` pass on current macOS and Windows builds,
+including packaged proxy startup, real Codex traffic, disable/restore, upgrade,
+uninstall cleanup, signing, and notarization.
 
 ## What happens when you connect
 
@@ -42,17 +51,35 @@ still require the gates in `docs/release.md`.
 3. You check the models to keep, or add a model ID manually.
 4. The app moves the temporary API Key into the operating-system keyring and
    writes only keyless shortcut metadata to `profiles.json`.
-5. Save-and-switch writes the explicit `model_provider` and `model` selection
-   while preserving unrelated Codex configuration.
+5. In the default fast-switch mode, the app starts an authenticated loopback
+   proxy and transactionally configures the managed `cps-local` provider the
+   first time. Restart Codex when the app asks.
+   That activation receives its own recovery point; closing fast switching
+   restores that validated point exactly when neither managed file changed.
+   If only unrelated valid TOML changed, it removes the Switcher-owned proxy
+   fields with a compare-and-swap write and preserves those later edits.
+   Changes to Switcher-owned fields or unreadable recovery data fail closed
+   for manual review.
+6. Later choices replace the active in-memory route. The proxy overwrites the
+   request model, injects the selected upstream bearer, and streams the
+   Responses API result back to Codex. A new choice applies on the next turn;
+   start a new thread when changing providers if their histories are not
+   compatible.
 
 Discovery uses the operating system's proxy settings, rejects remote plain
 HTTP, follows no redirects, and limits responses to 2 MiB and 500 models. API
 keys retained between discovery and save live in a zeroizing in-process vault
 for no more than ten minutes, with at most eight sessions.
 
-The Switcher does not add `model_catalog_json` and preserves any value the user
-already owns. Its internal `models.json` participates in safe apply/restore;
-Codex configuration is not pointed at that file.
+The local proxy serves authenticated `/models` and `/v1/models` responses from
+the checked models, but the Switcher does not add `model_catalog_json` and
+preserves any value the user already owns. Its internal `models.json`
+participates in safe apply/restore; Codex configuration is not pointed at that
+file.
+
+The fallback direct mode writes the explicit upstream `model_provider` and
+`model` through the same hash-checked backup transaction. It does not provide
+hot switching.
 
 ## Development
 
@@ -63,7 +90,12 @@ prerequisites for the current operating system.
 pnpm install
 pnpm check
 pnpm test
-cargo test -p codex-provider-switcher-core
+cargo fmt --all -- --check
+cargo test -p codex-provider-switcher-core \
+  -p codex-provider-switcher-credentials \
+  -p codex-provider-switcher-launcher \
+  -p codex-provider-switcher-local-proxy \
+  -p codex-provider-switcher-desktop
 pnpm tauri dev
 ```
 
