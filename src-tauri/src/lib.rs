@@ -12,12 +12,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_provider_switcher_core::AuthKind;
 use codex_provider_switcher_core::BackupManifest;
 use codex_provider_switcher_core::BackupStatus;
+use codex_provider_switcher_core::ConfigPlan;
 use codex_provider_switcher_core::CurrentCodexConfig;
 use codex_provider_switcher_core::FetchedModel;
 use codex_provider_switcher_core::LOCAL_PROXY_PROVIDER_ID;
 use codex_provider_switcher_core::ModelSpec;
+use codex_provider_switcher_core::OfficialProfile;
 use codex_provider_switcher_core::ProfileStore;
 use codex_provider_switcher_core::ProviderProfile;
 use codex_provider_switcher_core::ReasoningEffort;
@@ -33,14 +36,17 @@ use codex_provider_switcher_core::model_endpoint_candidates;
 use codex_provider_switcher_core::normalize_api_base_url;
 use codex_provider_switcher_core::parse_profile_store;
 use codex_provider_switcher_core::plan_config;
+use codex_provider_switcher_core::plan_official_config;
 use codex_provider_switcher_core::plan_proxy_config;
 use codex_provider_switcher_core::proxy_credential_account_for;
 use codex_provider_switcher_core::recover_prepared_backup;
+use codex_provider_switcher_core::refresh_proxy_credential_helper_file;
 use codex_provider_switcher_core::remove_profile;
 use codex_provider_switcher_core::render_profile_store;
 use codex_provider_switcher_core::restore_backup;
 use codex_provider_switcher_core::restore_proxy_config_preserving_unrelated_changes;
 use codex_provider_switcher_core::upsert_profile;
+use codex_provider_switcher_core::validate_official_profile;
 use codex_provider_switcher_core::verify_backup_integrity;
 use codex_provider_switcher_core::verify_credential_binding as verify_core_credential_binding;
 use codex_provider_switcher_core::verify_proxy_config_binding as verify_core_proxy_config_binding;
@@ -79,6 +85,8 @@ struct AppState {
     current: CurrentCodexConfig,
     profiles: Vec<ProviderProfile>,
     profile_warning: Option<String>,
+    official_profile: Option<OfficialProfile>,
+    official_profile_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +201,8 @@ const PROXY_STATE_SCHEMA_VERSION: u32 = 2;
 const LOCAL_PROXY_PORT: u16 = 15_722;
 const LOCAL_PROXY_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const AUTOSTART_NAME: &str = "Codex Provider Switcher";
+const MISSING_SAVED_PROVIDER_CREDENTIAL: &str =
+    "saved provider credential is missing; edit the connection and enter the API Key again";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProxyConfigState {
@@ -217,6 +227,16 @@ fn inspect_state() -> Result<AppState, String> {
             ),
         ),
     };
+    let (official_profile, official_profile_warning) = match load_official_profile(&paths) {
+        Ok(profile) => (profile, None),
+        Err(_) => (
+            None,
+            Some(
+                "saved official configuration could not be read; the original file was left unchanged"
+                    .to_string(),
+            ),
+        ),
+    };
     Ok(AppState {
         config_exists: paths.config.is_file(),
         latest_backup: latest_applied_manifest(&paths)?,
@@ -225,6 +245,8 @@ fn inspect_state() -> Result<AppState, String> {
         current,
         profiles,
         profile_warning,
+        official_profile,
+        official_profile_warning,
     })
 }
 
@@ -233,9 +255,7 @@ fn apply_profile(profile: ProviderProfile, selected_model: String) -> Result<App
         let account =
             credential_account_for(&profile.id, &profile.base_url).map_err(redacted_core_error)?;
         if !credentials::exists(&account)? {
-            return Err(
-                "store a credential for this exact provider endpoint before applying".to_string(),
-            );
+            return Err(MISSING_SAVED_PROVIDER_CREDENTIAL.to_string());
         }
     }
     let paths = app_paths()?;
@@ -252,8 +272,12 @@ fn apply_profile(profile: ProviderProfile, selected_model: String) -> Result<App
         Some(&paths.helper),
     )
     .map_err(redacted_core_error)?;
+    apply_plan(&paths, &plan)
+}
+
+fn apply_plan(paths: &AppPaths, plan: &ConfigPlan) -> Result<ApplySummary, String> {
     let mut result =
-        apply_config_plan(&paths.config, &paths.backups, &plan).map_err(redacted_core_error)?;
+        apply_config_plan(&paths.config, &paths.backups, plan).map_err(redacted_core_error)?;
     if !result.manifest_finalized {
         match recover_prepared_backup(&result.manifest_path, &paths.config, &paths.catalog)
             .map_err(redacted_core_error)?
@@ -277,6 +301,34 @@ fn apply_profile(profile: ProviderProfile, selected_model: String) -> Result<App
         backup_manifest: result.manifest_path,
         manifest_finalized: result.manifest_finalized,
     })
+}
+
+fn apply_official_profile(profile: OfficialProfile) -> Result<ApplySummary, String> {
+    validate_official_profile(&profile).map_err(redacted_core_error)?;
+    let paths = app_paths()?;
+    require_clean_recovery_state(&paths)?;
+    require_proxy_detached(&paths)?;
+    let existing = read_config_safely(&paths.config)?;
+    let existing_catalog = read_internal_catalog_safely(&paths.catalog)?;
+    let plan = plan_official_config(&existing, &existing_catalog, &profile, &paths.catalog)
+        .map_err(redacted_core_error)?;
+    apply_plan(&paths, &plan)
+}
+
+fn require_proxy_detached(paths: &AppPaths) -> Result<(), String> {
+    match load_proxy_state(paths) {
+        Ok(state)
+            if state.enabled
+                || current_proxy_config_state(paths, LOCAL_PROXY_PORT)?
+                    != ProxyConfigState::NotSelected =>
+        {
+            Err("close fast switching before activating the official login".to_string())
+        }
+        Err(_) => {
+            Err("repair or close fast switching before activating the official login".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 #[tauri::command]
@@ -325,17 +377,33 @@ fn cancel_discovery(
 }
 
 #[tauri::command]
+fn load_profile_credential(profile_id: String) -> Result<String, String> {
+    let paths = app_paths()?;
+    let store = load_profiles(&paths)?;
+    let account = profile_credential_account(&store, &profile_id)?;
+    credentials::get(&account).map_err(map_missing_provider_credential)
+}
+
+fn profile_credential_account(store: &ProfileStore, profile_id: &str) -> Result<String, String> {
+    let profile = store
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| "the saved connection no longer exists".to_string())?;
+    if !profile.credential_required {
+        return Err("this saved connection does not use an API Key".to_string());
+    }
+    credential_account_for(&profile.id, &profile.base_url).map_err(redacted_core_error)
+}
+
+#[tauri::command]
 fn save_profile(
     input: SaveProfileInput,
     vault: tauri::State<'_, DiscoveryVault>,
 ) -> Result<(), String> {
     let paths = app_paths()?;
-    if load_proxy_state(&paths).is_ok_and(|state| {
-        state.enabled && state.profile_id.as_deref() == Some(input.profile.id.as_str())
-    }) {
-        return Err(
-            "switch away from this connection before replacing its saved settings".to_string(),
-        );
+    if let Ok(state) = load_proxy_state(&paths) {
+        validate_active_profile_replacement(&state, &input.profile)?;
     }
     let _profile_lock = lock_profiles(&paths)?;
     let mut store = load_profiles(&paths)?;
@@ -382,30 +450,61 @@ fn save_profile(
     write_profiles(&paths, &rendered)
 }
 
+fn validate_active_profile_replacement(
+    state: &StoredProxyState,
+    profile: &ProviderProfile,
+) -> Result<(), String> {
+    if !state.enabled || state.profile_id.as_deref() != Some(profile.id.as_str()) {
+        return Ok(());
+    }
+    let current_model = state
+        .model_id
+        .as_deref()
+        .ok_or_else(|| "the active fast-switch route has no selected model".to_string())?;
+    if profile.models.iter().any(|model| model.id == current_model) {
+        Ok(())
+    } else {
+        Err("keep the active model in this connection until a new model is selected".to_string())
+    }
+}
+
 #[tauri::command]
 fn apply_saved_profile(profile_id: String, selected_model: String) -> Result<ApplySummary, String> {
     let paths = app_paths()?;
-    match load_proxy_state(&paths) {
-        Ok(state)
-            if state.enabled
-                || current_proxy_config_state(&paths, LOCAL_PROXY_PORT)?
-                    != ProxyConfigState::NotSelected =>
-        {
-            return Err("close fast switching before writing a direct configuration".to_string());
-        }
-        Err(_) => {
-            return Err(
-                "repair or close fast switching before writing a direct configuration".to_string(),
-            );
-        }
-        _ => {}
-    }
+    require_proxy_detached(&paths).map_err(|_| {
+        "close or repair fast switching before writing a direct configuration".to_string()
+    })?;
     let profile = load_profiles(&paths)?
         .profiles
         .into_iter()
         .find(|profile| profile.id == profile_id)
         .ok_or_else(|| "the saved connection no longer exists".to_string())?;
     apply_profile(profile, selected_model)
+}
+
+#[tauri::command]
+fn prepare_official_login() -> Result<ApplySummary, String> {
+    apply_official_profile(OfficialProfile::default_named(None))
+}
+
+#[tauri::command]
+fn activate_official_profile() -> Result<ApplySummary, String> {
+    let paths = app_paths()?;
+    let profile = load_official_profile(&paths)?
+        .ok_or_else(|| "save an official configuration before activating it".to_string())?;
+    apply_official_profile(profile)
+}
+
+#[tauri::command]
+fn save_current_official_profile(display_name: String) -> Result<OfficialProfile, String> {
+    let paths = app_paths()?;
+    require_clean_recovery_state(&paths)?;
+    require_proxy_detached(&paths)?;
+    let current =
+        inspect_config(&read_config_safely(&paths.config)?).map_err(redacted_core_error)?;
+    let profile = official_profile_from_current(&current, display_name)?;
+    write_official_profile(&paths, &profile)?;
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -464,7 +563,7 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
         }
     };
     if state.enabled && config_selected {
-        if let Err(error) = verify_active_proxy_configuration(&paths, &state) {
+        if let Err(error) = prepare_active_proxy_configuration(&paths, &state) {
             if let Some(handle) = runtime.handle.take() {
                 let _ = handle.shutdown().await;
             }
@@ -595,7 +694,7 @@ async fn enable_proxy(
         );
     }
     if !config_needs_write {
-        verify_active_proxy_configuration(&paths, &next)?;
+        prepare_active_proxy_configuration(&paths, &next)?;
     }
     start_proxy_handle(&next, &mut runtime, route, true).await?;
 
@@ -685,7 +784,7 @@ async fn switch_proxy_route(
             "fast-switch setup is incomplete; enable it again before switching models".to_string(),
         );
     }
-    verify_active_proxy_configuration(&paths, &previous)?;
+    prepare_active_proxy_configuration(&paths, &previous)?;
     let next = proxy_state_for_selection(&previous, &profile_id, &selected_model);
     let (_, route) = load_proxy_route(&paths, &next)?;
     start_proxy_handle(&next, &mut runtime, route, false).await?;
@@ -820,6 +919,8 @@ fn open_codex() -> Result<String, String> {
 }
 
 pub fn run() {
+    let background =
+        std::env::args_os().any(|argument| argument == std::ffi::OsStr::new("--background"));
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, arguments, _| {
             if !arguments.iter().any(|argument| argument == "--background") {
@@ -832,14 +933,9 @@ pub fn run() {
         ))
         .manage(DiscoveryVault::default())
         .manage(ProxyRuntime::default())
-        .setup(|app| {
+        .setup(move |app| {
             setup_tray(app)?;
-            let background = std::env::args_os()
-                .any(|argument| argument == std::ffi::OsStr::new("--background"));
             start_proxy_on_launch(app.handle().clone(), background);
-            if !background {
-                show_main_window(app.handle());
-            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -853,8 +949,12 @@ pub fn run() {
             discover_models,
             stage_credential,
             cancel_discovery,
+            load_profile_credential,
             save_profile,
             apply_saved_profile,
+            prepare_official_login,
+            activate_official_profile,
+            save_current_official_profile,
             proxy_status,
             enable_proxy,
             switch_proxy_route,
@@ -865,13 +965,8 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Codex Provider Switcher");
-    app.run(|app, event| match event {
-        tauri::RunEvent::ExitRequested {
-            code: None, api, ..
-        } if proxy_is_enabled_for_tray() => {
-            api.prevent_exit();
-            show_main_window(app);
-        }
+    app.run(move |app, event| match event {
+        tauri::RunEvent::Ready if !background => show_main_window(app),
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => show_main_window(app),
         _ => {}
@@ -906,9 +1001,10 @@ fn start_proxy_on_launch(app: tauri::AppHandle, background: bool) {
                     "fast-switch setup is incomplete; choose a connection again".to_string()
                 );
             }
-            verify_active_proxy_configuration(&paths, &state)?;
+            prepare_active_proxy_configuration(&paths, &state)?;
             let (_, route) = load_proxy_route(&paths, &state)?;
-            start_proxy_handle(&state, &mut runtime, route, false).await
+            start_proxy_handle(&state, &mut runtime, route, false).await?;
+            enable_background_startup(&app)
         }
         .await;
 
@@ -925,13 +1021,8 @@ fn start_proxy_on_launch(app: tauri::AppHandle, background: bool) {
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let open_item =
         tauri::menu::MenuItem::with_id(app, "open-switcher", "打开模型切换", true, None::<&str>)?;
-    let quit_item = tauri::menu::MenuItem::with_id(
-        app,
-        "quit-switcher",
-        "退出（需先关闭快速切换）",
-        true,
-        None::<&str>,
-    )?;
+    let quit_item =
+        tauri::menu::MenuItem::with_id(app, "quit-switcher", "退出", true, None::<&str>)?;
     let menu = tauri::menu::Menu::with_items(app, &[&open_item, &quit_item])?;
     let mut tray = tauri::tray::TrayIconBuilder::new()
         .tooltip("Codex 模型切换")
@@ -939,7 +1030,6 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open-switcher" => show_main_window(app),
-            "quit-switcher" if proxy_is_enabled_for_tray() => show_main_window(app),
             "quit-switcher" => app.exit(0),
             _ => {}
         })
@@ -1083,13 +1173,6 @@ fn disable_background_startup(app: &tauri::AppHandle) -> Result<(), String> {
         Err(error) if error.to_string().to_ascii_lowercase().contains("not found") => Ok(()),
         Err(_) => Err("could not disable automatic startup".to_string()),
     }
-}
-
-fn proxy_is_enabled_for_tray() -> bool {
-    app_paths()
-        .and_then(|paths| load_proxy_state(&paths))
-        .map(|state| state.enabled)
-        .unwrap_or(true)
 }
 
 pub fn credential_cli() -> Option<i32> {
@@ -1385,13 +1468,27 @@ fn verify_active_proxy_configuration(
         .map_err(redacted_core_error)?;
     let config = read_config_safely(&paths.config)?;
     let current = inspect_config(&config).map_err(redacted_core_error)?;
-    if current.model_id.as_deref() != Some(manifest.model_id.as_str()) {
+    let manifest_model = manifest
+        .model_id
+        .as_deref()
+        .ok_or_else(|| "the managed local proxy restore point has no model".to_string())?;
+    if current.model_id.as_deref() != Some(manifest_model) {
         return Err("the managed local proxy model changed after activation".to_string());
     }
     let helper = verify_core_proxy_config_binding(&config, &proxy_base_url(state.port))
         .map_err(redacted_core_error)?;
     verify_managed_helper(paths, &helper)?;
     Ok(())
+}
+
+fn prepare_active_proxy_configuration(
+    paths: &AppPaths,
+    state: &StoredProxyState,
+) -> Result<(), String> {
+    ensure_stable_helper(paths)?;
+    refresh_proxy_credential_helper_file(&paths.config, &proxy_base_url(state.port), &paths.helper)
+        .map_err(redacted_core_error)?;
+    verify_active_proxy_configuration(paths, state)
 }
 
 fn recover_proxy_activation_transaction(paths: &AppPaths) -> Result<Option<Uuid>, String> {
@@ -1436,6 +1533,7 @@ fn read_proxy_activation_manifest_metadata(
     .map_err(|_| "fast-switch restore point is invalid".to_string())?;
     if manifest.schema_version != 1
         || manifest.provider_id != LOCAL_PROXY_PROVIDER_ID
+        || manifest.model_id.as_deref().is_none_or(str::is_empty)
         || manifest.config.path != paths.config
         || manifest.catalog.path != paths.catalog
         || manifest_path.file_name().and_then(|name| name.to_str()) != Some("manifest.json")
@@ -1571,7 +1669,8 @@ fn load_proxy_route(
     }
     let account =
         credential_account_for(&profile.id, &profile.base_url).map_err(redacted_core_error)?;
-    let secret = Zeroizing::new(credentials::get(&account)?);
+    let secret =
+        Zeroizing::new(credentials::get(&account).map_err(map_missing_provider_credential)?);
     let bearer = BearerToken::new(secret.as_str().to_string()).map_err(|_| {
         "the saved provider credential cannot be used as a bearer token".to_string()
     })?;
@@ -1714,6 +1813,7 @@ struct AppPaths {
     config: PathBuf,
     catalog: PathBuf,
     profiles: PathBuf,
+    official_profile: PathBuf,
     proxy_state: PathBuf,
     backups: PathBuf,
     executable: PathBuf,
@@ -1746,6 +1846,7 @@ fn app_paths() -> Result<AppPaths, String> {
         config: codex_home.join("config.toml"),
         catalog: state.join("models.json"),
         profiles: state.join("profiles.json"),
+        official_profile: state.join("official-profile.json"),
         proxy_state: state.join("proxy.json"),
         backups: state.join("backups"),
         executable,
@@ -1774,6 +1875,53 @@ fn write_profiles(paths: &AppPaths, rendered: &[u8]) -> Result<(), String> {
     ensure_state_root(paths)?;
     write_private_file(&paths.profiles, rendered)
         .map_err(|_| "could not save saved connections".to_string())
+}
+
+fn load_official_profile(paths: &AppPaths) -> Result<Option<OfficialProfile>, String> {
+    match fs::symlink_metadata(&paths.official_profile) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("official profile path is not a safe regular file".to_string())
+        }
+        Ok(_) => {
+            let contents = fs::read_to_string(&paths.official_profile)
+                .map_err(|_| "could not read the saved official configuration".to_string())?;
+            let profile = serde_json::from_str::<OfficialProfile>(&contents)
+                .map_err(|_| "saved official configuration is invalid".to_string())?;
+            validate_official_profile(&profile)
+                .map_err(|_| "saved official configuration is invalid".to_string())?;
+            Ok(Some(profile))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("could not inspect the saved official configuration".to_string()),
+    }
+}
+
+fn write_official_profile(paths: &AppPaths, profile: &OfficialProfile) -> Result<(), String> {
+    validate_official_profile(profile).map_err(redacted_core_error)?;
+    ensure_state_root(paths)?;
+    let mut rendered = serde_json::to_vec_pretty(profile)
+        .map_err(|_| "could not encode the official configuration".to_string())?;
+    rendered.push(b'\n');
+    write_private_file(&paths.official_profile, &rendered)
+        .map_err(|_| "could not save the official configuration".to_string())
+}
+
+fn official_profile_from_current(
+    current: &CurrentCodexConfig,
+    display_name: String,
+) -> Result<OfficialProfile, String> {
+    if current.provider_id != "openai"
+        || current.base_url.is_some()
+        || current.auth_kind != AuthKind::OfficialLogin
+    {
+        return Err(
+            "switch Codex to its built-in OpenAI login before saving the official configuration"
+                .to_string(),
+        );
+    }
+    let profile = OfficialProfile::new(display_name.trim().to_string(), current.model_id.clone());
+    validate_official_profile(&profile).map_err(redacted_core_error)?;
+    Ok(profile)
 }
 
 fn ensure_state_root(paths: &AppPaths) -> Result<(), String> {
@@ -1887,6 +2035,14 @@ fn prune_discoveries(sessions: &mut HashMap<Uuid, PendingDiscovery>) {
 
 fn normalized_endpoint(value: &str) -> &str {
     value.trim().trim_end_matches('/')
+}
+
+fn map_missing_provider_credential(error: String) -> String {
+    if error == "credential is not stored" {
+        MISSING_SAVED_PROVIDER_CREDENTIAL.to_string()
+    } else {
+        error
+    }
 }
 
 fn ensure_stable_helper(paths: &AppPaths) -> Result<(), String> {
@@ -2012,6 +2168,20 @@ fn read_config_safely(path: &Path) -> Result<String, String> {
     }
 }
 
+fn read_internal_catalog_safely(path: &Path) -> Result<String, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("switcher model catalog path is not a safe regular file".to_string())
+        }
+        Ok(_) => fs::read_to_string(path)
+            .map_err(|_| "could not read the switcher model catalog as UTF-8".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok("{\n  \"models\": []\n}\n".to_string())
+        }
+        Err(_) => Err("could not inspect the switcher model catalog".to_string()),
+    }
+}
+
 fn latest_applied_manifest(paths: &AppPaths) -> Result<Option<PathBuf>, String> {
     let entries = match fs::read_dir(&paths.backups) {
         Ok(entries) => entries,
@@ -2095,6 +2265,33 @@ fn redacted_core_error(error: codex_provider_switcher_core::SwitcherError) -> St
 mod tests {
     use super::*;
 
+    fn profile_with_models(id: &str, models: &[&str]) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_string(),
+            display_name: "Test API".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            models: models
+                .iter()
+                .map(|id| ModelSpec {
+                    id: (*id).to_string(),
+                    display_name: (*id).to_string(),
+                    description: String::new(),
+                    context_window: 128_000,
+                    default_reasoning: ReasoningEffort::Medium,
+                    reasoning_levels: vec![
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                    ],
+                    supports_parallel_tool_calls: true,
+                    supports_images: false,
+                })
+                .collect(),
+            supports_websockets: false,
+            credential_required: true,
+        }
+    }
+
     #[test]
     fn proxy_state_requires_a_fixed_loopback_port_and_complete_selection() {
         let mut state = StoredProxyState::default();
@@ -2141,5 +2338,83 @@ mod tests {
         let rendered = serde_json::to_string(&selected).unwrap();
         assert!(!rendered.to_ascii_lowercase().contains("api_key"));
         assert!(!rendered.to_ascii_lowercase().contains("bearer"));
+    }
+
+    #[test]
+    fn active_profile_can_be_edited_only_while_it_keeps_the_current_model() {
+        let state = StoredProxyState {
+            enabled: true,
+            profile_id: Some("profile-a".to_string()),
+            model_id: Some("model-current".to_string()),
+            activation_transaction_id: Some(Uuid::new_v4()),
+            ..StoredProxyState::default()
+        };
+
+        assert!(
+            validate_active_profile_replacement(
+                &state,
+                &profile_with_models("profile-a", &["model-current", "model-new"]),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_active_profile_replacement(
+                &state,
+                &profile_with_models("profile-a", &["model-new"]),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_active_profile_replacement(
+                &state,
+                &profile_with_models("profile-b", &["model-new"]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn profile_credential_lookup_is_limited_to_saved_keyed_connections() {
+        let mut store = ProfileStore::default();
+        store
+            .profiles
+            .push(profile_with_models("profile-a", &["model-a"]));
+
+        assert!(profile_credential_account(&store, "profile-a").is_ok());
+        assert!(profile_credential_account(&store, "profile-missing").is_err());
+
+        store.profiles[0].credential_required = false;
+        assert!(profile_credential_account(&store, "profile-a").is_err());
+    }
+
+    #[test]
+    fn missing_provider_credential_has_an_actionable_error() {
+        assert_eq!(
+            map_missing_provider_credential("credential is not stored".to_string()),
+            MISSING_SAVED_PROVIDER_CREDENTIAL
+        );
+        assert_eq!(
+            map_missing_provider_credential("native credential store operation failed".to_string()),
+            "native credential store operation failed"
+        );
+    }
+
+    #[test]
+    fn captures_only_the_builtin_official_route() {
+        let official = CurrentCodexConfig {
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model_id: Some("gpt-5.6-sol".to_string()),
+            base_url: None,
+            auth_kind: AuthKind::OfficialLogin,
+            catalog_path: None,
+        };
+        let captured = official_profile_from_current(&official, "个人 Plus".to_string()).unwrap();
+        assert_eq!(captured.display_name, "个人 Plus");
+        assert_eq!(captured.model_id.as_deref(), Some("gpt-5.6-sol"));
+
+        let mut redirected = official;
+        redirected.base_url = Some("https://redirect.example/v1".to_string());
+        assert!(official_profile_from_current(&redirected, "个人 Plus".to_string()).is_err());
     }
 }

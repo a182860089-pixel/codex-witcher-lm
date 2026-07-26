@@ -32,6 +32,7 @@ Rust application boundary
         |
         +-- ~/.codex/config.toml
         +-- ~/.codex/provider-switcher/profiles.json
+        +-- ~/.codex/provider-switcher/official-profile.json
         +-- ~/.codex/provider-switcher/proxy.json
         `-- ~/.codex/provider-switcher/models.json
 ```
@@ -41,8 +42,11 @@ reports the active provider name and ID, model, Base URL, and credential kind.
 It does not return an inline token or resolve a provider's environment
 variable. The renderer cannot choose filesystem targets or submit rendered
 TOML. `proxy_status` separately reads the keyless proxy state and starts the
-loopback listener when fast switching was previously enabled. Background login
-startup uses the same path without showing the main window.
+loopback listener when fast switching was previously enabled. Before restoring
+the Route, it installs the current content-addressed credential helper and
+atomically refreshes the managed `cps-local` helper binding when an upgrade
+left the configuration pointing at an older helper. Background login startup
+uses the same path without showing the main window.
 
 ## Connection and discovery flow
 
@@ -89,10 +93,41 @@ to it. In the default local-proxy mode, a running proxy swaps the complete
 immutable route without rewriting Codex configuration. In direct mode, the
 choice passes through the original configuration transaction.
 
+Opening the editor resolves the selected saved profile server-side, derives
+its endpoint-bound keyring account, and returns that credential only to the
+local Tauri WebView. The Key is shown in the editor for the current user and
+cleared when the editor closes or saving finishes. An unchanged Base URL and
+unchanged Key reuse the existing keyring entry without rewriting it.
+
 Removing a shortcut removes only the `profiles.json` entry; it does not
 silently alter the current Codex configuration or delete an endpoint
 credential. The UI must not remove the route currently used by an enabled
 proxy.
+
+## Official account profile
+
+The official-account flow deliberately does not model ChatGPT login as an API
+provider credential. `prepare_official_login` creates a normal configuration
+transaction that removes `model_provider`, `openai_base_url`, and a shadowing
+`model_providers.openai` table, then leaves `model` unset so Codex can choose
+its own default. It preserves all unrelated settings, including MCP servers,
+hooks, other provider tables, and a user-owned `model_catalog_json`.
+
+After Codex completes its native login, `save_current_official_profile`
+accepts only the built-in `openai` route with no overridden Base URL. It writes
+schema-v2 `official-profile.json` containing a user-chosen display name and
+optional model ID. Existing schema-v1 files with the original fixed name remain
+readable and upgrade to v2 on the next save. `activate_official_profile`
+reapplies that route through the same hash-checked transaction. Neither command
+reads or writes `auth.json`, queries Codex's token cache, or claims that a saved
+route proves login state. Because Codex exposes one active login cache, this is
+one named bookmark rather than a set of independently bound OAuth identities.
+
+Switching from fast proxy mode to the official profile first performs the
+validated proxy disable/restore flow. Switching back to an API profile can
+enable the proxy again and create a new activation restore point. The boundary
+between official and API profiles requires a full Codex restart; hot switching
+continues only among API routes.
 
 ## Local proxy data plane
 
@@ -141,11 +176,13 @@ fixed port, revision, restart notice, and a credential-free
 `activationTransactionId`. A new activation preallocates this non-nil UUID
 before applying configuration; hot Route changes preserve it and disabled
 state clears it. Enabling fast switching also enables background login startup.
-Closing the window hides it in the tray; quitting is blocked while the proxy
-remains enabled. Windows writes the current-user `Run` entry as an exactly
-quoted executable path plus `--background`, records `StartupApproved`, and
-reads both values back before reporting success; disable removes both values
-idempotently. macOS uses its LaunchAgent integration. Disabling resolves
+Closing the window hides it in the tray. Choosing Exit stops the current
+process without changing the saved proxy activation or Codex configuration;
+the registered background launch restores that Route at the next login or app
+start. Windows writes the current-user `Run` entry as an exactly quoted
+executable path plus `--background`, records `StartupApproved`, and reads both
+values back before reporting success; disable removes both values idempotently.
+macOS uses its LaunchAgent integration. Disabling resolves
 `backups/<activationTransactionId>/manifest.json` and restores only that
 validated Applied `cps-local` activation with matching paths and transaction
 identity. Unchanged config and catalog files are restored exactly. If their
@@ -182,6 +219,11 @@ The Switcher-managed `models.json` is internal transaction companion data for
 the active saved model set and exact restore; it is not installed as a Codex
 catalog pointer.
 
+Official activation uses the same transaction layer with an optional manifest
+model ID. Existing schema-v1 manifests containing a string model deserialize
+as `Some(model)`; proxy validation still requires that value. An official
+manifest may omit it so Codex can select its default.
+
 The auth argument is an `endpoint-v1-...` fingerprint over the provider ID and
 normalized base URL. Reusing a provider ID with a different endpoint therefore
 requires a new Keychain/Credential Manager authorization.
@@ -195,6 +237,13 @@ On apply, the app installs a content-addressed copy of its command helper under
 stable copy instead of an App Translocation or installer path. Old helper
 versions remain available so an exact backup can still authenticate or run
 `recovery restore-latest` after the main app is moved or removed.
+When an enabled installation starts after an upgrade, a locked compare-and-swap
+write changes only the managed helper `command` and `cwd` to the current
+content-addressed copy. The original activation backup is not rewritten.
+
+On Windows, credential-helper caller verification accepts the registered
+Store Codex package or the canonical official npm Codex x64 layout when
+WinTrust validates its Authenticode signature and the signer name is OpenAI.
 
 A provider must implement the OpenAI Responses API contract. Translating
 arbitrary chat-completions APIs is outside the MVP.

@@ -56,6 +56,32 @@ pub struct ProviderProfile {
     pub credential_required: bool,
 }
 
+pub const OFFICIAL_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const OFFICIAL_PROFILE_DISPLAY_NAME: &str = "OpenAI 官方账号";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialProfile {
+    pub schema_version: u32,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+}
+
+impl OfficialProfile {
+    pub fn new(display_name: String, model_id: Option<String>) -> Self {
+        Self {
+            schema_version: OFFICIAL_PROFILE_SCHEMA_VERSION,
+            display_name,
+            model_id,
+        }
+    }
+
+    pub fn default_named(model_id: Option<String>) -> Self {
+        Self::new(OFFICIAL_PROFILE_DISPLAY_NAME.to_string(), model_id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Selection {
     pub provider_id: String,

@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::config::ConfigPlan;
 use crate::config::LOCAL_PROXY_PROVIDER_ID;
+use crate::config::refresh_proxy_credential_helper;
 use crate::config::sha256_hex;
 use crate::config::verify_proxy_config_binding;
 use crate::error::Result;
@@ -49,7 +50,8 @@ pub struct BackupManifest {
     pub transaction_id: Uuid,
     pub created_unix_ms: u128,
     pub provider_id: String,
-    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     pub status: BackupStatus,
     pub config: FileSnapshot,
     pub catalog: FileSnapshot,
@@ -131,6 +133,39 @@ pub fn apply_config_plan_with_transaction_id(
     FileExt::lock(&lock)?;
 
     let result = apply_locked(config_path, backup_root, plan, transaction_id);
+    FileExt::unlock(&lock)?;
+    result
+}
+
+pub fn refresh_proxy_credential_helper_file(
+    config_path: &Path,
+    proxy_base_url: &str,
+    credential_helper: &Path,
+) -> Result<bool> {
+    ensure_regular_file(config_path)?;
+    let lock_path = lock_path_for(config_path);
+    ensure_regular_or_missing(&lock_path)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    FileExt::lock(&lock)?;
+
+    let result = (|| {
+        let current = read_optional(config_path)?.ok_or_else(|| {
+            SwitcherError::Conflict("the active Codex configuration is missing".to_string())
+        })?;
+        let current_text = std::str::from_utf8(&current).map_err(|_| SwitcherError::InvalidUtf8)?;
+        let Some(rendered) =
+            refresh_proxy_credential_helper(current_text, proxy_base_url, credential_helper)?
+        else {
+            return Ok(false);
+        };
+        let expected = ExpectedFileState::Sha256(sha256_hex(&current));
+        atomic_write_expected(config_path, &expected, rendered.as_bytes())?;
+        Ok(true)
+    })();
     FileExt::unlock(&lock)?;
     result
 }
@@ -543,8 +578,12 @@ fn detach_proxy_config_locked(
         let current_text = std::str::from_utf8(&current).map_err(|_| SwitcherError::InvalidUtf8)?;
         verify_proxy_config_binding(current_text, expected_proxy_base_url)?;
         let current_document = current_text.parse::<DocumentMut>()?;
-        if current_document.get("model").and_then(Item::as_str) != Some(manifest.model_id.as_str())
-        {
+        let model_id = manifest.model_id.as_deref().ok_or_else(|| {
+            SwitcherError::Validation(
+                "the local-proxy transaction has no selected model".to_string(),
+            )
+        })?;
+        if current_document.get("model").and_then(Item::as_str) != Some(model_id) {
             return Err(SwitcherError::Conflict(
                 "the managed local proxy model changed after activation".to_string(),
             ));
@@ -1183,11 +1222,14 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::OfficialProfile;
     use crate::domain::ModelSpec;
     use crate::domain::ProviderProfile;
     use crate::domain::ReasoningEffort;
     use crate::plan_config;
+    use crate::plan_official_config;
     use crate::plan_proxy_config;
+    use crate::verify_proxy_config_binding;
 
     use super::*;
 
@@ -1209,6 +1251,90 @@ mod tests {
                 supports_images: false,
             }],
         }
+    }
+
+    #[test]
+    fn legacy_manifest_model_string_deserializes_as_selected_model() {
+        let rendered = r#"{
+          "schema_version": 1,
+          "transaction_id": "d3bb1e6f-6540-44b4-9e8f-ea1b237d5800",
+          "created_unix_ms": 1,
+          "provider_id": "legacy",
+          "model_id": "legacy/model",
+          "status": "applied",
+          "config": {
+            "path": "/tmp/config.toml",
+            "existed": false,
+            "original_sha256": null,
+            "applied_sha256": "a",
+            "backup_file": null
+          },
+          "catalog": {
+            "path": "/tmp/models.json",
+            "existed": false,
+            "original_sha256": null,
+            "applied_sha256": "b",
+            "backup_file": null
+          }
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(rendered).unwrap();
+        assert_eq!(manifest.model_id.as_deref(), Some("legacy/model"));
+    }
+
+    #[test]
+    fn official_transaction_does_not_require_a_model() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("codex/config.toml");
+        let catalog_path = root.path().join("codex/switcher/models.json");
+        let backups = root.path().join("backups");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing = "model_provider = \"vendor\"\nmodel = \"vendor/code\"\n";
+        fs::write(&config_path, existing).unwrap();
+        let plan = plan_official_config(
+            existing,
+            "{\"models\":[]}\n",
+            &OfficialProfile::default_named(None),
+            &catalog_path,
+        )
+        .unwrap();
+
+        let applied = apply_config_plan(&config_path, &backups, &plan).unwrap();
+        let manifest: BackupManifest =
+            serde_json::from_slice(&fs::read(applied.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.provider_id, "openai");
+        assert_eq!(manifest.model_id, None);
+        assert!(!fs::read_to_string(config_path).unwrap().contains("model"));
+    }
+
+    #[test]
+    fn refreshes_an_active_proxy_helper_with_a_locked_atomic_write() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("codex/config.toml");
+        let catalog_path = root.path().join("codex/switcher/models.json");
+        let old_helper = root.path().join("helpers/old/helper");
+        let new_helper = root.path().join("helpers/new/helper");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan = plan_proxy_config(
+            "",
+            &test_profile(),
+            "acme-code",
+            &catalog_path,
+            &old_helper,
+            base_url,
+        )
+        .unwrap();
+        fs::write(&config_path, plan.rendered_config).unwrap();
+
+        assert!(refresh_proxy_credential_helper_file(&config_path, base_url, &new_helper).unwrap());
+        let refreshed = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            verify_proxy_config_binding(&refreshed, base_url).unwrap(),
+            new_helper
+        );
+        assert!(
+            !refresh_proxy_credential_helper_file(&config_path, base_url, &new_helper).unwrap()
+        );
     }
 
     #[test]

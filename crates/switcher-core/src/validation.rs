@@ -4,6 +4,9 @@ use std::net::IpAddr;
 use url::Host;
 use url::Url;
 
+use crate::domain::OFFICIAL_PROFILE_DISPLAY_NAME;
+use crate::domain::OFFICIAL_PROFILE_SCHEMA_VERSION;
+use crate::domain::OfficialProfile;
 use crate::domain::ProviderProfile;
 use crate::error::Result;
 use crate::error::SwitcherError;
@@ -64,6 +67,27 @@ pub fn validate_profile(profile: &ProviderProfile) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_official_profile(profile: &OfficialProfile) -> Result<()> {
+    match profile.schema_version {
+        1 if profile.display_name != OFFICIAL_PROFILE_DISPLAY_NAME => {
+            return Err(SwitcherError::Validation(
+                "the legacy official profile display name is invalid".to_string(),
+            ));
+        }
+        1 | OFFICIAL_PROFILE_SCHEMA_VERSION => {}
+        _ => {
+            return Err(SwitcherError::Validation(
+                "unsupported official profile schema version".to_string(),
+            ));
+        }
+    }
+    validate_display_name("official profile display name", &profile.display_name)?;
+    if let Some(model_id) = profile.model_id.as_deref() {
+        validate_model_id(model_id)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_provider_id(id: &str) -> Result<()> {
     if id.len() < 2
         || id.len() > 64
@@ -102,7 +126,7 @@ pub(crate) fn validate_model_id(id: &str) -> Result<()> {
 
 fn validate_display_name(field: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 80 || trimmed.chars().any(char::is_control) {
+    if trimmed.is_empty() || trimmed.chars().count() > 80 || trimmed.chars().any(char::is_control) {
         return Err(SwitcherError::Validation(format!(
             "{field} must be 1-80 printable characters"
         )));
@@ -195,5 +219,33 @@ mod tests {
         let mut value = profile("https://api.example.test/v1");
         value.models.push(value.models[0].clone());
         assert!(validate_profile(&value).is_err());
+    }
+
+    #[test]
+    fn official_profile_accepts_named_v2_and_legacy_v1() {
+        validate_official_profile(&OfficialProfile::new(
+            "个人 Plus".to_string(),
+            Some("gpt-5.6-sol".to_string()),
+        ))
+        .unwrap();
+        validate_official_profile(&OfficialProfile {
+            schema_version: 1,
+            display_name: OFFICIAL_PROFILE_DISPLAY_NAME.to_string(),
+            model_id: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn official_profile_rejects_invalid_names_and_legacy_renames() {
+        assert!(validate_official_profile(&OfficialProfile::new(" \n".to_string(), None)).is_err());
+        assert!(
+            validate_official_profile(&OfficialProfile {
+                schema_version: 1,
+                display_name: "个人 Plus".to_string(),
+                model_id: None,
+            })
+            .is_err()
+        );
     }
 }

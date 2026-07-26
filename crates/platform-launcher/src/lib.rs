@@ -327,6 +327,12 @@ fn authorize_codex_parent_windows() -> Result<(), String> {
     path_buffer.truncate(path_length as usize);
     let parent_path = String::from_utf16(&path_buffer)
         .map_err(|_| "credential helper caller path is unavailable".to_string())?;
+    let parent_path = std::path::PathBuf::from(parent_path)
+        .canonicalize()
+        .map_err(|_| "credential helper caller path is unavailable".to_string())?;
+    let parent_path = parent_path
+        .to_str()
+        .ok_or_else(|| "credential helper caller path is unavailable".to_string())?;
 
     let manager =
         PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
@@ -354,14 +360,115 @@ fn authorize_codex_parent_windows() -> Result<(), String> {
         let Ok(installed_path) = package.InstalledPath() else {
             continue;
         };
-        if path_is_within_case_insensitive(&parent_path, &installed_path.to_string()) {
+        if path_is_within_case_insensitive(parent_path, &installed_path.to_string()) {
             matching_packages += 1;
         }
     }
-    if matching_packages != 1 {
-        return Err("credential helper caller is not the official Codex Store package".to_string());
+    if matching_packages == 1 {
+        return Ok(());
     }
-    Ok(())
+    if is_official_windows_npm_codex_path(parent_path) && authenticode_signer_is_openai(parent_path)
+    {
+        return Ok(());
+    }
+    Err("credential helper caller is not a trusted official Codex process".to_string())
+}
+
+#[cfg(windows)]
+fn authenticode_signer_is_openai(path: &str) -> bool {
+    use std::mem;
+    use std::ptr;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::Cryptography::CERT_NAME_SIMPLE_DISPLAY_TYPE;
+    use windows::Win32::Security::Cryptography::CertGetNameStringW;
+    use windows::Win32::Security::WinTrust::WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    use windows::Win32::Security::WinTrust::WINTRUST_DATA;
+    use windows::Win32::Security::WinTrust::WINTRUST_DATA_0;
+    use windows::Win32::Security::WinTrust::WINTRUST_FILE_INFO;
+    use windows::Win32::Security::WinTrust::WTD_CACHE_ONLY_URL_RETRIEVAL;
+    use windows::Win32::Security::WinTrust::WTD_CHOICE_FILE;
+    use windows::Win32::Security::WinTrust::WTD_REVOKE_NONE;
+    use windows::Win32::Security::WinTrust::WTD_STATEACTION_CLOSE;
+    use windows::Win32::Security::WinTrust::WTD_STATEACTION_VERIFY;
+    use windows::Win32::Security::WinTrust::WTD_UI_NONE;
+    use windows::Win32::Security::WinTrust::WTHelperGetProvSignerFromChain;
+    use windows::Win32::Security::WinTrust::WTHelperProvDataFromStateData;
+    use windows::Win32::Security::WinTrust::WinVerifyTrustEx;
+    use windows::core::PCWSTR;
+
+    let path_wide = path.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut file = WINTRUST_FILE_INFO {
+        cbStruct: mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(path_wide.as_ptr()),
+        hFile: HANDLE::default(),
+        pgKnownSubject: ptr::null_mut(),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 { pFile: &mut file },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let verified = unsafe { WinVerifyTrustEx(HWND::default(), &mut action, &mut data) } == 0;
+    let signer_matches = if verified {
+        let provider = unsafe { WTHelperProvDataFromStateData(data.hWVTStateData) };
+        let signer = if provider.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) }
+        };
+        if signer.is_null()
+            || unsafe { (*signer).csCertChain == 0 || (*signer).pasCertChain.is_null() }
+        {
+            false
+        } else {
+            let certificate = unsafe { (*(*signer).pasCertChain).pCert };
+            if certificate.is_null() {
+                false
+            } else {
+                let required = unsafe {
+                    CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None)
+                };
+                if required <= 1 {
+                    false
+                } else {
+                    let mut name = vec![0_u16; required as usize];
+                    let written = unsafe {
+                        CertGetNameStringW(
+                            certificate,
+                            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                            0,
+                            None,
+                            Some(&mut name),
+                        )
+                    };
+                    if written <= 1 {
+                        false
+                    } else {
+                        name.truncate((written - 1) as usize);
+                        String::from_utf16(&name).is_ok_and(|name| {
+                            matches!(
+                                name.as_str(),
+                                "OpenAI OpCo, LLC" | "OpenAI, L.L.C." | "OpenAI"
+                            )
+                        })
+                    }
+                }
+            }
+        }
+    } else {
+        false
+    };
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    let _ = unsafe { WinVerifyTrustEx(HWND::default(), &mut action, &mut data) };
+    signer_matches
 }
 
 #[cfg(windows)]
@@ -391,12 +498,30 @@ fn with_windows_runtime<T: Send + 'static>(
 
 #[cfg(windows)]
 fn path_is_within_case_insensitive(child: &str, parent: &str) -> bool {
-    let child = child.replace('/', "\\");
-    let parent = parent.trim_end_matches(['\\', '/']).replace('/', "\\");
+    let child = child
+        .strip_prefix(r"\\?\")
+        .unwrap_or(child)
+        .replace('/', "\\");
+    let parent = parent
+        .strip_prefix(r"\\?\")
+        .unwrap_or(parent)
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\");
     child
         .get(..parent.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&parent))
         && child.as_bytes().get(parent.len()) == Some(&b'\\')
+}
+
+#[cfg(any(windows, test))]
+fn is_official_windows_npm_codex_path(path: &str) -> bool {
+    const X64_SUFFIX: &str = "\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe";
+    let normalized = path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    normalized.ends_with(X64_SUFFIX)
 }
 
 #[cfg(windows)]
@@ -424,10 +549,27 @@ pub fn authorize_codex_parent() -> Result<(), String> {
     Err("credential helper caller verification is supported only on macOS and Windows".to_string())
 }
 
-#[cfg(all(test, windows))]
-mod windows_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
+    #[test]
+    fn recognizes_only_the_official_npm_codex_layout() {
+        assert!(is_official_windows_npm_codex_path(
+            r"C:\Users\Admin\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe"
+        ));
+        assert!(is_official_windows_npm_codex_path(
+            r"\\?\D:\Tools\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe"
+        ));
+        assert!(!is_official_windows_npm_codex_path(
+            r"C:\Users\Admin\bin\codex.exe"
+        ));
+        assert!(!is_official_windows_npm_codex_path(
+            r"C:\Users\Admin\node_modules\other\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe"
+        ));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn validates_app_user_model_ids() {
         assert!(valid_app_user_model_id("OpenAI.Codex_test!App"));

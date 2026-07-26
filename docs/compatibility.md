@@ -4,9 +4,9 @@
 
 | Surface | Architecture | Current evidence | Release gate |
 | --- | --- | --- | --- |
-| macOS | Apple silicon | Keychain, Launch Services, tray, LaunchAgent, proxy source, and package CI target are present; no current 0.2.0 native package run | Run signed DMG install, first enable/restart, next-turn switch, background relaunch, disable/restore, and uninstall smoke |
-| macOS | Intel | The same source and package target are present; no current 0.2.0 native package run | Run the same signed-host lifecycle |
-| Windows | x86_64 | The earlier phase-2 source passed native checks and isolated NSIS smoke; that evidence predates the 0.2.0 proxy and autostart changes | Re-run native tests/build and exercise the full proxy, Store Codex, DACL/durability, upgrade, and cleanup lifecycle |
+| macOS | Apple silicon | Keychain, Launch Services, tray, LaunchAgent, proxy source, and package CI target are present; no current 0.2.x native package run | Run signed DMG install, first enable/restart, next-turn switch, background relaunch, disable/restore, and uninstall smoke |
+| macOS | Intel | The same source and package target are present; no current 0.2.x native package run | Run the same signed-host lifecycle |
+| Windows | x86_64 | Version 0.3.2 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, named official-profile coverage, Credential Manager `Local` persistence checks, helper refresh, and an interactive visible-window smoke | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
 
@@ -70,6 +70,13 @@ reported as a compatibility gap rather than bypassed with a broad monkey
 patch. The external manager still preserves a recovery point and can restore
 the exact prior configuration.
 
+The official login path uses only documented Codex configuration defaults. It
+does not depend on Desktop injection: the Switcher restores the built-in
+`openai` provider, the user restarts Codex, and Codex itself presents and
+maintains ChatGPT OAuth. The Switcher cannot determine login success without
+crossing the credential boundary, so the saved official card represents route
+and model selection only.
+
 ## Validation commands
 
 ```bash
@@ -91,6 +98,173 @@ Windows x86_64.
 
 ## Native Windows evidence
 
+On 2026-07-26, version 0.3.2 on Windows 11 x64 build 22631 on `ydy001`
+passed the TypeScript check, four runtime tests, production WebView build,
+Rust formatting check, 60 Windows-applicable core tests, two Credential
+Manager tests, two Windows launcher tests, six desktop tests, six local-proxy
+unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+The 0.3.1 behavior carried into this build gives the single official-login
+bookmark a user-chosen display name, preserves schema-v1 bookmarks, and stores
+new or replaced Windows API credentials with explicit Credential Manager
+`Local` persistence. Because Codex owns one active OAuth cache, the Switcher
+does not read `auth.json` to infer an email or username and does not present
+several names as independently bound official accounts. A missing legacy API
+credential now opens the affected connection editor and requests one
+replacement Key without changing Codex configuration.
+
+Version 0.3.2 additionally fixes normal-launch visibility: background gateway
+startup remains hidden, while an ordinary launch shows and focuses the main
+window after Tauri reaches `RunEvent::Ready`. An interactive Session 1
+screenshot verified the rendered official-name editor and saved/current
+official-route state. The current-user upgrade preserved Codex/Switcher state
+and Credential Manager metadata.
+
+- Source archive SHA-256:
+  `cbc619f8f749f34f6aefcac4c034ec0dc6e76ba5183cbdc1ca91a8ae9ef14e74`
+  (`399667` bytes)
+- NSIS SHA-256:
+  `6e86184062473a0174c52abfe5c1ad2c717154edd7c08e12ff542fbcb1b62188`
+  (`3914685` bytes)
+- Installed application SHA-256:
+  `1392aab65b66b0b5ab911fffbd687415e0e89bc42fb547b87945f317ec334bbf`
+- Authenticode status: `NotSigned`
+
+This deployment deliberately did not rename or resave the user's official
+bookmark and did not read an OAuth token or API Key. The existing API-provider
+credentials were already absent from Credential Manager and cannot be
+reconstructed; each affected connection must receive its Key once through the
+local editor before it can be selected again.
+
+On 2026-07-25, version 0.3.0 on Windows 11 x64 build 22631 on `ydy001`
+passed the TypeScript check, four runtime tests, production WebView build,
+Rust formatting check, 58 Windows-applicable core tests, one Credential
+Manager test, two Windows launcher tests, five desktop tests, six local-proxy
+unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+Version 0.3.0 adds the credential-free official-account route. The Switcher
+can prepare Codex's built-in `openai` provider, save only the optional current
+official model choice, and later reactivate that route without reading,
+copying, exporting, or rewriting Codex OAuth credentials. Native tests cover
+official-route inspection, removal of route-shadowing fields, preservation of
+MCP/hooks/other providers/user-owned catalog configuration, optional-model
+manifests, and legacy backup compatibility.
+
+The current-user upgrade from 0.2.4 preserved Codex/Switcher state and
+Credential Manager metadata. Interactive Session 1 then started exactly one
+version 0.3.0 process, with the same PID owning `127.0.0.1:15722`, restored the
+quoted `--background` Run entry, removed the temporary deployment task, and
+preserved the existing `claude-opus-4-8` route and proxy-state revision. The
+active `cps-local` auth command references the new content-addressed helper,
+whose SHA-256 equals the installed application SHA-256.
+
+- Source archive SHA-256:
+  `1f78e68d7c97d60fec9bf26f5c25baa8d912264621d0a8fcf5a373cfe3cf92c3`
+- NSIS SHA-256:
+  `2afba8700f6533150cb90a6ca6baced5cd52d8cf2d8621491cb12e46833d9ca5`
+  (`4281055` bytes)
+- Installed application and active helper SHA-256:
+  `7a7cfae27580d310f443f2d0e0f342887cb07c26b5c592bef8fdb80b8dbb4d08`
+
+The application and installer are unsigned internal artifacts. This run
+deliberately did not activate the official route or change the user's current
+Codex login. Interactive prepare/login/save/API-profile/official-profile
+round-trip testing remains a release gate. It also did not repeat a live
+upstream request, so the 0.2.2 request evidence below remains the latest proof
+of the local credential-helper and proxy boundary.
+
+On 2026-07-25, version 0.2.4 on Windows 11 x64 build 22631 on `ydy001`
+passed the TypeScript check, four runtime tests, production WebView build,
+Rust formatting check, 53 Windows-applicable core tests, one Credential
+Manager test, two Windows launcher tests, four desktop tests, six local-proxy
+unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+Version 0.2.4 adds the saved-profile credential readback used by the local
+editor. The backend accepts only an existing keyed profile ID, derives its
+endpoint-bound credential account, and reads that entry from the current
+user's Credential Manager. The editor shows the existing Key and can save
+name/model changes without staging or rewriting an unchanged endpoint
+credential. A changed Base URL or Key still requires a new staged binding.
+
+The current-user upgrade from 0.2.3 preserved Codex/Switcher state and
+Credential Manager metadata. Read-only post-install verification found one
+version 0.2.4 process in interactive Session 1, that same PID owning
+`127.0.0.1:15722`, the quoted `--background` Run entry, no remaining temporary
+deployment task, and the active `gpt-5.6-sol` route. The `cps-local` auth
+command points to the new content-addressed helper, whose SHA-256 equals the
+installed application hash.
+
+- Source archive SHA-256:
+  `b2b2b455c07390c5c366ea5fc5386001b9086e17849e52fcaa8c89f4467c99c8`
+- NSIS SHA-256:
+  `7841590a41bbf5161cb818589629c7463cb82fdbb81109637eed10bc43eaf37a`
+  (`4274546` bytes)
+- Installed application and active helper SHA-256:
+  `c2585f1ca16b571baca9e837c23aad78c7bb291f89a64c7e7af5095901907bb5`
+
+The application and installer are unsigned internal artifacts. This run did
+not repeat a live upstream request, so the 0.2.2 request evidence below
+remains the latest proof of the local credential-helper and proxy boundary.
+
+On 2026-07-24, version 0.2.3 on Windows 11 x64 build 22631 on `ydy001`
+passed the TypeScript check, four runtime tests, production WebView build,
+Rust formatting check, 53 Windows-applicable core tests, one Credential
+Manager test, two Windows launcher tests, three desktop tests, six local-proxy
+unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+The current-user upgrade from 0.2.2 preserved Codex/Switcher state and
+Credential Manager metadata. The installed application was restarted in
+interactive Session 1, retained the selected `gpt-5.6-sol` route, owned
+`127.0.0.1:15722`, retained the quoted `--background` Run entry, and refreshed
+the content-addressed helper to the installed 0.2.3 executable. The saved
+restart flag remains set so the new one-time customer dialog appears when the
+main window is next opened.
+
+- Source archive SHA-256:
+  `52c18cdf231897acdce896d3ae58104bafe5ff80a980c96ff8146f457e1e7f5f`
+- NSIS SHA-256:
+  `7c8c4a781104da6d3007ad7e539668938ac734fcb4a3f9a56b7856d09f4bdac8`
+  (`4270992` bytes)
+- Installed application SHA-256:
+  `d7e9e9bcf73ee7d5f2f7e25276051df8d4f2463a70202f00c48dce1419a2d9ea`
+
+The application and installer are unsigned internal artifacts. This run did
+not repeat the live upstream request, so the 0.2.2 request evidence below
+remains the latest proof of the local credential-helper and proxy boundary.
+
+On 2026-07-25, version 0.2.2 on Windows 11 x64 build 22631 on `ydy001`
+passed the TypeScript check, four runtime tests, production WebView build,
+Rust formatting check, 53 Windows-applicable core tests, one Credential
+Manager test, two Windows launcher tests, two desktop tests, six local-proxy
+unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+The upgrade preserved Codex/Switcher state and Credential Manager metadata,
+installed the application as version 0.2.2, refreshed the managed helper to
+the content-addressed 0.2.2 executable, and repaired a missing current-user
+Run entry after the proxy started. A second `--background` launch in interactive
+Session 1 restored the listener on `127.0.0.1:15722`.
+
+An official npm `codex-cli 0.145.0` request executed in the same interactive
+session no longer returned a local proxy 401 or credential-helper binding
+error. It reached the configured upstream and returned HTTP 503 because the
+selected `claude-opus-4-8` route had no available channel. That result proves
+the local bearer injection path, not successful upstream model availability.
+
+- Source archive SHA-256:
+  `79834566f5572fcc6906e1cb00440636f6823847a8b515d58195e3e5b3f5863f`
+- NSIS SHA-256:
+  `e2aa9d9263e31ed1d8e16faae8cb7865bbfc1ea82a3314ca5f48a6e70621d987`
+  (`4271429` bytes)
+- Installed application SHA-256:
+  `ba38a88deae96789fb694ab762240e289b380a49a499b24e7dabeab1adb371d7`
+
+The application and installer are unsigned internal artifacts.
+
 On 2026-07-23, the earlier phase-2 source snapshot on Windows 11 x64 build
 22631 on `ydy001` passed the TypeScript check, four runtime tests, production
 WebView build, Rust formatting check, 42 core tests, one Credential Manager
@@ -98,7 +272,6 @@ test, one Windows launcher test, desktop `cargo check`, the full Tauri/NSIS
 build, and isolated NSIS install/remove smoke.
 
 That evidence is retained as historical validation of the earlier
-configuration path, not as validation of 0.2.0. The current proxy, local model
-catalog, tray, automatic startup, first-enable migration, hot Route switching,
-background relaunch, and disable/restore lifecycle still require a fresh native
-run. No 0.2.0 artifact hash or signed release evidence is recorded.
+configuration path. The newer 0.2.2 evidence above supersedes it for helper
+migration, proxy startup, upgrade, and background relaunch, but not for the
+remaining release gates.

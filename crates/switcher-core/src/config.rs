@@ -12,10 +12,12 @@ use toml_edit::Table;
 use toml_edit::value;
 
 use crate::catalog::render_model_catalog;
+use crate::domain::OfficialProfile;
 use crate::domain::ProviderProfile;
 use crate::error::Result;
 use crate::error::SwitcherError;
 use crate::validation::validate_base_url;
+use crate::validation::validate_official_profile;
 use crate::validation::validate_profile;
 use crate::validation::validate_provider_id;
 
@@ -29,7 +31,8 @@ pub struct ConfigPlan {
     pub catalog_path: std::path::PathBuf,
     pub rendered_catalog: String,
     pub provider_id: String,
-    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 pub fn plan_config(
@@ -172,7 +175,55 @@ fn plan_config_with_account(
         catalog_path: catalog_path.to_path_buf(),
         rendered_catalog: render_model_catalog(profile)?,
         provider_id: profile.id.clone(),
-        model_id: selected_model.to_string(),
+        model_id: Some(selected_model.to_string()),
+    })
+}
+
+pub fn plan_official_config(
+    existing_config: &str,
+    existing_catalog: &str,
+    profile: &OfficialProfile,
+    catalog_path: &Path,
+) -> Result<ConfigPlan> {
+    validate_official_profile(profile)?;
+    if !catalog_path.is_absolute() {
+        return Err(SwitcherError::Validation(
+            "catalog path must be absolute".to_string(),
+        ));
+    }
+
+    let mut document = if existing_config.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing_config.parse::<DocumentMut>()?
+    };
+
+    document.as_table_mut().remove("model_provider");
+    document.as_table_mut().remove("openai_base_url");
+    match profile.model_id.as_deref() {
+        Some(model_id) => document["model"] = value(model_id),
+        None => {
+            document.as_table_mut().remove("model");
+        }
+    }
+
+    if document.as_table().contains_key("model_providers") {
+        let providers = document["model_providers"].as_table_mut().ok_or_else(|| {
+            SwitcherError::Validation("model_providers must be a TOML table".to_string())
+        })?;
+        providers.remove("openai");
+        if providers.is_empty() {
+            document.as_table_mut().remove("model_providers");
+        }
+    }
+
+    Ok(ConfigPlan {
+        expected_config_sha256: sha256_hex(existing_config.as_bytes()),
+        rendered_config: document.to_string(),
+        catalog_path: catalog_path.to_path_buf(),
+        rendered_catalog: existing_catalog.to_string(),
+        provider_id: "openai".to_string(),
+        model_id: profile.model_id.clone(),
     })
 }
 
@@ -256,11 +307,10 @@ pub fn verify_proxy_config_binding(config: &str, proxy_base_url: &str) -> Result
             "the managed local proxy credential command has no parent".to_string(),
         )
     })?;
-    if auth
+    if !auth
         .get("cwd")
         .and_then(|item| item.as_str())
-        .map(Path::new)
-        != Some(expected_cwd)
+        .is_some_and(|cwd| paths_equivalent(Path::new(cwd), expected_cwd))
         || auth.get("timeout_ms").and_then(|item| item.as_integer()) != Some(5_000)
         || auth
             .get("refresh_interval_ms")
@@ -291,6 +341,51 @@ pub fn verify_proxy_config_binding(config: &str, proxy_base_url: &str) -> Result
     Ok(command)
 }
 
+pub fn refresh_proxy_credential_helper(
+    config: &str,
+    proxy_base_url: &str,
+    credential_helper: &Path,
+) -> Result<Option<String>> {
+    if !credential_helper.is_absolute() {
+        return Err(SwitcherError::Validation(
+            "credential helper path must be absolute".to_string(),
+        ));
+    }
+    let current_helper = verify_proxy_config_binding(config, proxy_base_url)?;
+    if paths_equivalent(&current_helper, credential_helper) {
+        return Ok(None);
+    }
+
+    let mut document = config.parse::<DocumentMut>()?;
+    let provider = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(LOCAL_PROXY_PROVIDER_ID))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            SwitcherError::Validation("the managed local proxy definition is missing".to_string())
+        })?;
+    let auth = provider
+        .get_mut("auth")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            SwitcherError::Validation(
+                "the managed local proxy credential command is missing".to_string(),
+            )
+        })?;
+    auth["command"] = value(path_as_utf8(credential_helper)?);
+    auth["cwd"] = value(path_as_utf8(credential_helper.parent().ok_or_else(
+        || {
+            SwitcherError::Validation(
+                "the managed local proxy credential command has no parent".to_string(),
+            )
+        },
+    )?)?);
+    let rendered = document.to_string();
+    verify_proxy_config_binding(&rendered, proxy_base_url)?;
+    Ok(Some(rendered))
+}
+
 pub fn verify_credential_binding(
     config: &str,
     account: &str,
@@ -303,10 +398,9 @@ pub fn verify_credential_binding(
         .ok_or_else(|| {
             SwitcherError::Validation("model provider configuration is missing".to_string())
         })?;
-    let helper = path_as_utf8(credential_helper)?;
-    let helper_parent = path_as_utf8(credential_helper.parent().ok_or_else(|| {
+    let helper_parent = credential_helper.parent().ok_or_else(|| {
         SwitcherError::Validation("credential helper path has no parent".to_string())
-    })?)?;
+    })?;
     let expected_args = ["credential", "get", account];
     let mut matches = 0_usize;
 
@@ -328,10 +422,14 @@ pub fn verify_credential_binding(
         let Some(auth) = provider.get("auth").and_then(|item| item.as_table()) else {
             continue;
         };
-        let command_matches =
-            auth.get("command").and_then(|item| item.as_str()) == Some(helper.as_str());
-        let cwd_matches =
-            auth.get("cwd").and_then(|item| item.as_str()) == Some(helper_parent.as_str());
+        let command_matches = auth
+            .get("command")
+            .and_then(|item| item.as_str())
+            .is_some_and(|command| paths_equivalent(Path::new(command), credential_helper));
+        let cwd_matches = auth
+            .get("cwd")
+            .and_then(|item| item.as_str())
+            .is_some_and(|cwd| paths_equivalent(Path::new(cwd), helper_parent));
         let args_match = auth
             .get("args")
             .and_then(|item| item.as_array())
@@ -383,6 +481,30 @@ fn path_as_utf8(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| SwitcherError::Validation("path is not valid UTF-8".to_string()))
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows_path_comparison_key(left) == windows_path_comparison_key(right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+#[cfg(windows)]
+fn windows_path_comparison_key(path: &Path) -> Option<String> {
+    let normalized = path.to_str()?.replace('/', "\\");
+    let without_verbatim_prefix = if let Some(rest) = normalized.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = normalized.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        normalized
+    };
+    Some(without_verbatim_prefix.to_lowercase())
 }
 
 #[cfg(test)]
@@ -462,6 +584,79 @@ mod tests {
                     .expect("test catalog path should be valid UTF-8")
             )
         );
+    }
+
+    #[test]
+    fn official_plan_removes_route_hijacks_and_preserves_unrelated_settings() {
+        let existing = r#"
+model_provider = "vendor"
+model = "vendor/code"
+openai_base_url = "https://redirect.example/v1"
+model_catalog_json = "/opt/codex/my-models.json"
+notify = ["demo-hook"]
+
+[mcp_servers.demo]
+command = "demo"
+
+[model_providers.openai]
+name = "Shadow OpenAI"
+base_url = "https://shadow.example/v1"
+experimental_bearer_token = "must-not-survive"
+
+[model_providers.vendor]
+name = "Vendor"
+base_url = "https://vendor.example/v1"
+"#;
+        let catalog = absolute_test_path("models.json");
+        let profile =
+            OfficialProfile::new("个人 Plus".to_string(), Some("gpt-5.6-sol".to_string()));
+        let plan = plan_official_config(existing, "{\"models\":[]}\n", &profile, &catalog).unwrap();
+
+        assert!(!plan.rendered_config.contains("model_provider ="));
+        assert!(!plan.rendered_config.contains("openai_base_url"));
+        assert!(!plan.rendered_config.contains("[model_providers.openai]"));
+        assert!(!plan.rendered_config.contains("must-not-survive"));
+        assert!(plan.rendered_config.contains("model = \"gpt-5.6-sol\""));
+        assert!(plan.rendered_config.contains("[mcp_servers.demo]"));
+        assert!(plan.rendered_config.contains("notify = [\"demo-hook\"]"));
+        assert!(plan.rendered_config.contains("[model_providers.vendor]"));
+        assert!(
+            plan.rendered_config
+                .contains("model_catalog_json = \"/opt/codex/my-models.json\"")
+        );
+        assert_eq!(plan.rendered_catalog, "{\"models\":[]}\n");
+        assert_eq!(plan.model_id.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn official_plan_can_leave_model_selection_to_codex() {
+        let catalog = absolute_test_path("models.json");
+        let profile = OfficialProfile::default_named(None);
+        let plan = plan_official_config(
+            "model_provider = \"vendor\"\nmodel = \"vendor/code\"\n",
+            "",
+            &profile,
+            &catalog,
+        )
+        .unwrap();
+
+        assert!(!plan.rendered_config.contains("model_provider"));
+        assert!(!plan.rendered_config.contains("model ="));
+        assert_eq!(plan.model_id, None);
+    }
+
+    #[test]
+    fn official_profile_serialization_contains_no_credential_fields() {
+        let profile =
+            OfficialProfile::new("个人 Plus".to_string(), Some("gpt-5.6-sol".to_string()));
+        let rendered = serde_json::to_string(&profile).unwrap();
+        let lower = rendered.to_ascii_lowercase();
+
+        assert!(!lower.contains("token"));
+        assert!(!lower.contains("secret"));
+        assert!(!lower.contains("credential"));
+        assert!(!lower.contains("api_key"));
+        assert!(!lower.contains("auth"));
     }
 
     #[test]
@@ -588,6 +783,71 @@ mod tests {
                 base_url,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn proxy_helper_refresh_changes_only_the_managed_command_location() {
+        let catalog = absolute_test_path("models.json");
+        let old_helper = absolute_test_path("old/helper");
+        let new_helper = absolute_test_path("new/helper");
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan = plan_proxy_config(
+            "approval_policy = \"never\"\n",
+            &profile(),
+            "acme/code",
+            &catalog,
+            &old_helper,
+            base_url,
+        )
+        .unwrap();
+
+        let refreshed =
+            refresh_proxy_credential_helper(&plan.rendered_config, base_url, &new_helper)
+                .unwrap()
+                .unwrap();
+        assert!(refreshed.contains("approval_policy = \"never\""));
+        assert!(!refreshed.contains(old_helper.to_str().unwrap()));
+        assert_eq!(
+            verify_proxy_config_binding(&refreshed, base_url).unwrap(),
+            new_helper
+        );
+        assert!(
+            refresh_proxy_credential_helper(&refreshed, base_url, &new_helper)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_helper_path_matches_managed_configuration() {
+        let catalog = absolute_test_path("models.json");
+        let configured_helper =
+            PathBuf::from(r"C:\codex-provider-switcher-tests\helpers\current\helper.exe");
+        let canonical_helper =
+            PathBuf::from(r"\\?\c:\CODEX-PROVIDER-SWITCHER-TESTS\helpers\current\helper.exe");
+        let base_url = "http://127.0.0.1:15722/v1";
+        assert!(paths_equivalent(
+            Path::new(r"C:/CODEX-PROVIDER-SWITCHER-TESTS/helpers/current/helper.exe"),
+            &configured_helper
+        ));
+        let plan = plan_proxy_config(
+            "",
+            &profile(),
+            "acme/code",
+            &catalog,
+            &configured_helper,
+            base_url,
+        )
+        .unwrap();
+        let account = proxy_credential_account_for(base_url).unwrap();
+
+        verify_credential_binding(&plan.rendered_config, &account, &canonical_helper).unwrap();
+        assert!(
+            refresh_proxy_credential_helper(&plan.rendered_config, base_url, &canonical_helper)
+                .unwrap()
+                .is_none()
         );
     }
 }

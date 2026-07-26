@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-core"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "fs4",
  "futures-util",
@@ -669,14 +669,16 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-credentials"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "keyring",
+ "keyring-core",
+ "windows-native-keyring-store",
 ]
 
 [[package]]
 name = "codex-provider-switcher-desktop"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "codex-provider-switcher-core",
  "codex-provider-switcher-credentials",
@@ -701,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-launcher"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "libc",
  "windows 0.62.2",
@@ -709,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-local-proxy"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "arc-swap",
  "axum",

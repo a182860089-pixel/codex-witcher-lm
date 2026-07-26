@@ -9,9 +9,23 @@ provider ID and normalized base URL, so changing the endpoint cannot silently
 reuse an old bearer token through the Switcher UI. The stable helper verifies
 that the fingerprint still matches exactly one managed provider table, its own
 command/working-directory binding, and an official Codex parent
-process/package before returning a token. The API key is copied out of and then
-immediately cleared from the password field; owned Rust secret buffers are
-zeroized.
+process/package before returning a token. On Windows, accepted parents are the
+registered Store package or the canonical official npm package layout with a
+valid Authenticode signature whose signer is OpenAI. The API key is copied out
+of and then cleared from the setup field after discovery. When the current
+user explicitly opens a saved connection for editing, the backend resolves
+only that saved profile's endpoint-bound account and returns its Key to the
+local Tauri WebView. The editor shows it until save or close, never writes it
+to application files or logs, and reuses the existing keyring entry when the
+endpoint and Key are unchanged. Owned Rust secret buffers used by discovery
+and proxy routing are zeroized.
+
+On Windows, new and updated entries use Credential Manager `Local` persistence
+instead of the provider library's default `Enterprise` persistence. The target
+name remains unchanged for compatibility. A missing entry is treated as
+missing user data, not as a generic keyring failure: switching stops before any
+Codex configuration write and the UI asks the user to enter that connection's
+Key again.
 
 Fast switching adds a second credential class: a random local-proxy entry
 bearer stored in the same OS credential manager under a
@@ -120,6 +134,20 @@ redacted and never contain the keyring backend's detailed payload.
   durability still require a native implementation/test before release.
 
 The manager does not edit `auth.json`.
+
+The official-account profile is a route bookmark, not an authentication
+backup. Schema v2 contains only a user-chosen display name and an optional
+validated model ID; schema v1 with the original fixed name remains readable.
+The app never reads, parses, copies, exports, logs, or writes Codex ChatGPT
+access or refresh tokens, whether Codex stores them in `auth.json` or the
+operating-system keyring. It therefore does not discover an email address or
+username. Login, account selection, expiry, and refresh remain entirely inside
+Codex.
+
+Official activation removes route fields that could redirect the built-in
+`openai` provider, but it does so through the same content-hash transaction and
+preserves unrelated TOML. It does not delete other saved API profiles or their
+system credentials.
 
 In local-proxy mode, the managed Codex provider contains only the strict
 loopback Base URL and a helper reference for the entry bearer. The upstream

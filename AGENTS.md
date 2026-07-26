@@ -16,6 +16,16 @@ modify `app.asar`, the signed macOS app bundle, or the Windows Store package.
   standard model-list endpoint.
 - Saved connections are shortcuts in `profiles.json`; they must never contain
   API keys.
+- Official ChatGPT login remains owned by Codex. The Switcher may save only a
+  credential-free `official-profile.json` containing the approved schema,
+  user-chosen display name, and optional model ID. It must never read, copy,
+  export, or rewrite `auth.json` or keyring-backed Codex login tokens. Codex
+  exposes one active login cache, so do not present multiple saved official
+  names as independently bound OAuth accounts.
+- Switching to the official profile must first detach the local proxy, restore
+  the built-in `openai` provider by removing route-hijacking fields, preserve
+  unrelated user configuration, and require a Codex restart. API-profile
+  switches may remain hot while the proxy is active.
 - The default switching mode is the loopback local proxy. Its first enable
   transactionally points Codex at the managed `cps-local` provider and may
   require a full Codex restart. Once that provider is active, changing a saved
@@ -33,6 +43,8 @@ modify `app.asar`, the signed macOS app bundle, or the Windows Store package.
 - Prefer documented Codex configuration and App Server requests.
 - Never write API keys to `config.toml`, `auth.json`, logs, state, or command
   arguments. Use macOS Keychain or Windows Credential Manager.
+- Never treat a saved official profile as proof that the user is logged in.
+  Login and refresh status remain visible only to Codex.
 - Model discovery uses the system proxy, permits HTTPS plus loopback HTTP,
   follows no redirects, and bounds response size and model count.
 - Discovery credentials may exist only in the zeroizing in-process vault:

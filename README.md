@@ -11,7 +11,7 @@ manual model ID remains available for compatible services that do not return a
 model list.
 
 Saved connections provide a small model picker for later one-click switching.
-The default 0.2.0 mode runs a local provider on `127.0.0.1`: the first enable
+The default 0.3.2 mode runs a local provider on `127.0.0.1`: the first enable
 transactionally points Codex at that provider and may require one full Codex
 restart. After it is active, selecting another saved connection or model
 atomically changes the upstream route for the next turn without rewriting
@@ -19,12 +19,28 @@ Codex configuration. When both identifiers are available, requests from the
 same thread and turn stay on the route with which they started.
 
 The Switcher remains open in the system tray while fast switching is enabled
-and registers itself for background login startup. Direct configuration remains
-available as a fallback; direct switches still require a full Codex restart and
-a new thread.
+and registers itself for background login startup. Fast switching is the
+silent default in the main UI. Direct configuration remains available under
+the compact advanced-settings control; direct switches still require a full
+Codex restart and a new thread. The tray can exit the application without
+disabling or restoring fast-switch state; the next launch resumes the saved
+gateway route.
+
+Each saved connection can be edited after creation. The app reads its existing
+Key from the operating-system credential manager and shows it in the local
+editor, where it can be kept or replaced together with the Base URL, checked
+model list, and selected model.
 
 Saved metadata lives in a keyless `profiles.json`; API keys and the separate
 local-proxy entry token stay in macOS Keychain or Windows Credential Manager.
+
+The OpenAI official-account card first restores Codex's built-in `openai`
+route, after which the user restarts Codex and completes its native ChatGPT
+login. Returning to the Switcher and choosing “save official configuration”
+records a user-chosen name and the optional model choice in
+`official-profile.json`. Codex continues to own and refresh the login
+credential; the Switcher never reads, copies, or writes `auth.json`, so it does
+not infer an email address or username from the login cache.
 
 The app never modifies the signed Codex Desktop package. A narrowly scoped CDP
 adapter exists only as an opt-in compatibility layer for reviewed Desktop
@@ -32,16 +48,25 @@ builds; unknown builds fail closed.
 
 ## Status
 
-Version 0.2.0 adds the loopback proxy, local model catalog, atomic route
-switching, turn pinning, tray lifecycle, and background startup implementation,
-with portable proxy unit and integration tests in the source tree.
+Version 0.3.2 keeps background gateway startup hidden while reliably showing
+the main window after a normal customer launch. Version 0.3.1 lets the user
+name the single credential-free official-account
+bookmark, reports a missing saved API Key accurately, opens the affected
+connection editor, and stores new Windows credentials with local-machine
+persistence. Existing schema-v1 official bookmarks remain readable. Version
+0.3.0 added capture and switching for Codex's official ChatGPT login. Version
+0.2.4 reads the selected connection's existing Key back into the local editor
+for normal daily maintenance and avoids rewriting an unchanged endpoint
+credential. Version 0.2.3 simplified
+the customer-facing UI, shows the required first Codex restart in a one-time
+dialog, permits tray exit while the proxy is enabled, and adds safe editing of
+saved credentials and models. The internal Windows build and upgrade evidence
+is recorded in the documentation.
 
-The native Windows checks and NSIS install/remove evidence recorded in the
-documentation belong to the earlier phase-2 source snapshot; they do not prove
-the new 0.2.0 proxy lifecycle. This version is not release-ready until the
-complete checks in `docs/release.md` pass on current macOS and Windows builds,
-including packaged proxy startup, real Codex traffic, disable/restore, upgrade,
-uninstall cleanup, signing, and notarization.
+This version is not release-ready until the complete checks in
+`docs/release.md` pass on current macOS and Windows builds, including real
+upstream traffic, disable/restore, uninstall cleanup, signing, and
+notarization.
 
 ## What happens when you connect
 
@@ -65,6 +90,16 @@ uninstall cleanup, signing, and notarization.
    Responses API result back to Codex. A new choice applies on the next turn;
    start a new thread when changing providers if their histories are not
    compatible.
+
+To use an official ChatGPT account, choose the OpenAI official-account card.
+The app safely closes fast switching if needed, removes only
+`model_provider`, `openai_base_url`, a shadowing
+`model_providers.openai` definition, and the optional selected model covered
+by the transaction, then restarts into Codex's native login flow. MCP servers,
+hooks, a user-owned `model_catalog_json`, other provider definitions, and all
+other unrelated settings are preserved. Switching between official and API
+profiles requires a restart; API-profile changes remain hot after the proxy is
+enabled.
 
 Discovery uses the operating system's proxy settings, rejects remote plain
 HTTP, follows no redirects, and limits responses to 2 MiB and 500 models. API

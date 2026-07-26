@@ -32,6 +32,12 @@ interface ProviderProfile {
   credential_required: boolean;
 }
 
+interface OfficialProfile {
+  schemaVersion: number;
+  displayName: string;
+  modelId: string | null;
+}
+
 interface CurrentCodexConfig {
   providerId: string;
   providerName: string;
@@ -49,6 +55,8 @@ interface DashboardState {
   current: CurrentCodexConfig;
   profiles: ProviderProfile[];
   profileWarning: string | null;
+  officialProfile: OfficialProfile | null;
+  officialProfileWarning: string | null;
 }
 
 interface FetchedModel {
@@ -65,6 +73,10 @@ interface DiscoverySummary {
 interface CredentialSessionSummary {
   sessionId: string;
   baseUrl: string;
+}
+
+interface ProfileEditorOptions {
+  credentialMissing?: boolean;
 }
 
 type SwitchMode = "localProxy" | "directConfig";
@@ -98,6 +110,8 @@ const browserPreview: DashboardState = {
   },
   profiles: [],
   profileWarning: null,
+  officialProfile: null,
+  officialProfileWarning: null,
 };
 
 const stoppedProxy: LocalProxyStatus = {
@@ -119,6 +133,10 @@ let switchMode: SwitchMode = "localProxy";
 let discoveryId: string | null = null;
 let discoveredModels: FetchedModel[] = [];
 let selectedModels = new Set<string>();
+let editingProfileId: string | null = null;
+let editingCredentialLoaded = false;
+let editingCredentialDirty = false;
+let restartNoticeShown = false;
 let busy = false;
 
 app.innerHTML = `
@@ -127,10 +145,21 @@ app.innerHTML = `
       <div class="brand-mark" aria-hidden="true">C</div>
       <div>
         <h1>Codex 模型切换</h1>
-        <p>选择接入和模型，下一次发送即可使用。</p>
+        <p>选择接入和模型即可使用。</p>
       </div>
     </div>
-    <button id="refresh" class="button button-quiet" type="button">刷新状态</button>
+    <div class="header-actions">
+      <button id="refresh" class="button button-quiet" type="button">刷新状态</button>
+      <button
+        id="advanced-settings-toggle"
+        class="button button-icon"
+        type="button"
+        aria-label="打开高级设置"
+        aria-controls="advanced-settings"
+        aria-expanded="false"
+        title="高级设置"
+      >•••</button>
+    </div>
   </header>
 
   <main>
@@ -145,18 +174,18 @@ app.innerHTML = `
       <div id="current-details" class="current-details"></div>
     </section>
 
-    <section class="switch-mode-section" aria-labelledby="switch-mode-title">
+    <section id="advanced-settings" class="switch-mode-section advanced-settings" aria-labelledby="switch-mode-title" hidden>
       <div class="section-title-row">
         <div>
-          <div class="title-with-recommendation">
-            <h2 id="switch-mode-title">选择切换方式</h2>
-            <span class="recommendation">推荐</span>
-          </div>
-          <p>快速切换不会反复改动 Codex 设置，更适合日常使用。</p>
+          <h2 id="switch-mode-title">高级设置</h2>
+          <p>日常默认使用无感快速切换；只有兼容排查时才需要改动这里。</p>
         </div>
-        <div id="proxy-health" class="proxy-health" role="status">
-          <span class="health-dot" aria-hidden="true"></span>
-          <strong>正在检查</strong>
+        <div class="advanced-header-actions">
+          <div id="proxy-health" class="proxy-health" role="status">
+            <span class="health-dot" aria-hidden="true"></span>
+            <strong>正在检查</strong>
+          </div>
+          <button id="advanced-settings-close" class="button button-quiet" type="button">收起</button>
         </div>
       </div>
 
@@ -166,7 +195,7 @@ app.innerHTML = `
             <strong>快速切换</strong>
             <span class="mini-badge">推荐</span>
           </span>
-          <span>由本机安全转发请求，切换后从下一次发送开始使用。</span>
+          <span>应用保持开启时，可直接切换接入和模型。</span>
         </button>
         <button id="mode-direct-config" class="mode-option" type="button" aria-pressed="false">
           <span class="mode-option-heading">
@@ -182,15 +211,31 @@ app.innerHTML = `
           <strong id="mode-summary-title">快速切换尚未开启</strong>
           <p id="mode-summary-copy">在下方选择一个接入和模型即可开启。</p>
         </div>
-        <button id="stop-proxy" class="button button-secondary" type="button" hidden>关闭快速切换</button>
+        <div class="mode-summary-actions">
+          <button id="restore" class="button button-quiet" type="button">撤销上次配置更改</button>
+          <button id="open-codex" class="button button-secondary" type="button" hidden>重新打开 Codex</button>
+          <button id="stop-proxy" class="button button-secondary" type="button" hidden>关闭快速切换</button>
+        </div>
       </div>
+    </section>
+
+    <section class="official-section" aria-labelledby="official-title">
+      <div class="section-title-row">
+        <div>
+          <p class="section-kicker">官方接入</p>
+          <h2 id="official-title">OpenAI 官方账号</h2>
+          <p>登录和令牌由 Codex 自己管理；本软件只保存模型选择，不读取账号凭据。</p>
+        </div>
+        <span id="official-badge" class="badge badge-neutral">未保存</span>
+      </div>
+      <div id="official-profile" class="official-profile"></div>
     </section>
 
     <section class="connections-section" aria-labelledby="connections-title">
       <div class="section-title-row">
         <div>
           <h2 id="connections-title">我的接入</h2>
-          <p id="connections-help">选择模型后，下一次发送即可使用。</p>
+          <p id="connections-help">选择接入，或编辑已有 Key 和模型。</p>
         </div>
         <button id="add-connection" class="button button-primary" type="button">添加接入</button>
       </div>
@@ -200,7 +245,7 @@ app.innerHTML = `
     <section id="editor" class="editor-section" aria-labelledby="editor-title" hidden>
       <div class="section-title-row">
         <div>
-          <p class="section-kicker">添加接入</p>
+          <p id="editor-kicker" class="section-kicker">添加接入</p>
           <h2 id="editor-title">连接你的模型服务</h2>
           <p>通常只需要 Base URL 和 API Key。</p>
         </div>
@@ -222,7 +267,7 @@ app.innerHTML = `
             <input id="api-key" type="password" autocomplete="new-password" placeholder="输入 API Key" />
             <button id="toggle-key" class="field-button" type="button">显示</button>
           </div>
-          <small class="field-help">Key 只会保存在这台电脑的系统密钥库中。</small>
+          <small id="api-key-help" class="field-help">Key 只会保存在这台电脑的系统密钥库中。</small>
         </label>
       </div>
 
@@ -259,24 +304,29 @@ app.innerHTML = `
       </div>
     </section>
 
-    <section class="footer-actions" aria-label="配置操作">
-      <div class="recovery-copy">
-        <strong id="footer-title">下一次发送生效</strong>
-        <span id="footer-copy">正在生成的回复不会被中断。</span>
-      </div>
-      <div class="footer-buttons">
-        <button id="restore" class="button button-secondary" type="button">撤销上次配置更改</button>
-        <button id="open-codex" class="button button-primary" type="button">重新打开 Codex</button>
-      </div>
-    </section>
-
     <output id="status" class="status status-info" aria-live="polite">正在读取当前状态…</output>
   </main>
+
+  <dialog id="restart-notice" class="restart-dialog" aria-labelledby="restart-notice-title">
+    <div class="restart-dialog-mark" aria-hidden="true">✓</div>
+    <h2 id="restart-notice-title">代理服务已自动设置</h2>
+    <p>重启一次 Codex 马上生效。后续使用 Codex 时，请先打开本软件作为模型代理网关。</p>
+    <div class="restart-dialog-actions">
+      <button id="restart-later" class="button button-secondary" type="button">稍后</button>
+      <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
+    </div>
+  </dialog>
 `;
 
 const status = required<HTMLOutputElement>("#status");
 
 required<HTMLButtonElement>("#refresh").addEventListener("click", refreshDashboard);
+required<HTMLButtonElement>("#advanced-settings-toggle").addEventListener("click", () =>
+  setAdvancedSettingsVisible(required<HTMLElement>("#advanced-settings").hidden),
+);
+required<HTMLButtonElement>("#advanced-settings-close").addEventListener("click", () =>
+  setAdvancedSettingsVisible(false),
+);
 required<HTMLButtonElement>("#mode-local-proxy").addEventListener("click", () =>
   selectSwitchMode("localProxy"),
 );
@@ -284,7 +334,16 @@ required<HTMLButtonElement>("#mode-direct-config").addEventListener("click", () 
   selectSwitchMode("directConfig"),
 );
 required<HTMLButtonElement>("#stop-proxy").addEventListener("click", disableLocalProxy);
+required<HTMLButtonElement>("#restore").addEventListener("click", restoreLatest);
+required<HTMLButtonElement>("#open-codex").addEventListener("click", () => openCodex());
 required<HTMLButtonElement>("#add-connection").addEventListener("click", openEditor);
+required<HTMLElement>("#official-profile").addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLButtonElement)) return;
+  if (target.dataset.officialAction === "activate") void activateOfficial();
+  if (target.dataset.officialAction === "save") void saveCurrentOfficial();
+  if (target.dataset.officialAction === "restart") void openCodex();
+});
 required<HTMLButtonElement>("#close-editor").addEventListener("click", closeEditor);
 required<HTMLButtonElement>("#fetch-models").addEventListener("click", fetchAvailableModels);
 required<HTMLButtonElement>("#toggle-key").addEventListener("click", toggleKeyVisibility);
@@ -299,6 +358,11 @@ required<HTMLInputElement>("#api-key").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     void fetchAvailableModels();
+  }
+});
+required<HTMLInputElement>("#api-key").addEventListener("input", () => {
+  if (editingProfileId && editingCredentialLoaded) {
+    editingCredentialDirty = true;
   }
 });
 required<HTMLInputElement>("#model-search").addEventListener("input", renderModelChoices);
@@ -318,10 +382,26 @@ required<HTMLButtonElement>("#save-only").addEventListener("click", () => saveCo
 required<HTMLButtonElement>("#save-and-switch").addEventListener("click", () =>
   saveConnection(true),
 );
-required<HTMLButtonElement>("#restore").addEventListener("click", restoreLatest);
-required<HTMLButtonElement>("#open-codex").addEventListener("click", openCodex);
+required<HTMLButtonElement>("#restart-later").addEventListener("click", () =>
+  required<HTMLDialogElement>("#restart-notice").close(),
+);
+required<HTMLButtonElement>("#restart-now").addEventListener("click", () => {
+  required<HTMLDialogElement>("#restart-notice").close();
+  void openCodex(false);
+});
 
 void refreshDashboard();
+
+function setAdvancedSettingsVisible(visible: boolean): void {
+  const panel = required<HTMLElement>("#advanced-settings");
+  const toggle = required<HTMLButtonElement>("#advanced-settings-toggle");
+  panel.hidden = !visible;
+  toggle.setAttribute("aria-expanded", String(visible));
+  toggle.setAttribute("aria-label", visible ? "收起高级设置" : "打开高级设置");
+  if (visible) {
+    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
 
 async function refreshDashboard(): Promise<void> {
   if (!nativeAvailable) {
@@ -339,8 +419,11 @@ async function refreshDashboard(): Promise<void> {
     if (dashboard.profileWarning) {
       return "保存的接入暂时无法读取；原有内容没有被覆盖。";
     }
+    if (dashboard.officialProfileWarning) {
+      return "保存的官方配置暂时无法读取；原有内容没有被覆盖。";
+    }
     if (!proxyApiAvailable) {
-      return "已读取当前设置。快速切换暂不可用，可以选择直接配置。";
+      return "已读取当前设置。快速切换暂不可用，可从高级设置使用兼容配置。";
     }
     if (localProxy.manualRecoveryRequired) {
       return "快速切换的配置或恢复记录无法安全读取；应用不会覆盖文件，请人工处理后刷新。";
@@ -356,9 +439,12 @@ function renderDashboard(): void {
   );
   const proxyIsActive =
     localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
+  const officialIsActive = isOfficialActive(proxyIsActive);
   const currentConnection = proxyIsActive
     ? (proxyProfile?.display_name ?? "已保存的接入")
-    : dashboard.current.providerName;
+    : officialIsActive
+      ? (dashboard.officialProfile?.displayName ?? "OpenAI 官方账号")
+      : dashboard.current.providerName;
   const currentModel = proxyIsActive
     ? (localProxy.currentModelId ?? "自动选择")
     : (dashboard.current.modelId ?? "自动选择");
@@ -374,7 +460,7 @@ function renderDashboard(): void {
   const currentDetails = required<HTMLElement>("#current-details");
 
   currentTitle.textContent = currentModel;
-  currentKicker.textContent = proxyIsActive ? "下一次发送将使用" : "Codex 当前使用";
+  currentKicker.textContent = "当前模型";
   if (dashboard.recoveryWarnings > 0 || localProxy.manualRecoveryRequired) {
     currentBadge.textContent = "需人工处理";
     currentBadge.className = "badge badge-warning";
@@ -382,8 +468,11 @@ function renderDashboard(): void {
     currentBadge.textContent = "可安全恢复";
     currentBadge.className = "badge badge-warning";
   } else if (proxyIsActive) {
-    currentBadge.textContent = "快速切换已开启";
+    currentBadge.textContent = "快速切换";
     currentBadge.className = "badge";
+  } else if (officialIsActive) {
+    currentBadge.textContent = "官方账号";
+    currentBadge.className = "badge badge-official";
   } else {
     currentBadge.textContent = dashboard.configExists ? "直接配置" : "默认设置";
     currentBadge.className = "badge badge-neutral";
@@ -392,10 +481,6 @@ function renderDashboard(): void {
     <div>
       <span>接入方式</span>
       <strong>${escapeHtml(currentConnection)}</strong>
-    </div>
-    <div>
-      <span>当前模型</span>
-      <strong>${escapeHtml(currentModel)}</strong>
     </div>
     <div>
       <span>服务地址</span>
@@ -407,6 +492,7 @@ function renderDashboard(): void {
     </div>
   `;
   renderSwitchExperience();
+  renderOfficialProfile();
   renderProfiles();
   required<HTMLButtonElement>("#restore").disabled =
     !dashboard.latestBackup ||
@@ -414,6 +500,83 @@ function renderDashboard(): void {
     localProxy.enabled ||
     localProxy.recoveryRequired ||
     busy;
+  maybeShowRestartNotice();
+}
+
+function renderOfficialProfile(): void {
+  const root = required<HTMLElement>("#official-profile");
+  const badge = required<HTMLElement>("#official-badge");
+  const proxyIsActive =
+    localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
+  const current = isOfficialActive(proxyIsActive);
+  const saved = dashboard.officialProfile;
+  const blocked =
+    busy ||
+    dashboard.recoveryWarnings > 0 ||
+    localProxy.manualRecoveryRequired ||
+    localProxy.recoveryRequired;
+
+  if (dashboard.officialProfileWarning) {
+    badge.textContent = "需检查";
+    badge.className = "badge badge-warning";
+  } else if (current) {
+    badge.textContent = "当前使用";
+    badge.className = "badge badge-official";
+  } else if (saved) {
+    badge.textContent = "已保存";
+    badge.className = "badge badge-neutral";
+  } else {
+    badge.textContent = "未保存";
+    badge.className = "badge badge-neutral";
+  }
+
+  const savedModel = saved?.modelId ?? "由 Codex 自动选择";
+  const savedName = saved?.displayName ?? "OpenAI 官方账号";
+  const mainAction = saved ? `切换到 ${savedName}` : "切换到官方登录";
+  const explanation = current
+    ? "当前已使用 Codex 内置 OpenAI 接入。完成登录并选好模型后，可保存这份无凭据配置。"
+    : saved
+      ? `已保存账号配置：${savedName}；模型：${savedModel}。切换后需要重新打开 Codex。`
+      : "先切换到 Codex 内置 OpenAI 接入，重新打开 Codex 并按提示登录；随后返回保存当前配置。";
+  const nameEditor = current
+    ? `
+      <label class="official-name-field">
+        <span>配置名称</span>
+        <input
+          id="official-profile-name"
+          maxlength="80"
+          autocomplete="off"
+          value="${escapeHtml(savedName)}"
+          placeholder="例如：个人 Plus 或工作账号"
+        />
+        <small class="field-help">用于区分这份官方登录配置。本软件不会读取邮箱、用户名或 OAuth 令牌。</small>
+      </label>
+    `
+    : "";
+
+  root.innerHTML = `
+    <div class="official-main">
+      <div class="official-copy">
+        <strong>${escapeHtml(explanation)}</strong>
+        <span>官方账号和 API 接入之间切换需要重启 Codex；API 接入之间仍可快速切换。</span>
+      </div>
+      ${nameEditor}
+    </div>
+    <div class="official-actions">
+      <button class="button button-primary" data-official-action="activate" type="button" ${current ? "hidden" : ""} ${blocked || dashboard.officialProfileWarning ? "disabled" : ""}>${mainAction}</button>
+      <button class="button button-secondary" data-official-action="save" type="button" ${!current || blocked ? "disabled" : ""}>${saved ? "更新官方配置" : "保存官方配置"}</button>
+      <button class="button button-quiet" data-official-action="restart" type="button" ${!current || blocked ? "disabled" : ""}>重新打开 Codex</button>
+    </div>
+  `;
+}
+
+function isOfficialActive(proxyIsActive = false): boolean {
+  return (
+    !proxyIsActive &&
+    dashboard.current.providerId === "openai" &&
+    dashboard.current.baseUrl === null &&
+    dashboard.current.authKind === "officialLogin"
+  );
 }
 
 function renderSwitchExperience(): void {
@@ -425,8 +588,6 @@ function renderSwitchExperience(): void {
   const stopButton = required<HTMLButtonElement>("#stop-proxy");
   const connectionsHelp = required<HTMLElement>("#connections-help");
   const saveAndSwitch = required<HTMLButtonElement>("#save-and-switch");
-  const footerTitle = required<HTMLElement>("#footer-title");
-  const footerCopy = required<HTMLElement>("#footer-copy");
   const openCodexButton = required<HTMLButtonElement>("#open-codex");
   const manualRecoveryBlocked =
     dashboard.recoveryWarnings > 0 || localProxy.manualRecoveryRequired;
@@ -463,8 +624,6 @@ function renderSwitchExperience(): void {
       "Codex 配置或快速切换恢复记录无法安全读取；应用已停止转发，也不会覆盖这些文件。";
     connectionsHelp.textContent = "请先人工修复 Codex 配置或恢复记录，然后点击“刷新状态”。";
     saveAndSwitch.textContent = "修复后可继续";
-    footerTitle.textContent = "当前不会写入配置";
-    footerCopy.textContent = "确认文件恢复正常后刷新，即可重新使用切换功能。";
     openCodexButton.hidden = true;
   } else if (switchMode === "directConfig") {
     summaryTitle.textContent = "直接配置（兼容）";
@@ -473,57 +632,36 @@ function renderSwitchExperience(): void {
       : "适合快速切换不可用的情况；切换后需要重新打开 Codex。";
     connectionsHelp.textContent = "选择模型后会更新 Codex 设置，完成后需要重新打开 Codex。";
     saveAndSwitch.textContent = "保存并写入配置";
-    footerTitle.textContent = "兼容方式需要重新打开";
-    footerCopy.textContent = "每次更改后，重新打开 Codex 即可生效。";
     openCodexButton.hidden = false;
   } else if (!proxyApiAvailable) {
     summaryTitle.textContent = "快速切换暂不可用";
     summaryCopy.textContent = "你仍可选择“直接配置”完成模型切换。";
-    connectionsHelp.textContent = "快速切换暂不可用，请先选择上方的直接配置。";
+    connectionsHelp.textContent = "快速切换暂不可用，请从右上角高级设置选择直接配置。";
     saveAndSwitch.textContent = "保存并使用";
-    footerTitle.textContent = "可以使用兼容方式";
-    footerCopy.textContent = "选择“直接配置”后仍可安全切换。";
     openCodexButton.hidden = true;
   } else if (localProxy.recoveryRequired) {
     summaryTitle.textContent = "快速切换需要修复";
     summaryCopy.textContent = "请先关闭快速切换并恢复原设置，再重新选择接入和模型。";
     connectionsHelp.textContent = "修复完成前不会发送新的本地转发请求。";
     saveAndSwitch.textContent = "请先完成修复";
-    footerTitle.textContent = "原设置受到保护";
-    footerCopy.textContent = "点击“关闭快速切换”执行受验证的恢复。";
     openCodexButton.hidden = true;
   } else if (localProxy.running) {
-    const profile = dashboard.profiles.find(
-      (item) => item.id === localProxy.currentProfileId,
-    );
     summaryTitle.textContent = "快速切换已开启";
-    summaryCopy.textContent = localProxy.requiresCodexRestart
-      ? "首次设置已完成。重新打开一次 Codex 后，今后的切换无需重复重启。"
-      : `${profile?.display_name ?? "当前接入"} · ${localProxy.currentModelId ?? "自动选择"}，下一次发送生效。`;
-    connectionsHelp.textContent = "选择模型后立即准备好；正在生成的回复不会被中断。";
+    summaryCopy.textContent = "应用保持开启时，可直接切换接入和模型。";
+    connectionsHelp.textContent = "选择模型即可使用，也可以编辑已有接入。";
     saveAndSwitch.textContent = "保存并使用";
-    footerTitle.textContent = localProxy.requiresCodexRestart
-      ? "首次开启需要重新打开一次"
-      : "下一次发送生效";
-    footerCopy.textContent = localProxy.requiresCodexRestart
-      ? "完成这一次后，今后切换模型无需重复重启。"
-      : "正在生成的回复不会被中断。";
-    openCodexButton.hidden = !localProxy.requiresCodexRestart;
+    openCodexButton.hidden = true;
   } else if (localProxy.enabled) {
     summaryTitle.textContent = "快速切换需要重新开启";
     summaryCopy.textContent = "选择一个接入和模型即可安全修复；也可以关闭并恢复原设置。";
     connectionsHelp.textContent = "重新选择接入和模型后，应用会检查并修复快速切换。";
     saveAndSwitch.textContent = "保存并重新开启";
-    footerTitle.textContent = "当前没有转发请求";
-    footerCopy.textContent = "完成重新开启前，应用不会假装切换已经生效。";
     openCodexButton.hidden = true;
   } else {
     summaryTitle.textContent = "快速切换尚未开启";
-    summaryCopy.textContent = "在下方选择一个接入和模型，即可开启并使用。";
-    connectionsHelp.textContent = "选择模型后开启快速切换，下一次发送即可使用。";
+    summaryCopy.textContent = "选择一个接入和模型即可开启。";
+    connectionsHelp.textContent = "选择接入和模型，应用会自动配置代理服务。";
     saveAndSwitch.textContent = "保存并使用";
-    footerTitle.textContent = "首次开启只需设置一次";
-    footerCopy.textContent = "之后切换接入或模型，无需反复重新打开 Codex。";
     openCodexButton.hidden = true;
   }
 
@@ -589,9 +727,7 @@ function renderProfiles(): void {
           ? "写入配置"
           : localProxy.recoveryRequired
             ? "请先完成修复"
-          : localProxy.running && !localProxy.recoveryRequired
-            ? "下一次发送生效"
-            : "开启并使用";
+            : "使用此模型";
       return `
         <article class="profile-card ${isCurrent ? "profile-card-current" : ""}">
           <div class="profile-heading">
@@ -599,7 +735,7 @@ function renderProfiles(): void {
               <h3>${escapeHtml(profile.display_name)}</h3>
               <p>${escapeHtml(readableEndpoint(profile.base_url))}</p>
             </div>
-            ${isCurrent ? `<span class="badge">${proxyIsActive ? "下一次" : "当前"}</span>` : ""}
+            ${isCurrent ? '<span class="badge">当前</span>' : ""}
           </div>
           <label>
             <span>选择模型</span>
@@ -612,13 +748,9 @@ function renderProfiles(): void {
                 .join("")}
             </select>
           </label>
-          <p class="profile-effect">${
-            switchMode === "localProxy"
-              ? "选择后从下一次发送开始使用"
-              : "选择后将更新 Codex 设置"
-          }</p>
           <div class="profile-actions">
             <button class="button button-primary" data-switch-profile="${escapeHtml(profile.id)}" type="button" ${manualRecoveryBlocked || (switchMode === "localProxy" && localProxy.recoveryRequired) ? "disabled" : ""}>${actionLabel}</button>
+            <button class="button button-secondary" data-edit-profile="${escapeHtml(profile.id)}" type="button">编辑配置</button>
             <button class="button button-quiet danger-text" data-delete-profile="${escapeHtml(profile.id)}" type="button">移除</button>
           </div>
         </article>
@@ -629,8 +761,61 @@ function renderProfiles(): void {
   root.querySelectorAll<HTMLButtonElement>("[data-switch-profile]").forEach((button) => {
     button.addEventListener("click", () => switchSavedProfile(button.dataset.switchProfile ?? ""));
   });
+  root.querySelectorAll<HTMLButtonElement>("[data-edit-profile]").forEach((button) => {
+    button.addEventListener("click", () => {
+      void openProfileEditor(button.dataset.editProfile ?? "");
+    });
+  });
   root.querySelectorAll<HTMLButtonElement>("[data-delete-profile]").forEach((button) => {
     button.addEventListener("click", () => deleteSavedProfile(button.dataset.deleteProfile ?? ""));
+  });
+}
+
+async function activateOfficial(): Promise<void> {
+  if (dashboard.recoveryWarnings > 0 || localProxy.manualRecoveryRequired) {
+    setStatus("配置或恢复记录需要人工处理；应用不会在修复前写入 Codex 配置。", "error");
+    return;
+  }
+  await run("正在切换到 OpenAI 官方账号…", async () => {
+    if (!nativeAvailable) throw new Error("请通过桌面应用切换官方账号配置。");
+    if (localProxy.enabled || localProxy.recoveryRequired) {
+      localProxy = await invokeProxyCommand("disable_proxy");
+      if (localProxy.enabled || localProxy.running || localProxy.recoveryRequired) {
+        throw new Error("快速切换尚未安全关闭，官方配置没有继续写入。");
+      }
+    }
+    await invoke(
+      dashboard.officialProfile ? "activate_official_profile" : "prepare_official_login",
+    );
+    dashboard = await invoke<DashboardState>("inspect_state");
+    await refreshProxyStatus();
+    renderDashboard();
+    if (!isOfficialActive(false)) {
+      throw new Error("官方配置已写入，但 Codex 路由被其他程序立即改变。");
+    }
+    return dashboard.officialProfile
+      ? `已切换到 ${dashboard.officialProfile.displayName}。请完全退出并重新打开 Codex。`
+      : "已准备 OpenAI 官方登录。请重新打开 Codex，按提示登录；登录后返回保存当前官方配置。";
+  });
+}
+
+async function saveCurrentOfficial(): Promise<void> {
+  const displayName = required<HTMLInputElement>("#official-profile-name").value.trim();
+  if (!displayName) {
+    setStatus("请先填写官方配置名称。", "error");
+    required<HTMLInputElement>("#official-profile-name").focus();
+    return;
+  }
+  await run("正在保存当前官方配置…", async () => {
+    if (!nativeAvailable) throw new Error("请通过桌面应用保存官方配置。");
+    const saved = await invoke<OfficialProfile>("save_current_official_profile", {
+      displayName,
+    });
+    dashboard = await invoke<DashboardState>("inspect_state");
+    renderDashboard();
+    return saved.modelId
+      ? `已保存 ${saved.displayName}，当前模型为 ${saved.modelId}。账号令牌仍由 Codex 管理。`
+      : `已保存 ${saved.displayName}，模型由 Codex 自动选择。账号令牌仍由 Codex 管理。`;
   });
 }
 
@@ -654,9 +839,114 @@ function selectSwitchMode(mode: SwitchMode): void {
 }
 
 function openEditor(): void {
+  if (discoveryId && nativeAvailable) {
+    const sessionId = discoveryId;
+    void invoke("cancel_discovery", { sessionId }).catch(() => undefined);
+  }
+  discoveryId = null;
+  discoveredModels = [];
+  selectedModels.clear();
+  editingProfileId = null;
+  editingCredentialLoaded = false;
+  editingCredentialDirty = false;
+  input("#connection-name").value = "";
+  input("#base-url").value = "";
+  input("#api-key").value = "";
+  input("#model-search").value = "";
+  input("#manual-model").value = "";
+  required<HTMLElement>("#model-step").hidden = true;
+  required<HTMLElement>("#editor-kicker").textContent = "添加接入";
+  required<HTMLElement>("#editor-title").textContent = "连接你的模型服务";
+  required<HTMLInputElement>("#api-key").placeholder = "输入 API Key";
+  required<HTMLElement>("#api-key-help").textContent =
+    "Key 只会保存在这台电脑的系统密钥库中。";
+  required<HTMLButtonElement>("#fetch-models").textContent = "连接并获取模型";
+  required<HTMLButtonElement>("#save-only").textContent = "仅保存";
+  required<HTMLButtonElement>("#save-and-switch").textContent = "保存并使用";
   required<HTMLElement>("#editor").hidden = false;
   required<HTMLInputElement>("#connection-name").focus();
   required<HTMLElement>("#editor").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function openProfileEditor(
+  profileId: string,
+  options: ProfileEditorOptions = {},
+): Promise<void> {
+  const profile = dashboard.profiles.find((item) => item.id === profileId);
+  if (!profile) return;
+  if (discoveryId && nativeAvailable) {
+    const sessionId = discoveryId;
+    void invoke("cancel_discovery", { sessionId }).catch(() => undefined);
+  }
+  editingProfileId = profile.id;
+  editingCredentialLoaded = false;
+  editingCredentialDirty = false;
+  discoveryId = null;
+  discoveredModels = profile.models.map((model) => ({ id: model.id, ownedBy: null }));
+  selectedModels = new Set(profile.models.map((model) => model.id));
+  required<HTMLElement>("#editor-kicker").textContent = "编辑配置";
+  required<HTMLElement>("#editor-title").textContent = profile.display_name;
+  input("#connection-name").value = profile.display_name;
+  input("#base-url").value = profile.base_url;
+  input("#api-key").value = "";
+  input("#api-key").type = "password";
+  input("#api-key").placeholder = "正在读取现有 Key…";
+  required<HTMLButtonElement>("#toggle-key").textContent = "显示";
+  required<HTMLElement>("#api-key-help").textContent =
+    "正在从这台电脑的系统密钥库读取现有 Key。";
+  required<HTMLButtonElement>("#fetch-models").textContent = "重新获取模型";
+  required<HTMLButtonElement>("#save-only").textContent = "保存配置";
+  required<HTMLButtonElement>("#save-and-switch").textContent = "保存并使用";
+  input("#model-search").value = "";
+  input("#manual-model").value = "";
+  required<HTMLElement>("#model-step").hidden = false;
+  required<HTMLElement>("#editor").hidden = false;
+  renderModelChoices();
+  const activeModel =
+    localProxy.enabled && localProxy.currentProfileId === profile.id
+      ? localProxy.currentModelId
+      : dashboard.current.providerId === profile.id
+        ? dashboard.current.modelId
+        : null;
+  if (activeModel && selectedModels.has(activeModel)) {
+    required<HTMLSelectElement>("#default-model").value = activeModel;
+  }
+  required<HTMLElement>("#editor").scrollIntoView({ behavior: "smooth", block: "start" });
+  if (options.credentialMissing) {
+    input("#api-key").placeholder = "重新输入 API Key";
+    required<HTMLElement>("#api-key-help").textContent =
+      "这个接入的 Key 已不在系统密钥库中。请重新输入一次，再获取模型或保存配置。";
+    input("#api-key").focus();
+    return;
+  }
+  input("#connection-name").focus();
+  await run(
+    "正在读取现有 Key…",
+    async () => {
+      if (!nativeAvailable) throw new Error("请通过桌面应用读取已保存的 Key。");
+      const secret = await invoke<string>("load_profile_credential", { profileId });
+      if (editingProfileId !== profileId) return "编辑窗口已切换。";
+      const keyField = input("#api-key");
+      keyField.value = secret;
+      keyField.type = "text";
+      keyField.placeholder = "输入 API Key";
+      required<HTMLButtonElement>("#toggle-key").textContent = "隐藏";
+      required<HTMLElement>("#api-key-help").textContent =
+        "已从系统密钥库载入。可直接修改；不改动时会继续使用原 Key。";
+      editingCredentialLoaded = true;
+      editingCredentialDirty = false;
+      return "现有 Key 已载入，可以直接编辑配置。";
+    },
+    (error) => {
+      if (editingProfileId !== profileId) return;
+      const missing = isMissingProviderCredential(error);
+      input("#api-key").placeholder = missing ? "重新输入 API Key" : "无法读取现有 Key";
+      required<HTMLElement>("#api-key-help").textContent = missing
+        ? "这个接入的 Key 已不在系统密钥库中。请重新输入一次，再获取模型或保存配置。"
+        : "系统密钥库暂时无法读取。为避免误用旧配置，请重新输入 API Key 后再保存。";
+      if (missing) window.setTimeout(() => input("#api-key").focus(), 0);
+    },
+  );
 }
 
 async function closeEditor(): Promise<void> {
@@ -667,6 +957,9 @@ async function closeEditor(): Promise<void> {
   }
   discoveredModels = [];
   selectedModels.clear();
+  editingProfileId = null;
+  editingCredentialLoaded = false;
+  editingCredentialDirty = false;
   required<HTMLElement>("#editor").hidden = true;
   required<HTMLElement>("#model-step").hidden = true;
   input("#connection-name").value = "";
@@ -706,7 +999,9 @@ async function fetchAvailableModels(): Promise<void> {
       renderModelChoices();
       throw error;
     }
-    keyInput.value = "";
+    if (!editingProfileId) {
+      keyInput.value = "";
+    }
     discoveryId = result.sessionId;
     input("#base-url").value = result.baseUrl;
     discoveredModels = result.models;
@@ -807,29 +1102,53 @@ async function saveConnection(activate: boolean): Promise<void> {
     return;
   }
   const modelIds = [...selectedModels];
+  const originalProfile = editingProfileId
+    ? dashboard.profiles.find((profile) => profile.id === editingProfileId)
+    : null;
 
   const mode = switchMode;
-  await run(activate ? "正在保存并切换…" : "正在保存接入…", async () => {
+  await run(activate ? "正在保存并使用…" : "正在保存配置…", async () => {
     if (!nativeAvailable) throw new Error("请通过桌面应用保存接入。");
     let sessionForSave = discoveryId;
     let resolvedBaseUrl = baseUrl;
     if (!sessionForSave) {
       const keyField = input("#api-key");
       const secret = keyField.value.trim();
-      if (!secret) throw new Error("请输入 API Key。");
-      const staged = await invoke<CredentialSessionSummary>("stage_credential", {
-        input: { baseUrl, secret },
-      });
-      keyField.value = "";
-      sessionForSave = staged.sessionId;
-      resolvedBaseUrl = staged.baseUrl;
+      const canReuseExistingCredential =
+        originalProfile &&
+        normalizedEndpoint(originalProfile.base_url) === normalizedEndpoint(baseUrl) &&
+        editingCredentialLoaded &&
+        !editingCredentialDirty;
+      if (canReuseExistingCredential) {
+        resolvedBaseUrl = originalProfile.base_url;
+      } else if (secret) {
+        const staged = await invoke<CredentialSessionSummary>("stage_credential", {
+          input: { baseUrl, secret },
+        });
+        keyField.value = "";
+        sessionForSave = staged.sessionId;
+        resolvedBaseUrl = staged.baseUrl;
+      } else if (!originalProfile) {
+        throw new Error("请输入 API Key。");
+      }
     }
     const profile = buildProfile(displayName, resolvedBaseUrl, modelIds);
     const connectionChanged = activate && isCrossConnectionSwitch(profile.id);
+    const activeProxyModel =
+      localProxy.enabled && localProxy.currentProfileId === profile.id
+        ? localProxy.currentModelId
+        : null;
+    if (activeProxyModel && !modelIds.includes(activeProxyModel) && !activate) {
+      throw new Error("当前模型正在使用中；如需移除，请选择新的模型并点击“保存并使用”。");
+    }
+    const profileForFirstSave =
+      activeProxyModel && !modelIds.includes(activeProxyModel)
+        ? buildProfile(displayName, resolvedBaseUrl, [...modelIds, activeProxyModel])
+        : profile;
     discoveryId = null;
     try {
       await invoke("save_profile", {
-        input: { profile, discoveryId: sessionForSave },
+        input: { profile: profileForFirstSave, discoveryId: sessionForSave },
       });
     } catch (error) {
       if (sessionForSave) {
@@ -841,11 +1160,25 @@ async function saveConnection(activate: boolean): Promise<void> {
     if (activate) {
       try {
         await activateProfile(profile.id, defaultModel);
+        if (profileForFirstSave.models.length !== profile.models.length) {
+          await invoke("save_profile", {
+            input: { profile, discoveryId: null },
+          });
+        }
       } catch (error) {
         await refreshDashboard();
         const action = mode === "directConfig" ? "配置切换" : "快速切换";
         throw new Error(`接入已保存；${action}未能确认：${friendlyError(error)}`);
       }
+    } else if (
+      activeProxyModel &&
+      localProxy.running &&
+      !localProxy.recoveryRequired
+    ) {
+      localProxy = await invokeProxyCommand("switch_proxy_route", {
+        profileId: profile.id,
+        selectedModel: activeProxyModel,
+      });
     }
 
     if (activate) {
@@ -861,14 +1194,12 @@ async function saveConnection(activate: boolean): Promise<void> {
     }
     await closeEditor();
     if (!activate) {
-      return `已保存 ${displayName}，现在可以从“我的接入”中选择。`;
+      return `已保存 ${displayName} 的配置。`;
     }
     if (mode === "directConfig") {
       return `已写入 ${displayName} / ${defaultModel}。请重新打开 Codex 以生效。${crossConnectionAdvice(connectionChanged)}`;
     }
-    return proxyCompletionMessage(localProxy.requiresCodexRestart
-      ? `已准备 ${displayName} / ${defaultModel}。首次开启需要重新打开一次 Codex。${crossConnectionAdvice(connectionChanged)}`
-      : `已切换到 ${displayName} / ${defaultModel}，下一次发送生效。${crossConnectionAdvice(connectionChanged)}`);
+    return `当前模型：${displayName} / ${defaultModel}。${crossConnectionAdvice(connectionChanged)}`;
   });
 }
 
@@ -881,21 +1212,26 @@ async function switchSavedProfile(profileId: string): Promise<void> {
   const selectedModel = selector.value;
   const mode = switchMode;
   const connectionChanged = isCrossConnectionSwitch(profileId);
+  let credentialMissing = false;
   await run(
     mode === "localProxy"
       ? `正在准备 ${profile.display_name}…`
       : `正在更新为 ${profile.display_name}…`,
     async () => {
-    await activateProfile(profileId, selectedModel);
-    await refreshAfterMutation(mode, profileId, selectedModel);
-    if (mode === "directConfig") {
-      return `已写入 ${profile.display_name} / ${selectedModel}。请重新打开 Codex 以生效。${crossConnectionAdvice(connectionChanged)}`;
-    }
-    return proxyCompletionMessage(localProxy.requiresCodexRestart
-      ? `已准备 ${profile.display_name} / ${selectedModel}。首次开启需要重新打开一次 Codex。${crossConnectionAdvice(connectionChanged)}`
-      : `已切换到 ${profile.display_name} / ${selectedModel}，下一次发送生效。${crossConnectionAdvice(connectionChanged)}`);
-  },
+      await activateProfile(profileId, selectedModel);
+      await refreshAfterMutation(mode, profileId, selectedModel);
+      if (mode === "directConfig") {
+        return `已写入 ${profile.display_name} / ${selectedModel}。请重新打开 Codex 以生效。${crossConnectionAdvice(connectionChanged)}`;
+      }
+      return `当前模型：${profile.display_name} / ${selectedModel}。${crossConnectionAdvice(connectionChanged)}`;
+    },
+    (error) => {
+      credentialMissing = isMissingProviderCredential(error);
+    },
   );
+  if (credentialMissing) {
+    await openProfileEditor(profileId, { credentialMissing: true });
+  }
 }
 
 function isCrossConnectionSwitch(targetProfileId: string): boolean {
@@ -908,10 +1244,6 @@ function isCrossConnectionSwitch(targetProfileId: string): boolean {
 
 function crossConnectionAdvice(changed: boolean): string {
   return changed ? " 为保证上下文兼容，建议新建对话。" : "";
-}
-
-function proxyCompletionMessage(message: string): string {
-  return message;
 }
 
 function requireActiveProxySelection(profileId: string, modelId: string): void {
@@ -983,7 +1315,7 @@ async function activateProfile(profileId: string, selectedModel: string): Promis
   }
   if (switchMode === "localProxy") {
     if (!proxyApiAvailable) {
-      throw new Error("快速切换暂不可用，请选择“直接配置”后重试。");
+      throw new Error("快速切换暂不可用，请从高级设置选择“直接配置”后重试。");
     }
     if (localProxy.recoveryRequired) {
       throw new Error("请先关闭快速切换并恢复原设置，再重新开启。");
@@ -1027,7 +1359,7 @@ async function invokeProxyCommand(
       message.includes("Command")
     ) {
       proxyApiAvailable = false;
-      throw new Error("快速切换暂不可用，请选择“直接配置”后重试。");
+      throw new Error("快速切换暂不可用，请从高级设置选择“直接配置”后重试。");
     }
     throw new Error(message || "快速切换未能完成。");
   }
@@ -1109,8 +1441,9 @@ async function restoreLatest(): Promise<void> {
   });
 }
 
-async function openCodex(): Promise<void> {
+async function openCodex(confirmFirst = true): Promise<void> {
   if (
+    confirmFirst &&
     !window.confirm(
       "请先完全退出正在运行的 Codex。确认现在重新打开吗？",
     )
@@ -1125,13 +1458,27 @@ async function openCodex(): Promise<void> {
   });
 }
 
+function maybeShowRestartNotice(): void {
+  if (
+    restartNoticeShown ||
+    !nativeAvailable ||
+    !localProxy.running ||
+    !localProxy.requiresCodexRestart
+  ) {
+    return;
+  }
+  const dialog = required<HTMLDialogElement>("#restart-notice");
+  restartNoticeShown = true;
+  if (!dialog.open) dialog.showModal();
+}
+
 function buildProfile(
   displayName: string,
   baseUrl: string,
   modelIds: string[],
 ): ProviderProfile {
   return {
-    id: providerId(displayName, baseUrl),
+    id: editingProfileId ?? providerId(displayName, baseUrl),
     display_name: displayName,
     base_url: baseUrl,
     models: modelIds
@@ -1195,7 +1542,7 @@ function normalizedEndpoint(baseUrl: string | null): string {
 function authLabel(kind: AuthKind): string {
   return (
     {
-      officialLogin: "OpenAI 登录 / API Key",
+      officialLogin: "Codex 官方登录",
       systemCredential: "系统密钥库",
       environmentVariable: "环境变量",
       inlineToken: "配置文件中的令牌",
@@ -1247,6 +1594,7 @@ function setBusy(value: boolean): void {
       localProxy.enabled ||
       localProxy.recoveryRequired;
     renderSwitchExperience();
+    renderOfficialProfile();
     renderProfiles();
     updateSelectionSummary();
   }
@@ -1319,6 +1667,9 @@ function friendlyError(error: unknown): string {
   if (message.includes("Base URL changed after models were fetched")) {
     return "Base URL 已改变，请重新输入 API Key 并获取模型。";
   }
+  if (isMissingProviderCredential(error)) {
+    return "这个接入的 API Key 已不在系统密钥库中，请编辑配置并重新输入一次。";
+  }
   if (message.includes("enter the API Key") || message.includes("API Key is required")) {
     return "请输入 API Key 后再继续。";
   }
@@ -1327,6 +1678,15 @@ function friendlyError(error: unknown): string {
   }
   if (message.includes("saved connections")) {
     return "无法保存快捷接入；原有快捷接入和 Codex 配置没有被覆盖。";
+  }
+  if (
+    message.includes("built-in OpenAI login") ||
+    message.includes("official configuration before activating")
+  ) {
+    return "请先切换到 Codex 官方登录并重新打开 Codex；完成登录后再保存当前官方配置。";
+  }
+  if (message.includes("official configuration")) {
+    return "官方配置无法安全读取或保存；原有 Codex 登录凭据没有被修改。";
   }
   if (
     message.includes("could not read the Codex configuration") ||
@@ -1339,6 +1699,14 @@ function friendlyError(error: unknown): string {
     return "操作失败；Codex 设置没有被修改。";
   }
   return message;
+}
+
+function isMissingProviderCredential(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("saved provider credential is missing") ||
+    message.includes("credential is not stored")
+  );
 }
 
 function renderConfigReadError(): void {

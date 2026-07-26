@@ -25,6 +25,14 @@
   explicit release, and bounded-pin eviction.
 - Keyless `profiles.json` create, replace, remove, lock, permission, schema, and
   atomic-write behavior.
+- Keyless `official-profile.json` schema, permission, corruption, model
+  validation, user-chosen-name validation, v1 read compatibility, and
+  credential-field exclusion. Capturing must accept only the built-in `openai`
+  route without a Base URL and must never access `auth.json`.
+- Official-route fixtures must remove `model_provider`, `openai_base_url`, and
+  a shadowing `model_providers.openai` table while preserving MCP, hooks, other
+  providers, and user-owned `model_catalog_json`. Test optional model manifests
+  and legacy string-model manifest compatibility.
 - Keyless `proxy.json` schema-v2, permission, corruption, revision, fixed-port,
   missing profile/model/activation ID, v1 migration, and write-failure rollback
   behavior. Test non-nil ID preallocation, exact manifest path/ID matching, ID
@@ -53,8 +61,14 @@
   turn, switch provider in a new thread, disable, exact restore, and restart.
 - Direct-mode flow: apply an upstream provider, fully restart, start a new
   thread, and exactly restore.
+- Official-account flow: safely disable the proxy, prepare the built-in route,
+  restart into Codex's native ChatGPT login, save the credential-free current
+  route, switch to an API profile, switch back to official, and verify that
+  Codex owns the same login cache throughout.
 - Keychain/Credential Manager flow: first-access prompt, locked store, missing
-  entry, replacement, and deletion.
+  entry, saved-profile readback into the local editor, unchanged credential
+  reuse, endpoint rebinding, replacement, and deletion. Windows tests must
+  reopen the entry and verify `Local` persistence.
 - Config fixtures: CRLF, non-ASCII, comments, dotted keys, concurrent edits,
   missing files, read-only files, symlinks, and interrupted writes.
 - Proxy-detach fixtures must prove that unrelated valid TOML survives, changes
@@ -102,6 +116,8 @@ commit. It is not enabled until both platform signing identities exist.
   in-flight Route rather than replacing it atomically.
 - `profiles.json` contains a credential or switching adds/replaces a
   user-owned `model_catalog_json`.
+- `official-profile.json` contains a credential, token, auth payload, Base URL,
+  or any copied content from `auth.json`.
 - Exact restore or semantic proxy detach can overwrite a concurrent user edit.
 - Disable can restore an unrelated latest backup or a manifest whose
   provider/status/path/transaction ID does not match the recorded activation,
@@ -117,6 +133,196 @@ commit. It is not enabled until both platform signing identities exist.
   private-module scanning fallbacks.
 - A release is unsigned, unnotarized on macOS, or lacks real target-host smoke
   tests.
+
+## 2026-07-26 Windows 0.3.2 evidence
+
+The version 0.3.2 source snapshot on the `ydy001` Windows 11 x64 host passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 60 Windows-applicable core tests, two Credential Manager
+  tests, two launcher tests, six desktop tests, six proxy unit tests, and five
+  proxy integration tests.
+- Named schema-v2 official-profile validation and legacy schema-v1 read
+  compatibility.
+- Explicit Windows Credential Manager `Local` persistence round-trip coverage
+  for newly stored credentials.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke.
+- Verified current-user upgrade without changing Codex/Switcher state or
+  Credential Manager metadata.
+- Interactive Session 1 verification that an ordinary launch shows the main
+  window, while `--background` remains suitable for a hidden gateway start.
+- Visual verification of the official-profile name editor and current/saved
+  official-route state without reading `auth.json`, OAuth tokens, or API Keys.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `cbc619f8f749f34f6aefcac4c034ec0dc6e76ba5183cbdc1ca91a8ae9ef14e74`
+  (`399667` bytes)
+- NSIS SHA-256:
+  `6e86184062473a0174c52abfe5c1ad2c717154edd7c08e12ff542fbcb1b62188`
+  (`3914685` bytes)
+- Installed application SHA-256:
+  `1392aab65b66b0b5ab911fffbd687415e0e89bc42fb547b87945f317ec334bbf`
+- Authenticode status: `NotSigned`
+
+The application and installer remain unsigned internal artifacts. This run
+did not perform the user's interactive official-login/API-provider round trip.
+The affected saved API connections had no recoverable Credential Manager
+entries, so they require one local Key re-entry before selection; the product
+now reports that specific condition without changing Codex configuration.
+
+## 2026-07-25 Windows 0.3.0 evidence
+
+The version 0.3.0 source snapshot on the `ydy001` Windows 11 x64 host passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 58 Windows-applicable core tests, one Credential Manager
+  test, two launcher tests, five desktop tests, six proxy unit tests, and five
+  proxy integration tests.
+- Official-profile validation and native command coverage, including
+  credential-free capture, built-in `openai` restoration, optional models,
+  route-shadow removal, unrelated-config preservation, and legacy manifest
+  compatibility.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke.
+- Verified current-user upgrade from 0.2.4 to 0.3.0 without changing
+  Codex/Switcher state or Credential Manager metadata.
+- Live verification of one version 0.3.0 process in interactive Session 1,
+  proxy ownership of `127.0.0.1:15722`, the quoted current-user Run
+  registration, removal of the temporary deployment task, and preservation of
+  the existing `claude-opus-4-8` Route and proxy revision.
+- A `cps-local` auth command bound to the new content-addressed helper, with
+  the helper SHA-256 equal to the installed application SHA-256.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `1f78e68d7c97d60fec9bf26f5c25baa8d912264621d0a8fcf5a373cfe3cf92c3`
+- NSIS SHA-256:
+  `2afba8700f6533150cb90a6ca6baced5cd52d8cf2d8621491cb12e46833d9ca5`
+  (`4281055` bytes)
+- Installed application and active helper SHA-256:
+  `7a7cfae27580d310f443f2d0e0f342887cb07c26b5c592bef8fdb80b8dbb4d08`
+- Authenticode status: `NotSigned`
+
+This is internal deployment evidence, not a public release approval. The run
+deliberately preserved the user's current API route and did not exercise the
+interactive OpenAI prepare/login/save/switch-back flow. It also did not repeat
+a live upstream model turn. Native Windows DACL/durability, disable/restore,
+uninstall cleanup, signed release gates, and the complete official-account
+round trip remain open.
+
+## 2026-07-25 Windows 0.2.4 evidence
+
+The version 0.2.4 source snapshot on the `ydy001` Windows 11 x64 host passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 53 Windows-applicable core tests, one Credential Manager
+  test, two launcher tests, four desktop tests, six proxy unit tests, and five
+  proxy integration tests.
+- The new saved-profile credential lookup test, which limits Key readback to
+  an existing profile that is marked as requiring a credential.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke.
+- Verified current-user upgrade from 0.2.3 to 0.2.4 without changing
+  Codex/Switcher state or Credential Manager metadata.
+- Read-only live verification of one version 0.2.4 process in interactive
+  Session 1, proxy ownership of `127.0.0.1:15722`, the quoted current-user Run
+  registration, removal of the temporary deployment task, and the active
+  `gpt-5.6-sol` Route.
+- A `cps-local` auth command bound to the new content-addressed helper, with
+  the helper SHA-256 equal to the installed application SHA-256.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `b2b2b455c07390c5c366ea5fc5386001b9086e17849e52fcaa8c89f4467c99c8`
+- NSIS SHA-256:
+  `7841590a41bbf5161cb818589629c7463cb82fdbb81109637eed10bc43eaf37a`
+  (`4274546` bytes)
+- Installed application and active helper SHA-256:
+  `c2585f1ca16b571baca9e837c23aad78c7bb291f89a64c7e7af5095901907bb5`
+- Authenticode status: `NotSigned`
+
+This is internal deployment evidence, not a public release approval. The run
+did not repeat a live upstream model turn. Native Windows DACL/durability,
+  disable/restore, uninstall cleanup, signed release gates, and interactive
+  OpenAI-login switching remain open.
+
+## 2026-07-24 Windows 0.2.3 evidence
+
+The version 0.2.3 source snapshot on the `ydy001` Windows 11 x64 host passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 53 Windows-applicable core tests, one Credential Manager
+  test, two launcher tests, three desktop tests, six proxy unit tests, and five
+  proxy integration tests.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke while preserving the existing uninstall
+  registration, installer state, and shortcuts.
+- Verified current-user upgrade from 0.2.2 to 0.2.3 without changing
+  Codex/Switcher state or Credential Manager metadata.
+- Interactive Session 1 background restart, proxy ownership of
+  `127.0.0.1:15722`, quoted current-user Run registration, and
+  content-addressed helper refresh to the installed 0.2.3 executable.
+- Preserved active `gpt-5.6-sol` selection and the required first-restart flag
+  for the new one-time customer notice.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `52c18cdf231897acdce896d3ae58104bafe5ff80a980c96ff8146f457e1e7f5f`
+- NSIS SHA-256:
+  `7c8c4a781104da6d3007ad7e539668938ac734fcb4a3f9a56b7856d09f4bdac8`
+  (`4270992` bytes)
+- Installed application SHA-256:
+  `d7e9e9bcf73ee7d5f2f7e25276051df8d4f2463a70202f00c48dce1419a2d9ea`
+- Authenticode status: `NotSigned`
+
+This is internal deployment evidence, not a public release approval. The run
+did not repeat a live upstream model turn. Native Windows DACL/durability,
+disable/restore, uninstall cleanup, signed release gates, and official
+OpenAI-login profile capture remain open.
+
+## 2026-07-25 Windows 0.2.2 evidence
+
+The version 0.2.2 source snapshot on the `ydy001` Windows 11 x64 host passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 53 Windows-applicable core tests including normal versus
+  `\\?\` helper path equivalence, one Credential Manager test, two launcher
+  tests, two desktop tests, six proxy unit tests, and five proxy integration
+  tests.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke while preserving the existing uninstall
+  registration, installer state, and two shortcuts.
+- Verified current-user upgrade from 0.2.1 to 0.2.2 without changing
+  Codex/Switcher state or Credential Manager metadata.
+- Content-addressed helper refresh, proxy ownership of
+  `127.0.0.1:15722`, missing-Run-entry repair, and a second interactive
+  `--background` restart.
+- An official npm `codex-cli 0.145.0` request from interactive Session 1. The
+  request passed the credential helper and local proxy instead of returning
+  401, then received upstream HTTP 503 because the selected
+  `claude-opus-4-8` route had no available channel.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `79834566f5572fcc6906e1cb00440636f6823847a8b515d58195e3e5b3f5863f`
+- NSIS SHA-256:
+  `e2aa9d9263e31ed1d8e16faae8cb7865bbfc1ea82a3314ca5f48a6e70621d987`
+  (`4271429` bytes)
+- Installed application SHA-256:
+  `ba38a88deae96789fb694ab762240e289b380a49a499b24e7dabeab1adb371d7`
+- Authenticode status: `NotSigned`
+
+This is internal deployment evidence, not a public release approval. Native
+Windows DACL/durability, disable/restore, uninstall cleanup, and signed release
+gates remain open. The observed upstream 503 also does not prove availability
+of the selected provider/model route.
 
 ## 2026-07-23 Windows phase-2 evidence
 
@@ -135,7 +341,5 @@ development artifacts. The isolated package smoke does not replace an
 interactive user-session test.
 
 This evidence predates the local proxy, local model catalog, tray, background
-startup, and hot Route switching implementation. It is not 0.2.0 evidence.
-Current native macOS and Windows test results, package hashes, GUI lifecycle,
-Credential Manager/Keychain interaction, real Codex traffic, disable/restore,
-upgrade/uninstall cleanup, and release signing remain open gates.
+startup, and hot Route switching implementation. The 2026-07-25 evidence above
+supersedes it for the tested 0.2.2 Windows paths.
