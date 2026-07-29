@@ -80,6 +80,7 @@ interface ProfileEditorOptions {
 }
 
 type SwitchMode = "localProxy" | "directConfig";
+type AppPage = "switcher" | "advanced";
 
 interface LocalProxyStatus {
   enabled: boolean;
@@ -95,6 +96,21 @@ interface LocalProxyStatus {
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("missing app root");
 
+const previewModel = (
+  id: string,
+  displayName: string,
+  description: string,
+): ModelSpec => ({
+  id,
+  display_name: displayName,
+  description,
+  context_window: 128_000,
+  default_reasoning: "medium",
+  reasoning_levels: ["low", "medium", "high"],
+  supports_parallel_tool_calls: true,
+  supports_images: true,
+});
+
 const browserPreview: DashboardState = {
   configPath: "~/.codex/config.toml",
   configExists: true,
@@ -108,9 +124,25 @@ const browserPreview: DashboardState = {
     authKind: "officialLogin",
     catalogPath: null,
   },
-  profiles: [],
+  profiles: [
+    {
+      id: "studio-api",
+      display_name: "Studio API",
+      base_url: "https://gateway.example.com/v1",
+      models: [
+        previewModel("code-pro", "Code Pro", "日常开发与复杂任务"),
+        previewModel("code-fast", "Code Fast", "快速编码与迭代"),
+      ],
+      supports_websockets: true,
+      credential_required: true,
+    },
+  ],
   profileWarning: null,
-  officialProfile: null,
+  officialProfile: {
+    schemaVersion: 2,
+    displayName: "个人 Plus",
+    modelId: null,
+  },
   officialProfileWarning: null,
 };
 
@@ -130,6 +162,7 @@ let nativeAvailable = "__TAURI_INTERNALS__" in window;
 let proxyApiAvailable = true;
 let localProxy = stoppedProxy;
 let switchMode: SwitchMode = "localProxy";
+let activePage: AppPage = "switcher";
 let discoveryId: string | null = null;
 let discoveredModels: FetchedModel[] = [];
 let selectedModels = new Set<string>();
@@ -140,177 +173,291 @@ let restartNoticeShown = false;
 let busy = false;
 
 app.innerHTML = `
-  <header class="app-header">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true">C</div>
-      <div>
-        <h1>Codex 模型切换</h1>
-        <p>选择接入和模型即可使用。</p>
-      </div>
-    </div>
-    <div class="header-actions">
-      <button id="refresh" class="button button-quiet" type="button">刷新状态</button>
-      <button
-        id="advanced-settings-toggle"
-        class="button button-icon"
-        type="button"
-        aria-label="打开高级设置"
-        aria-controls="advanced-settings"
-        aria-expanded="false"
-        title="高级设置"
-      >•••</button>
-    </div>
-  </header>
-
-  <main>
-    <section class="current-section" aria-labelledby="current-title">
-      <div class="section-title-row">
-        <div>
-          <p id="current-kicker" class="section-kicker">当前选择</p>
-          <h2 id="current-title">正在读取…</h2>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="应用导航">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false">
+            <path d="m7.5 6.5 5.5 5.5-5.5 5.5M13 6.5l5.5 5.5-5.5 5.5" />
+          </svg>
         </div>
-        <span id="current-badge" class="badge">读取中</span>
-      </div>
-      <div id="current-details" class="current-details"></div>
-    </section>
-
-    <section id="advanced-settings" class="switch-mode-section advanced-settings" aria-labelledby="switch-mode-title" hidden>
-      <div class="section-title-row">
         <div>
-          <h2 id="switch-mode-title">高级设置</h2>
-          <p>日常默认使用无感快速切换；只有兼容排查时才需要改动这里。</p>
+          <strong>Codex Switcher</strong>
+          <span>模型与接入</span>
         </div>
-        <div class="advanced-header-actions">
-          <div id="proxy-health" class="proxy-health" role="status">
-            <span class="health-dot" aria-hidden="true"></span>
+      </div>
+
+      <nav class="sidebar-nav">
+        <button id="nav-switcher" class="nav-item nav-item-active" type="button" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7.5h16M4 16.5h16M8 4v7M16 13v7" />
+          </svg>
+          <span>模型切换</span>
+        </button>
+        <button
+          id="advanced-settings-toggle"
+          class="nav-item"
+          type="button"
+          aria-label="打开高级设置"
+          aria-controls="advanced-settings"
+          aria-expanded="false"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.82 2.82-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.04 1.56V21h-4v-.08A1.7 1.7 0 0 0 8.96 19.36a1.7 1.7 0 0 0-1.88.34l-.06.06-2.82-2.82.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3v-4h.04A1.7 1.7 0 0 0 4.6 8.92a1.7 1.7 0 0 0-.34-1.88L4.2 6.98l2.82-2.82.06.06a1.7 1.7 0 0 0 1.88.34A1.7 1.7 0 0 0 10 3V3h4v.08a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.82 2.82-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.56 1.04H21v4h-.04A1.7 1.7 0 0 0 19.4 15Z" />
+          </svg>
+          <span>高级设置</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div id="proxy-health" class="proxy-health" role="status">
+          <span class="health-dot" aria-hidden="true"></span>
+          <div>
+            <span>快速切换</span>
             <strong>正在检查</strong>
           </div>
-          <button id="advanced-settings-close" class="button button-quiet" type="button">收起</button>
         </div>
+        <span class="version-label">Version 0.3.3</span>
       </div>
+    </aside>
 
-      <div class="mode-options" role="group" aria-label="切换方式">
-        <button id="mode-local-proxy" class="mode-option mode-option-active" type="button" aria-pressed="true">
-          <span class="mode-option-heading">
-            <strong>快速切换</strong>
-            <span class="mini-badge">推荐</span>
-          </span>
-          <span>应用保持开启时，可直接切换接入和模型。</span>
+    <div class="workspace">
+      <header class="app-header">
+        <div class="page-heading">
+          <p>Codex Provider Switcher</p>
+          <h1 id="page-title">模型切换</h1>
+          <span id="page-description">选择接入和模型，下一轮对话即可使用。</span>
+        </div>
+        <button id="refresh" class="button button-toolbar" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" />
+          </svg>
+          <span>刷新</span>
         </button>
-        <button id="mode-direct-config" class="mode-option" type="button" aria-pressed="false">
-          <span class="mode-option-heading">
-            <strong>直接配置</strong>
-            <span class="mode-label">兼容</span>
-          </span>
-          <span>遇到兼容问题时使用；每次切换后需要重新打开 Codex。</span>
-        </button>
-      </div>
+      </header>
 
-      <div class="mode-summary">
-        <div>
-          <strong id="mode-summary-title">快速切换尚未开启</strong>
-          <p id="mode-summary-copy">在下方选择一个接入和模型即可开启。</p>
-        </div>
-        <div class="mode-summary-actions">
-          <button id="restore" class="button button-quiet" type="button">撤销上次配置更改</button>
-          <button id="open-codex" class="button button-secondary" type="button" hidden>重新打开 Codex</button>
-          <button id="stop-proxy" class="button button-secondary" type="button" hidden>关闭快速切换</button>
-        </div>
-      </div>
-    </section>
+      <main class="content-scroll">
+        <section id="switcher-page" class="page-view" aria-labelledby="current-title">
+          <section class="current-section">
+            <div class="current-heading">
+              <div class="current-symbol" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="m8 7 5 5-5 5M13 7l5 5-5 5" />
+                </svg>
+              </div>
+              <div class="current-copy">
+                <p id="current-kicker" class="section-kicker">当前模型</p>
+                <h2 id="current-title">正在读取…</h2>
+              </div>
+              <span id="current-badge" class="badge">读取中</span>
+            </div>
+            <div id="current-details" class="current-details"></div>
+          </section>
 
-    <section class="official-section" aria-labelledby="official-title">
-      <div class="section-title-row">
-        <div>
-          <p class="section-kicker">官方接入</p>
-          <h2 id="official-title">OpenAI 官方账号</h2>
-          <p>登录和令牌由 Codex 自己管理；本软件只保存模型选择，不读取账号凭据。</p>
-        </div>
-        <span id="official-badge" class="badge badge-neutral">未保存</span>
-      </div>
-      <div id="official-profile" class="official-profile"></div>
-    </section>
+          <section class="connections-section" aria-labelledby="connections-title">
+            <div class="section-title-row">
+              <div>
+                <h2 id="connections-title">可用接入</h2>
+                <p id="connections-help">选择接入和模型，应用会自动完成切换。</p>
+              </div>
+              <button id="add-connection" class="button button-primary" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                <span>添加接入</span>
+              </button>
+            </div>
 
-    <section class="connections-section" aria-labelledby="connections-title">
-      <div class="section-title-row">
-        <div>
-          <h2 id="connections-title">我的接入</h2>
-          <p id="connections-help">选择接入，或编辑已有 Key 和模型。</p>
-        </div>
-        <button id="add-connection" class="button button-primary" type="button">添加接入</button>
-      </div>
-      <div id="profiles" class="profile-grid"></div>
-    </section>
+            <div class="provider-list">
+              <article class="official-section" aria-labelledby="official-title">
+                <div class="provider-heading">
+                  <div class="provider-icon provider-icon-official" aria-hidden="true">O</div>
+                  <div>
+                    <p class="section-kicker">Codex 内置</p>
+                    <h3 id="official-title">OpenAI 官方账号</h3>
+                    <p>登录凭据始终由 Codex 管理。</p>
+                  </div>
+                  <span id="official-badge" class="badge badge-neutral">未保存</span>
+                </div>
+                <div id="official-profile" class="official-profile"></div>
+              </article>
+              <div id="profiles" class="profile-grid"></div>
+            </div>
+          </section>
+        </section>
 
-    <section id="editor" class="editor-section" aria-labelledby="editor-title" hidden>
-      <div class="section-title-row">
+        <section id="advanced-settings" class="page-view advanced-settings" aria-labelledby="switch-mode-title" hidden>
+          <div class="advanced-intro">
+            <div>
+              <p class="section-kicker">仅在需要时调整</p>
+              <h2 id="switch-mode-title">切换与恢复</h2>
+              <p>默认推荐快速切换。兼容模式和恢复工具只在排查问题时使用。</p>
+            </div>
+            <button id="advanced-settings-close" class="button button-secondary" type="button">
+              返回模型切换
+            </button>
+          </div>
+
+          <section class="settings-group" aria-labelledby="mode-heading">
+            <div class="settings-group-heading">
+              <h3 id="mode-heading">切换方式</h3>
+              <p>选择最适合当前 Codex 环境的工作方式。</p>
+            </div>
+            <div class="mode-options" role="group" aria-label="切换方式">
+              <button id="mode-local-proxy" class="mode-option mode-option-active" type="button" aria-pressed="true">
+                <span class="mode-radio" aria-hidden="true"></span>
+                <span class="mode-option-copy">
+                  <span class="mode-option-heading">
+                    <strong>快速切换</strong>
+                    <span class="mini-badge">推荐</span>
+                  </span>
+                  <span>应用保持开启时，新一轮对话直接使用新接入和模型。</span>
+                </span>
+              </button>
+              <button id="mode-direct-config" class="mode-option" type="button" aria-pressed="false">
+                <span class="mode-radio" aria-hidden="true"></span>
+                <span class="mode-option-copy">
+                  <span class="mode-option-heading">
+                    <strong>直接配置</strong>
+                    <span class="mode-label">兼容</span>
+                  </span>
+                  <span>写入 Codex 用户配置；每次切换后需要重新打开 Codex。</span>
+                </span>
+              </button>
+            </div>
+          </section>
+
+          <section class="settings-group" aria-labelledby="service-heading">
+            <div class="settings-group-heading">
+              <h3 id="service-heading">服务状态</h3>
+              <p>这里显示当前模式，并提供安全关闭与恢复操作。</p>
+            </div>
+            <div class="mode-summary">
+              <div>
+                <strong id="mode-summary-title">快速切换尚未开启</strong>
+                <p id="mode-summary-copy">在模型切换页选择一个接入和模型即可开启。</p>
+              </div>
+              <div class="mode-summary-actions">
+                <button id="restore" class="button button-quiet" type="button">撤销上次更改</button>
+                <button id="open-codex" class="button button-secondary" type="button" hidden>重新打开 Codex</button>
+                <button id="stop-proxy" class="button button-secondary danger-text" type="button" hidden>关闭快速切换</button>
+              </div>
+            </div>
+          </section>
+
+          <aside class="privacy-note">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3 5 6v5c0 4.7 2.9 8 7 10 4.1-2 7-5.3 7-10V6l-7-3Z" />
+              <path d="m9 12 2 2 4-4" />
+            </svg>
+            <div>
+              <strong>本机优先</strong>
+              <p>API Key 只保存在系统密钥库中；官方登录和 OAuth 令牌始终由 Codex 管理。</p>
+            </div>
+          </aside>
+        </section>
+      </main>
+
+      <output id="status" class="status status-info" aria-live="polite">正在读取当前状态…</output>
+    </div>
+  </div>
+
+  <dialog id="editor" class="editor-dialog" aria-labelledby="editor-title">
+    <div class="editor-shell">
+      <header class="editor-header">
         <div>
           <p id="editor-kicker" class="section-kicker">添加接入</p>
           <h2 id="editor-title">连接你的模型服务</h2>
           <p>通常只需要 Base URL 和 API Key。</p>
         </div>
-        <button id="close-editor" class="button button-quiet" type="button">关闭</button>
+        <button id="close-editor" class="button button-icon" type="button" aria-label="关闭">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m7 7 10 10M17 7 7 17" />
+          </svg>
+        </button>
+      </header>
+
+      <div class="editor-progress" aria-label="设置进度">
+        <div id="editor-step-connection" class="progress-step progress-step-active">
+          <span>1</span>
+          <strong>连接信息</strong>
+        </div>
+        <div class="progress-line" aria-hidden="true"></div>
+        <div id="editor-step-models" class="progress-step">
+          <span>2</span>
+          <strong>选择模型</strong>
+        </div>
       </div>
 
-      <div class="connection-fields">
-        <label>
-          <span>接入名称 <small>可选</small></span>
-          <input id="connection-name" autocomplete="off" placeholder="例如：我的 Coding API" />
-        </label>
-        <label class="field-wide">
-          <span>Base URL</span>
-          <input id="base-url" type="url" autocomplete="url" placeholder="https://api.example.com/v1" />
-        </label>
-        <label class="field-wide">
-          <span>API Key</span>
-          <div class="password-field">
-            <input id="api-key" type="password" autocomplete="new-password" placeholder="输入 API Key" />
-            <button id="toggle-key" class="field-button" type="button">显示</button>
+      <div class="editor-body">
+        <div class="connection-fields">
+          <label>
+            <span>接入名称 <small>可选</small></span>
+            <input id="connection-name" autocomplete="off" placeholder="例如：我的 Coding API" />
+          </label>
+          <label class="field-wide">
+            <span>Base URL</span>
+            <input id="base-url" type="url" autocomplete="url" placeholder="https://api.example.com/v1" />
+          </label>
+          <label class="field-wide">
+            <span>API Key</span>
+            <div class="password-field">
+              <input id="api-key" type="password" autocomplete="new-password" placeholder="输入 API Key" />
+              <button id="toggle-key" class="field-button" type="button">显示</button>
+            </div>
+            <small id="api-key-help" class="field-help">Key 只会保存在这台电脑的系统密钥库中。</small>
+          </label>
+        </div>
+
+        <div class="editor-actions first-step-actions">
+          <button id="fetch-models" class="button button-primary" type="button">
+            连接并获取模型
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+          </button>
+        </div>
+
+        <div id="model-step" class="model-step" hidden>
+          <div class="model-toolbar">
+            <div>
+              <h3>选择要保留的模型</h3>
+              <p>以后快速切换时，只显示这些模型。</p>
+            </div>
+            <strong id="selected-count">已选择 0 个</strong>
           </div>
-          <small id="api-key-help" class="field-help">Key 只会保存在这台电脑的系统密钥库中。</small>
-        </label>
-      </div>
-
-      <div class="editor-actions first-step-actions">
-        <button id="fetch-models" class="button button-primary" type="button">连接并获取模型</button>
-      </div>
-
-      <div id="model-step" class="model-step" hidden>
-        <div class="model-toolbar">
-          <div>
-            <h3>选择要保留的模型</h3>
-            <p>以后快速切换时，只显示你勾选的模型。</p>
+          <div class="model-controls">
+            <div class="search-field">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="6" />
+                <path d="m16 16 4 4" />
+              </svg>
+              <input id="model-search" type="search" autocomplete="off" placeholder="搜索模型" />
+            </div>
+            <button id="select-visible" class="button button-secondary" type="button">全选结果</button>
+            <button id="clear-models" class="button button-quiet" type="button">清空</button>
           </div>
-          <strong id="selected-count">已选择 0 个</strong>
-        </div>
-        <div class="model-controls">
-          <input id="model-search" type="search" autocomplete="off" placeholder="搜索模型" />
-          <button id="select-visible" class="button button-secondary" type="button">全选当前结果</button>
-          <button id="clear-models" class="button button-quiet" type="button">清空</button>
-        </div>
-        <div id="model-list" class="model-list"></div>
-        <div class="manual-model">
-          <input id="manual-model" autocomplete="off" placeholder="列表里没有？手动输入模型 ID" />
-          <button id="add-manual-model" class="button button-secondary" type="button">添加</button>
-        </div>
-        <label class="default-model-field">
-          <span>保存后首先使用</span>
-          <select id="default-model"></select>
-        </label>
-        <div class="editor-actions">
-          <button id="save-only" class="button button-secondary" type="button">仅保存</button>
-          <button id="save-and-switch" class="button button-primary" type="button">保存并使用</button>
+          <div id="model-list" class="model-list"></div>
+          <div class="manual-model">
+            <input id="manual-model" autocomplete="off" placeholder="列表里没有？手动输入模型 ID" />
+            <button id="add-manual-model" class="button button-secondary" type="button">添加</button>
+          </div>
+          <label class="default-model-field">
+            <span>保存后首先使用</span>
+            <select id="default-model"></select>
+          </label>
+          <div class="editor-actions">
+            <button id="save-only" class="button button-secondary" type="button">仅保存</button>
+            <button id="save-and-switch" class="button button-primary" type="button">保存并使用</button>
+          </div>
         </div>
       </div>
-    </section>
-
-    <output id="status" class="status status-info" aria-live="polite">正在读取当前状态…</output>
-  </main>
+    </div>
+  </dialog>
 
   <dialog id="restart-notice" class="restart-dialog" aria-labelledby="restart-notice-title">
     <div class="restart-dialog-mark" aria-hidden="true">✓</div>
-    <h2 id="restart-notice-title">代理服务已自动设置</h2>
-    <p>重启一次 Codex 马上生效。后续使用 Codex 时，请先打开本软件作为模型代理网关。</p>
+    <h2 id="restart-notice-title">快速切换已准备好</h2>
+    <p>重新打开一次 Codex 即可生效。之后保持本软件运行，模型切换会应用到下一轮对话。</p>
     <div class="restart-dialog-actions">
       <button id="restart-later" class="button button-secondary" type="button">稍后</button>
       <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
@@ -321,12 +468,16 @@ app.innerHTML = `
 const status = required<HTMLOutputElement>("#status");
 
 required<HTMLButtonElement>("#refresh").addEventListener("click", refreshDashboard);
-required<HTMLButtonElement>("#advanced-settings-toggle").addEventListener("click", () =>
-  setAdvancedSettingsVisible(required<HTMLElement>("#advanced-settings").hidden),
-);
-required<HTMLButtonElement>("#advanced-settings-close").addEventListener("click", () =>
+required<HTMLButtonElement>("#nav-switcher").addEventListener("click", () =>
   setAdvancedSettingsVisible(false),
 );
+required<HTMLButtonElement>("#advanced-settings-toggle").addEventListener("click", () =>
+  setAdvancedSettingsVisible(true),
+);
+required<HTMLButtonElement>("#advanced-settings-close").addEventListener("click", () => {
+  setAdvancedSettingsVisible(false);
+  required<HTMLButtonElement>("#nav-switcher").focus();
+});
 required<HTMLButtonElement>("#mode-local-proxy").addEventListener("click", () =>
   selectSwitchMode("localProxy"),
 );
@@ -389,18 +540,52 @@ required<HTMLButtonElement>("#restart-now").addEventListener("click", () => {
   required<HTMLDialogElement>("#restart-notice").close();
   void openCodex(false);
 });
+required<HTMLDialogElement>("#editor").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  void closeEditor();
+});
 
-void refreshDashboard();
+void refreshDashboard().then(showRequestedBrowserPreview);
+
+function showRequestedBrowserPreview(): void {
+  if (nativeAvailable) return;
+  const preview = new URLSearchParams(window.location.search).get("preview");
+  if (preview === "advanced") {
+    setAdvancedSettingsVisible(true);
+    return;
+  }
+  if (preview === "editor") {
+    openEditor();
+    input("#connection-name").value = "Studio API";
+    input("#base-url").value = "https://gateway.example.com/v1";
+    input("#api-key").value = "demo-key";
+  }
+}
 
 function setAdvancedSettingsVisible(visible: boolean): void {
   const panel = required<HTMLElement>("#advanced-settings");
+  const switcher = required<HTMLElement>("#switcher-page");
   const toggle = required<HTMLButtonElement>("#advanced-settings-toggle");
-  panel.hidden = !visible;
-  toggle.setAttribute("aria-expanded", String(visible));
-  toggle.setAttribute("aria-label", visible ? "收起高级设置" : "打开高级设置");
-  if (visible) {
-    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
+  const switcherNav = required<HTMLButtonElement>("#nav-switcher");
+  const pageTitle = required<HTMLElement>("#page-title");
+  const pageDescription = required<HTMLElement>("#page-description");
+  activePage = visible ? "advanced" : "switcher";
+  const advancedActive = activePage === "advanced";
+  panel.hidden = !advancedActive;
+  switcher.hidden = advancedActive;
+  toggle.classList.toggle("nav-item-active", advancedActive);
+  switcherNav.classList.toggle("nav-item-active", !advancedActive);
+  toggle.setAttribute("aria-expanded", String(advancedActive));
+  toggle.setAttribute("aria-current", advancedActive ? "page" : "false");
+  switcherNav.setAttribute("aria-current", advancedActive ? "false" : "page");
+  pageTitle.textContent = advancedActive ? "高级设置" : "模型切换";
+  pageDescription.textContent = advancedActive
+    ? "切换工作方式，查看服务状态或安全恢复设置。"
+    : "选择接入和模型，下一轮对话即可使用。";
+  required<HTMLElement>(".content-scroll").scrollTo({
+    top: 0,
+    behavior: "smooth",
+  });
 }
 
 async function refreshDashboard(): Promise<void> {
@@ -557,8 +742,8 @@ function renderOfficialProfile(): void {
   root.innerHTML = `
     <div class="official-main">
       <div class="official-copy">
-        <strong>${escapeHtml(explanation)}</strong>
-        <span>官方账号和 API 接入之间切换需要重启 Codex；API 接入之间仍可快速切换。</span>
+        <p>${escapeHtml(explanation)}</p>
+        <span>官方账号与 API 接入互换后需要重启 Codex；API 接入之间仍可快速切换。</span>
       </div>
       ${nameEditor}
     </div>
@@ -693,6 +878,7 @@ function renderProfiles(): void {
     root.innerHTML = `
       ${warning}
       <div class="empty-state">
+        <div class="empty-state-icon" aria-hidden="true">+</div>
         <strong>还没有保存的接入</strong>
         <p>添加 Base URL 和 API Key，选择模型后即可开始使用。</p>
         <button class="button button-secondary" data-open-editor type="button">添加接入</button>
@@ -728,16 +914,19 @@ function renderProfiles(): void {
           : localProxy.recoveryRequired
             ? "请先完成修复"
             : "使用此模型";
+      const initial =
+        Array.from(profile.display_name.trim())[0]?.toLocaleUpperCase() ?? "A";
       return `
         <article class="profile-card ${isCurrent ? "profile-card-current" : ""}">
           <div class="profile-heading">
+            <div class="provider-icon provider-icon-api" aria-hidden="true">${escapeHtml(initial)}</div>
             <div>
               <h3>${escapeHtml(profile.display_name)}</h3>
               <p>${escapeHtml(readableEndpoint(profile.base_url))}</p>
             </div>
             ${isCurrent ? '<span class="badge">当前</span>' : ""}
           </div>
-          <label>
+          <label class="profile-model">
             <span>选择模型</span>
             <select data-profile-model="${escapeHtml(profile.id)}">
               ${profile.models
@@ -863,9 +1052,10 @@ function openEditor(): void {
   required<HTMLButtonElement>("#fetch-models").textContent = "连接并获取模型";
   required<HTMLButtonElement>("#save-only").textContent = "仅保存";
   required<HTMLButtonElement>("#save-and-switch").textContent = "保存并使用";
-  required<HTMLElement>("#editor").hidden = false;
+  setEditorStep(1);
+  const editor = required<HTMLDialogElement>("#editor");
+  if (!editor.open) editor.showModal();
   required<HTMLInputElement>("#connection-name").focus();
-  required<HTMLElement>("#editor").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function openProfileEditor(
@@ -900,7 +1090,9 @@ async function openProfileEditor(
   input("#model-search").value = "";
   input("#manual-model").value = "";
   required<HTMLElement>("#model-step").hidden = false;
-  required<HTMLElement>("#editor").hidden = false;
+  setEditorStep(2);
+  const editor = required<HTMLDialogElement>("#editor");
+  if (!editor.open) editor.showModal();
   renderModelChoices();
   const activeModel =
     localProxy.enabled && localProxy.currentProfileId === profile.id
@@ -911,7 +1103,6 @@ async function openProfileEditor(
   if (activeModel && selectedModels.has(activeModel)) {
     required<HTMLSelectElement>("#default-model").value = activeModel;
   }
-  required<HTMLElement>("#editor").scrollIntoView({ behavior: "smooth", block: "start" });
   if (options.credentialMissing) {
     input("#api-key").placeholder = "重新输入 API Key";
     required<HTMLElement>("#api-key-help").textContent =
@@ -960,8 +1151,10 @@ async function closeEditor(): Promise<void> {
   editingProfileId = null;
   editingCredentialLoaded = false;
   editingCredentialDirty = false;
-  required<HTMLElement>("#editor").hidden = true;
+  const editor = required<HTMLDialogElement>("#editor");
+  if (editor.open) editor.close();
   required<HTMLElement>("#model-step").hidden = true;
+  setEditorStep(1);
   input("#connection-name").value = "";
   input("#base-url").value = "";
   input("#api-key").value = "";
@@ -996,6 +1189,7 @@ async function fetchAvailableModels(): Promise<void> {
       discoveredModels = [];
       selectedModels.clear();
       required<HTMLElement>("#model-step").hidden = false;
+      setEditorStep(2);
       renderModelChoices();
       throw error;
     }
@@ -1007,6 +1201,7 @@ async function fetchAvailableModels(): Promise<void> {
     discoveredModels = result.models;
     selectedModels.clear();
     required<HTMLElement>("#model-step").hidden = false;
+    setEditorStep(2);
     renderModelChoices();
     return result.models.length > 0
       ? `已获取 ${result.models.length} 个模型，请勾选需要保留的模型。`
@@ -1733,10 +1928,26 @@ function invalidateDiscovery(): void {
   discoveredModels = [];
   selectedModels.clear();
   required<HTMLElement>("#model-step").hidden = true;
+  setEditorStep(1);
   if (nativeAvailable) {
     void invoke("cancel_discovery", { sessionId }).catch(() => undefined);
   }
   setStatus("Base URL 已改变，请重新输入 API Key 并获取模型。", "info");
+}
+
+function setEditorStep(step: 1 | 2): void {
+  required<HTMLElement>("#editor-step-connection").classList.toggle(
+    "progress-step-active",
+    step === 1,
+  );
+  required<HTMLElement>("#editor-step-models").classList.toggle(
+    "progress-step-active",
+    step === 2,
+  );
+  required<HTMLElement>(".progress-line").classList.toggle(
+    "progress-line-complete",
+    step === 2,
+  );
 }
 
 function cssEscape(value: string): string {

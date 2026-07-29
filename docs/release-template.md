@@ -1,0 +1,52 @@
+Codex Provider Switcher {{VERSION}} brings the redesigned two-page interface
+to downloadable native desktop packages.
+
+> **Preview release:** the Windows installer is unsigned. The macOS DMGs use
+> an ad-hoc signature but are not Developer ID signed or notarized. Read the
+> first-launch notes below before installing.
+
+## Choose your download
+
+| Computer | Download |
+| --- | --- |
+| Windows x64 (tested on Windows 11) | `Codex.Provider.Switcher_{{VERSION}}_Windows-x64-Setup.exe` |
+| Mac with Apple silicon (M1/M2/M3/M4…) | `Codex.Provider.Switcher_{{VERSION}}_macOS-arm64.dmg` |
+| Mac with an Intel processor | `Codex.Provider.Switcher_{{VERSION}}_macOS-x64.dmg` |
+
+`SHA256SUMS.txt` contains the checksum for every installer. The individual
+`.sha256` files can be used to verify one download.
+
+## Install
+
+### Windows
+
+1. Download the `Windows-x64-Setup.exe` file and run it.
+2. Because this preview is unsigned, Microsoft Defender SmartScreen may
+   appear. Choose **More info → Run anyway** only after confirming that the
+   checksum matches this release.
+3. The installer uses the current Windows user and does not require a
+   machine-wide installation.
+
+### macOS
+
+1. Choose the Apple silicon or Intel DMG for your Mac.
+2. Open the DMG and copy **Codex Provider Switcher** into Applications.
+3. Because this preview is not notarized, the first launch may require
+   **System Settings → Privacy & Security → Open Anyway**.
+
+## First use
+
+1. Open the Switcher; it automatically reads the current non-secret Codex
+   provider and model.
+2. Choose **Add connection**, enter a friendly name, Base URL, and API Key,
+   then fetch and select models.
+3. Choose **Save and use**. The first fast-switch activation may ask you to
+   reopen Codex once; later saved-model changes apply to the next turn while
+   the Switcher is running.
+
+API Keys stay in macOS Keychain or Windows Credential Manager. The Switcher
+does not copy Codex's official OAuth token or modify the signed Codex Desktop
+package.
+
+This is a desktop companion for Codex on macOS and Windows. It is not an iOS
+application and cannot manage an iPhone or iPad Codex configuration.

@@ -98,8 +98,17 @@ and stapling. Windows requires Authenticode or Azure Artifact Signing for both
 the executable and installer, with timestamping. Signing credentials belong in
 the CI secret manager and must never be added to this repository.
 
-The release workflow should use `tauri-apps/tauri-action@v1` pinned to an exact
-commit. It is not enabled until both platform signing identities exist.
+The tag-triggered `.github/workflows/release.yml` workflow may publish an
+explicit GitHub **prerelease** before those identities exist. It runs the
+portable and native test suites, builds on Windows x64, Apple silicon macOS,
+and Intel macOS, smoke-tests each package, creates per-package and aggregate
+SHA-256 manifests, and only then creates the prerelease. The macOS preview uses
+the documented ad-hoc signing identity; the README and release notes must
+continue to explain the Gatekeeper and SmartScreen limitations.
+
+Do not promote that workflow to a normal public release until Windows signing
+and macOS Developer ID signing, notarization, and stapling have been added and
+verified. Signing secrets must remain in the GitHub Actions secret store.
 
 ## No-go conditions
 
@@ -133,6 +142,42 @@ commit. It is not enabled until both platform signing identities exist.
   private-module scanning fallbacks.
 - A release is unsigned, unnotarized on macOS, or lacks real target-host smoke
   tests.
+
+## 2026-07-29 Windows 0.3.3 UI evidence
+
+The version 0.3.3 source snapshot on the `ydy001` Windows 11 x64 host passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 60 Windows-applicable core tests, two Credential Manager
+  tests, two launcher tests, six desktop tests, six proxy unit tests, and five
+  proxy integration tests.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke.
+- Verified current-user upgrade without changing measured Codex/Switcher
+  state hashes or Credential Manager metadata.
+- Interactive Session 1 visual verification of the redesigned dark interface,
+  navigation sidebar, saved-profile list, and visible version 0.3.3 label.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `072a2760903e5f85d92033aadd8c56822deb208ed144b455ccbe347c36b81082`
+  (`392251` bytes)
+- NSIS SHA-256:
+  `a09ef59b4db69e7757248cebca205b13e43e6ff4d4419fa05380a0eed4a6dce4`
+  (`3920148` bytes)
+- Installed application SHA-256:
+  `92567b3719bca1a1e0110b6e97c0e7a03ad69571849b48d9a7706aa21e58cdea`
+- Interactive screenshot SHA-256:
+  `6d89a894c58ce2e5869fe13aecbe9f0cecaebc88d0c1c87dc4a6610dfc300ac2`
+- Authenticode status: `NotSigned`
+
+The pre-upgrade installation and registration were retained at
+`D:\CodexProviderSwitcher\rollback-0.3.2-before-0.3.3-20260729T070316Z`.
+The official route remained selected, the proxy remained disabled, and neither
+the port-15722 listener nor its automatic-startup entry was introduced. This
+run did not perform a live provider turn or the interactive official-login/API
+provider round trip.
 
 ## 2026-07-26 Windows 0.3.2 evidence
 

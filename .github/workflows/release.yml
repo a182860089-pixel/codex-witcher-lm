@@ -1,0 +1,189 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Enable pinned pnpm
+        run: corepack enable && corepack prepare pnpm@10.32.0 --activate
+      - name: Install web dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          tauri_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          test "$GITHUB_REF_NAME" = "v$package_version"
+          test "$tauri_version" = "$package_version"
+      - name: Check web and runtime
+        run: pnpm check && pnpm test && pnpm web:build
+      - name: Install stable Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+      - name: Check portable Rust boundaries
+        run: >-
+          cargo fmt --all -- --check &&
+          cargo test --locked
+          -p codex-provider-switcher-core
+          -p codex-provider-switcher-credentials
+          -p codex-provider-switcher-launcher
+          -p codex-provider-switcher-local-proxy
+
+  native:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos
+            asset_suffix: macOS-arm64
+          - os: macos-15-intel
+            platform: macos
+            asset_suffix: macOS-x64
+          - os: windows-2022
+            platform: windows
+            asset_suffix: Windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Enable pinned pnpm
+        run: corepack enable && corepack prepare pnpm@10.32.0 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install stable Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Test native boundaries
+        run: >-
+          cargo test --locked
+          -p codex-provider-switcher-core
+          -p codex-provider-switcher-credentials
+          -p codex-provider-switcher-launcher
+          -p codex-provider-switcher-local-proxy
+          -p codex-provider-switcher-desktop
+      - name: Build ad-hoc signed macOS packages
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: pnpm tauri build
+      - name: Build Windows package
+        if: matrix.platform == 'windows'
+        run: pnpm tauri build
+      - name: Smoke-test macOS DMG install and removal
+        if: matrix.platform == 'macos'
+        run: bash ci/smoke-package-macos.sh
+      - name: Smoke-test Windows NSIS install and uninstall
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./ci/smoke-package-windows.ps1
+      - name: Stage macOS release assets
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release-assets
+          set -- target/release/bundle/dmg/*.dmg
+          test "$#" -eq 1
+          destination="release-assets/Codex.Provider.Switcher_${version}_${{ matrix.asset_suffix }}.dmg"
+          cp "$1" "$destination"
+          shasum -a 256 "$destination" |
+            sed 's#  release-assets/#  #' > "$destination.sha256"
+      - name: Stage Windows release assets
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $installers = @(
+            Get-ChildItem -LiteralPath 'target\release\bundle\nsis' -Filter '*-setup.exe'
+          )
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)."
+          }
+          New-Item -ItemType Directory -Path 'release-assets' | Out-Null
+          $name = "Codex.Provider.Switcher_${version}_Windows-x64-Setup.exe"
+          $destination = Join-Path 'release-assets' $name
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $destination
+          $hash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $destination
+          ).Hash.ToLowerInvariant()
+          "$hash  $name" |
+            Set-Content -LiteralPath "$destination.sha256" -Encoding ascii
+      - name: Upload verified native package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.asset_suffix }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download verified packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify checksums and build manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test "$(find . -maxdepth 1 -type f \( -name '*.exe' -o -name '*.dmg' \) | wc -l)" -eq 3
+          shasum -a 256 -c ./*.sha256
+          cat ./*.sha256 | sort -k2 > SHA256SUMS.txt
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sed "s/{{VERSION}}/$version/g" docs/release-template.md \
+            > "$RUNNER_TEMP/release-notes.md"
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Codex Provider Switcher $GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --prerelease
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Codex Provider Switcher $GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --prerelease \
+              --verify-tag
+          fi

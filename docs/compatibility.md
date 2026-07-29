@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | macOS | Apple silicon | Keychain, Launch Services, tray, LaunchAgent, proxy source, and package CI target are present; no current 0.2.x native package run | Run signed DMG install, first enable/restart, next-turn switch, background relaunch, disable/restore, and uninstall smoke |
 | macOS | Intel | The same source and package target are present; no current 0.2.x native package run | Run the same signed-host lifecycle |
-| Windows | x86_64 | Version 0.3.2 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, named official-profile coverage, Credential Manager `Local` persistence checks, helper refresh, and an interactive visible-window smoke | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
+| Windows | x86_64 | Version 0.3.3 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, and an interactive visual smoke of the redesigned light/dark interface | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
 
@@ -97,6 +97,46 @@ The last command must run natively on macOS Apple silicon, macOS Intel, and
 Windows x86_64.
 
 ## Native Windows evidence
+
+On 2026-07-29, version 0.3.3 on Windows 11 x64 build 22631 on `ydy001`
+passed the TypeScript check, four runtime tests, production WebView build,
+Rust formatting check, 60 Windows-applicable core tests, two Credential
+Manager tests, two Windows launcher tests, six desktop tests, six local-proxy
+unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+Version 0.3.3 redesigns the interface as a focused two-page utility: Model
+Switching remains the default task, Advanced Settings contains proxy and
+recovery controls, and Add/Edit Connection uses a staged connection-to-model
+flow. Semantic system colors, native fonts, visible keyboard focus, dark
+appearance, and responsive cards provide the Apple-influenced visual language
+without changing the provider, credential, or restore contracts.
+
+The current-user upgrade from 0.3.2 preserved all measured Codex/Switcher
+state hashes and Credential Manager metadata. The existing official route,
+disabled proxy, absent port-15722 listener, and absent automatic-startup entry
+were unchanged. An interactive Session 1 screenshot verified the complete dark
+interface, navigation sidebar, saved-profile list, and visible version 0.3.3
+label. The application remains running and responding in that user session;
+the session was returned to its original disconnected state after capture.
+
+- Source archive SHA-256:
+  `072a2760903e5f85d92033aadd8c56822deb208ed144b455ccbe347c36b81082`
+  (`392251` bytes)
+- NSIS SHA-256:
+  `a09ef59b4db69e7757248cebca205b13e43e6ff4d4419fa05380a0eed4a6dce4`
+  (`3920148` bytes)
+- Installed application SHA-256:
+  `92567b3719bca1a1e0110b6e97c0e7a03ad69571849b48d9a7706aa21e58cdea`
+- Interactive screenshot SHA-256:
+  `6d89a894c58ce2e5869fe13aecbe9f0cecaebc88d0c1c87dc4a6610dfc300ac2`
+- Authenticode status: `NotSigned`
+- Pre-upgrade rollback snapshot:
+  `D:\CodexProviderSwitcher\rollback-0.3.2-before-0.3.3-20260729T070316Z`
+
+This deployment did not activate a provider, enable the proxy, read a
+credential value, or perform a live upstream turn. Interactive official-login
+and API-provider switching therefore remain release gates.
 
 On 2026-07-26, version 0.3.2 on Windows 11 x64 build 22631 on `ydy001`
 passed the TypeScript check, four runtime tests, production WebView build,
