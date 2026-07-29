@@ -4,8 +4,8 @@
 
 | Surface | Architecture | Current evidence | Release gate |
 | --- | --- | --- | --- |
-| macOS | Apple silicon | Keychain, Launch Services, tray, LaunchAgent, proxy source, and package CI target are present; no current 0.2.x native package run | Run signed DMG install, first enable/restart, next-turn switch, background relaunch, disable/restore, and uninstall smoke |
-| macOS | Intel | The same source and package target are present; no current 0.2.x native package run | Run the same signed-host lifecycle |
+| macOS | Apple silicon | Version 0.3.3 passed native Web/Rust/Tauri tests plus ad-hoc DMG build and install/remove smoke on `macos-15`; the published DMG was checksum-verified after download | Add Developer ID signing, notarization, stapling, and run the complete real-host switching lifecycle |
+| macOS | Intel | Version 0.3.3 passed the same native suite plus ad-hoc DMG build and install/remove smoke on `macos-15-intel`; the published DMG was checksum-verified after download | Run the same signed and notarized real-host lifecycle |
 | Windows | x86_64 | Version 0.3.3 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, and an interactive visual smoke of the redesigned light/dark interface | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
@@ -95,6 +95,26 @@ pnpm tauri build
 
 The last command must run natively on macOS Apple silicon, macOS Intel, and
 Windows x86_64.
+
+## Native macOS package evidence
+
+On 2026-07-29, the v0.3.3 GitHub release workflow ran the native Web, Rust,
+Tauri, and package-smoke suites on both `macos-15` Apple silicon and
+`macos-15-intel`. Both jobs completed successfully and produced ad-hoc signed
+DMGs:
+
+- Apple silicon:
+  `ef8c69d00b0ca5371fb794be13db7ad211e378eb6a10c6f8caff36b1aaaad188`
+  (`5903173` bytes).
+- Intel:
+  `d05936e526a59117ef8ac2dec008d97856918ef8c59d49ac0e176c0113ca13e0`
+  (`6300568` bytes).
+
+The packages passed their CI install/remove smoke, were published in the
+private v0.3.3 prerelease, downloaded again through the Releases API, and
+matched both their individual and aggregate SHA-256 manifests. This is native
+package evidence, not a claim of Developer ID signing, notarization, stapling,
+or a complete interactive lifecycle on a maintained release Mac.
 
 ## Native Windows evidence
 

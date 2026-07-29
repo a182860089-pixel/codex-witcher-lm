@@ -127,8 +127,11 @@ jobs:
           $hash = (
             Get-FileHash -Algorithm SHA256 -LiteralPath $destination
           ).Hash.ToLowerInvariant()
-          "$hash  $name" |
-            Set-Content -LiteralPath "$destination.sha256" -Encoding ascii
+          [System.IO.File]::WriteAllText(
+            "$destination.sha256",
+            "$hash  $name`n",
+            [System.Text.Encoding]::ASCII
+          )
       - name: Upload verified native package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -156,6 +159,8 @@ jobs:
           set -euo pipefail
           cd release-assets
           test "$(find . -maxdepth 1 -type f \( -name '*.exe' -o -name '*.dmg' \) | wc -l)" -eq 3
+          test "$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 3
+          sed -i 's/\r$//' ./*.sha256
           shasum -a 256 -c ./*.sha256
           cat ./*.sha256 | sort -k2 > SHA256SUMS.txt
       - name: Prepare release notes

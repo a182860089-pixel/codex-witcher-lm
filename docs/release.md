@@ -143,6 +143,55 @@ verified. Signing secrets must remain in the GitHub Actions secret store.
 - A release is unsigned, unnotarized on macOS, or lacks real target-host smoke
   tests.
 
+## 2026-07-29 GitHub 0.3.3 prerelease evidence
+
+The private repository published
+[Codex Provider Switcher v0.3.3](https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.3)
+as an explicit GitHub prerelease from source commit
+`50596d6c1df253ac89b00f7fbcbda93b23b805db`.
+
+GitHub Actions quality run
+[`30432922504`](https://github.com/grey0758/codex-provider-switcher/actions/runs/30432922504)
+passed the Ubuntu portable suite and native Apple silicon macOS, Intel macOS,
+and Windows x64 suites. Release run
+[`30434380456`](https://github.com/grey0758/codex-provider-switcher/actions/runs/30434380456)
+then passed release validation and all three native build, test, package-smoke,
+checksum, and artifact-upload jobs.
+
+The release job initially rejected the Windows checksum sidecar because
+PowerShell had written CRLF while the Linux verifier treated the trailing
+carriage return as part of the filename. The verified native artifacts were
+downloaded from that run, the sidecar was normalized to LF, all individual
+checksums were checked, and the prerelease assets were uploaded through the
+GitHub Releases API. The release workflow now writes the Windows sidecar with
+LF and defensively normalizes all sidecars before future publication.
+
+Published installers:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.3_Windows-x64-Setup.exe`,
+  `3917602` bytes,
+  SHA-256
+  `7e502aa6754b18fd80f97a3affaa132c47b7f6d78880ea3cac1a500a5e98c17d`.
+- macOS Apple silicon DMG:
+  `Codex.Provider.Switcher_0.3.3_macOS-arm64.dmg`,
+  `5903173` bytes,
+  SHA-256
+  `ef8c69d00b0ca5371fb794be13db7ad211e378eb6a10c6f8caff36b1aaaad188`.
+- macOS Intel DMG:
+  `Codex.Provider.Switcher_0.3.3_macOS-x64.dmg`,
+  `6300568` bytes,
+  SHA-256
+  `d05936e526a59117ef8ac2dec008d97856918ef8c59d49ac0e176c0113ca13e0`.
+
+The final GitHub release contains exactly those three installers, three
+per-package `.sha256` files, and `SHA256SUMS.txt`. All seven assets were
+downloaded again from the private release API, and both the aggregate manifest
+and the three individual sidecars passed. The Windows installer remains
+unsigned. The macOS bundles use ad-hoc signing and are not Developer ID signed,
+notarized, or stapled, so this evidence does not satisfy the normal-release
+signing gate.
+
 ## 2026-07-29 Windows 0.3.3 UI evidence
 
 The version 0.3.3 source snapshot on the `ydy001` Windows 11 x64 host passed:
