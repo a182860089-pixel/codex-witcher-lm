@@ -4,9 +4,9 @@
 
 | Surface | Architecture | Current evidence | Release gate |
 | --- | --- | --- | --- |
-| macOS | Apple silicon | Version 0.3.3 passed native Web/Rust/Tauri tests plus ad-hoc DMG build and install/remove smoke on `macos-15`; the published DMG was checksum-verified after download | Add Developer ID signing, notarization, stapling, and run the complete real-host switching lifecycle |
-| macOS | Intel | Version 0.3.3 passed the same native suite plus ad-hoc DMG build and install/remove smoke on `macos-15-intel`; the published DMG was checksum-verified after download | Run the same signed and notarized real-host lifecycle |
-| Windows | x86_64 | Version 0.3.4 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, and real-session visual smoke of the account and connection-choice interfaces; v0.3.4 is the current prerelease source | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
+| macOS | Apple silicon | Version 0.3.4 passed native Web/Rust/Tauri tests plus ad-hoc DMG build and install/remove smoke on `macos-15`; the published DMG was checksum-verified after download | Add Developer ID signing, notarization, stapling, and run the complete real-host switching lifecycle |
+| macOS | Intel | Version 0.3.4 passed the same native suite plus ad-hoc DMG build and install/remove smoke on `macos-15-intel`; the published DMG was checksum-verified after download | Run the same signed and notarized real-host lifecycle |
+| Windows | x86_64 | Version 0.3.4 passed public native Web/Rust/Tauri tests and NSIS package smoke plus a state-preserving upgrade and real-session interface smoke on `ydy001`; the published installer was checksum-verified after download | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
 
@@ -114,6 +114,33 @@ pnpm tauri build
 
 The last command must run natively on macOS Apple silicon, macOS Intel, and
 Windows x86_64.
+
+## GitHub v0.3.4 package evidence
+
+On 2026-07-30, quality run
+[`30597020953`](https://github.com/grey0758/codex-provider-switcher/actions/runs/30597020953)
+and release run
+[`30597824718`](https://github.com/grey0758/codex-provider-switcher/actions/runs/30597824718)
+passed the portable, Apple silicon macOS, Intel macOS, and Windows x64 jobs for
+source commit `9dcf8ae3f967eb73a832d0a99d4a226ed22ef646`. The release run
+built and package-smoked all three native packages before publishing the
+[v0.3.4 prerelease](https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.4).
+
+- Windows x64 NSIS:
+  `3f325f2e0e87b3722fe7aaf911ef35cec2a394975b8cff6d97683ecf0105ec41`
+  (`3992369` bytes).
+- Apple silicon DMG:
+  `8620c2d7da8eb1697a27fb348fc0ff6d3d8847b72b9dbe432084909caee482f7`
+  (`5994511` bytes).
+- Intel macOS DMG:
+  `e257fc9c69fd05da83c9062c4699bd930f8f903b9acf1cf0c429c2ec1cb6fddb`
+  (`6403320` bytes).
+
+All seven release assets were downloaded again. Their local digests matched
+the GitHub Releases API, the three package sidecars passed, and
+`SHA256SUMS.txt` passed and matched the filename-sorted sidecars. The Windows
+package remains unsigned; both macOS packages remain ad-hoc signed and
+unnotarized.
 
 ## Native macOS package evidence
 

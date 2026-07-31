@@ -179,6 +179,58 @@ verified. Signing secrets must remain in the GitHub Actions secret store.
 - A release is unsigned, unnotarized on macOS, or lacks real target-host smoke
   tests.
 
+## 2026-07-30 GitHub 0.3.4 prerelease evidence
+
+The repository published
+[Codex Provider Switcher v0.3.4](https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.4)
+as an explicit GitHub prerelease from immutable tag source commit
+`9dcf8ae3f967eb73a832d0a99d4a226ed22ef646`.
+
+GitHub Actions quality run
+[`30597020953`](https://github.com/grey0758/codex-provider-switcher/actions/runs/30597020953)
+passed the portable core job plus native Apple silicon macOS, Intel macOS, and
+Windows x64 test, package-build, and install/remove-smoke jobs. Release run
+[`30597824718`](https://github.com/grey0758/codex-provider-switcher/actions/runs/30597824718)
+then passed release validation, all three native build/test/package-smoke
+jobs, checksum verification, and the final publication job.
+
+Published installers:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.4_Windows-x64-Setup.exe`,
+  `3992369` bytes,
+  SHA-256
+  `3f325f2e0e87b3722fe7aaf911ef35cec2a394975b8cff6d97683ecf0105ec41`.
+- macOS Apple silicon DMG:
+  `Codex.Provider.Switcher_0.3.4_macOS-arm64.dmg`,
+  `5994511` bytes,
+  SHA-256
+  `8620c2d7da8eb1697a27fb348fc0ff6d3d8847b72b9dbe432084909caee482f7`.
+- macOS Intel DMG:
+  `Codex.Provider.Switcher_0.3.4_macOS-x64.dmg`,
+  `6403320` bytes,
+  SHA-256
+  `e257fc9c69fd05da83c9062c4699bd930f8f903b9acf1cf0c429c2ec1cb6fddb`.
+
+The release contains exactly those three installers, their three individual
+sidecars, and `SHA256SUMS.txt`. Their published SHA-256 digests are:
+
+- Windows sidecar:
+  `3a33aebf2437a651272af08c6055e764b71f264ce29db8f62b5dfabe1717eca1`.
+- Apple silicon sidecar:
+  `a38209204abb329d63a577e3d933a5252f466ed45651142c6845427401e62679`.
+- Intel macOS sidecar:
+  `1d1d1b0b3609378b9f402bafb002cb9ae9fe3fc9837be96e377a96aeab2760ca`.
+- Aggregate manifest:
+  `37028f493449e1439cba7e1c0695bebc45a90643bee97490182252a0d4774278`.
+
+All seven assets were downloaded again from the public release. Every local
+digest matched the GitHub Releases API digest, all three individual sidecars
+passed, `SHA256SUMS.txt` passed, and the aggregate manifest was byte-identical
+to the filename-sorted sidecars. The Windows installer remains unsigned. The
+macOS bundles use ad-hoc signing and are not Developer ID signed, notarized, or
+stapled, so v0.3.4 remains a prerelease.
+
 ## 2026-07-30 Windows 0.3.4 account-interface evidence
 
 The recovered App Server account and connection-flow work was versioned as
