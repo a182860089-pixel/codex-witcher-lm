@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | macOS | Apple silicon | Version 0.3.3 passed native Web/Rust/Tauri tests plus ad-hoc DMG build and install/remove smoke on `macos-15`; the published DMG was checksum-verified after download | Add Developer ID signing, notarization, stapling, and run the complete real-host switching lifecycle |
 | macOS | Intel | Version 0.3.3 passed the same native suite plus ad-hoc DMG build and install/remove smoke on `macos-15-intel`; the published DMG was checksum-verified after download | Run the same signed and notarized real-host lifecycle |
-| Windows | x86_64 | Version 0.3.3 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, and an interactive visual smoke of the redesigned light/dark interface | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
+| Windows | x86_64 | Version 0.3.4 passed native Web/Rust/Tauri tests, NSIS package smoke, a state-preserving upgrade on `ydy001`, and real-session visual smoke of the account and connection-choice interfaces; v0.3.4 is the current prerelease source | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
 
@@ -70,12 +70,31 @@ reported as a compatibility gap rather than bypassed with a broad monkey
 patch. The external manager still preserves a recovery point and can restore
 the exact prior configuration.
 
-The official login path uses only documented Codex configuration defaults. It
-does not depend on Desktop injection: the Switcher restores the built-in
-`openai` provider, the user restarts Codex, and Codex itself presents and
-maintains ChatGPT OAuth. The Switcher cannot determine login success without
-crossing the credential boundary, so the saved official card represents route
-and model selection only.
+The official login path uses documented Codex configuration plus the public
+Codex App Server account surface and does not depend on Desktop injection. The
+Switcher restores the built-in `openai` provider, requires the local proxy to
+be detached, calls `account/login/start` with `type: "chatgpt"`, and lets Codex
+own the browser callback and OAuth storage. It then uses `account/read` to
+distinguish ChatGPT, API-key, signed-out, and unknown authentication without
+reading `auth.json`, and caches only optional email/plan metadata in
+schema-v3 `official-profile.json`.
+
+This flow requires an installed official Codex CLI whose App Server exposes
+`account/read`, `account/login/start`, `account/login/completed`, and
+`account/logout`. The configured `openai` route alone is not proof of ChatGPT
+authentication. API and official boundaries require a full Codex restart. In
+`rust-v0.145.0`, the normal TUI and App Server do not enable API-key
+environment authentication: `CODEX_API_KEY` is enabled only for `codex exec`,
+and `OPENAI_API_KEY` is not an implicit runtime override for either surface.
+Only an inherited `CODEX_ACCESS_TOKEN` is surfaced here as an external
+access-token conflict; affected Switcher and Codex processes must be restarted
+without it before persisted OAuth is reported as active.
+
+Current public App Server methods expose one active authentication state but no
+stable `account/sessions/*` API for persisting and switching multiple OAuth
+accounts. Logging in with another account replaces the active Codex login and
+the single cached metadata record; the Switcher cannot reconstruct or restore
+the previous login from its email or plan.
 
 ## Validation commands
 
@@ -111,12 +130,58 @@ DMGs:
   (`6300568` bytes).
 
 The packages passed their CI install/remove smoke, were published in the
-private v0.3.3 prerelease, downloaded again through the Releases API, and
+v0.3.3 prerelease, downloaded again through the Releases API, and
 matched both their individual and aggregate SHA-256 manifests. This is native
 package evidence, not a claim of Developer ID signing, notarization, stapling,
 or a complete interactive lifecycle on a maintained release Mac.
 
 ## Native Windows evidence
+
+On 2026-07-30, the prepublication version 0.3.4 snapshot on Windows 11 x64
+build 22631 on `ydy001` passed the TypeScript check, four runtime tests,
+production WebView build, Rust formatting check, 66 core tests, two Credential
+Manager tests, nine desktop tests, three launcher tests, six local-proxy unit
+tests, five local-proxy integration tests, the full Tauri/NSIS build, and
+isolated NSIS install/remove smoke.
+
+Version 0.3.4 separates configured route state from real Codex authentication.
+The main account card obtains API-key, ChatGPT, signed-out, or unknown status
+through App Server `account/read`; the Add Connection dialog first offers
+Codex-owned OpenAI login or an API service. The default API path enables fast
+switching on first use. The verified real-session state on `ydy001` reported
+OpenAI API-key authentication without mislabeling the built-in route as
+ChatGPT login.
+
+The current-user upgrade from 0.3.3 preserved the measured Codex config,
+24-file Switcher state fingerprint, Credential Manager metadata, absent
+automatic-startup values, saved installer path, and two user shortcuts.
+Interactive Session 1 screenshots verified the account card, `登录 OpenAI`
+action, visible `Version 0.3.4` label, and the separate OpenAI-official/API
+connection choices without overlap. The application remains running in
+Session 1. The proxy remains disabled, no process listens on port 15722, and
+no temporary deployment task remains.
+
+- Source archive SHA-256:
+  `12314548bf7d13adc47ea281f133b721c03f84969d19ec3601210ba19555a72d`
+  (`796076` bytes)
+- NSIS SHA-256:
+  `46f796f069f3f5ed041809ea169d61fc803514256b46e2cb9f5fa86392241874`
+  (`3995494` bytes)
+- Installed application SHA-256:
+  `5f6829b0b65e1073f45fee78238ff01daae30f7f0c7588ef962b56145f37b070`
+- Main-interface screenshot SHA-256:
+  `07460ae2cb0197523b5127d0a978ebe17539d2111fb48597c637b2546b2b9934`
+- Add Connection screenshot SHA-256:
+  `e67a3b48aeefc025681c37da01b53800a63399565c38a3c82376ae5ee1440a45`
+- Authenticode status: `NotSigned`
+- Pre-upgrade rollback snapshot:
+  `D:\CodexProviderSwitcher\rollback-0.3.3-before-0.3.4-20260730T150944Z`
+
+This native deployment did not submit an official browser login, change an API
+credential, enable the proxy, perform a live provider turn, or complete the
+official/API/official round trip. GitHub v0.3.4 packages are rebuilt and
+package-smoked independently on their target runners; the interactive account
+lifecycle remains a release gate.
 
 On 2026-07-29, version 0.3.3 on Windows 11 x64 build 22631 on `ydy001`
 passed the TypeScript check, four runtime tests, production WebView build,
@@ -165,19 +230,20 @@ Manager tests, two Windows launcher tests, six desktop tests, six local-proxy
 unit tests, five local-proxy integration tests, the full Tauri/NSIS build, and
 isolated NSIS install/remove smoke.
 
-The 0.3.1 behavior carried into this build gives the single official-login
-bookmark a user-chosen display name, preserves schema-v1 bookmarks, and stores
-new or replaced Windows API credentials with explicit Credential Manager
-`Local` persistence. Because Codex owns one active OAuth cache, the Switcher
-does not read `auth.json` to infer an email or username and does not present
-several names as independently bound official accounts. A missing legacy API
-credential now opens the affected connection editor and requests one
-replacement Key without changing Codex configuration.
+Historical 0.3.1 behavior carried into this 0.3.2 build gave the single
+official-route bookmark a user-chosen display name and preserved schema-v1
+bookmarks. That old editor is release evidence only and is superseded in the
+current working tree by schema-v3 metadata populated from App Server
+`account/read`; it was never a second OAuth session. The same 0.3.2 build
+stored new or replaced Windows API credentials with explicit Credential
+Manager `Local` persistence. A missing legacy API credential opened the
+affected connection editor and requested one replacement Key without changing
+Codex configuration.
 
 Version 0.3.2 additionally fixes normal-launch visibility: background gateway
 startup remains hidden, while an ordinary launch shows and focuses the main
 window after Tauri reaches `RunEvent::Ready`. An interactive Session 1
-screenshot verified the rendered official-name editor and saved/current
+screenshot verified that historical official-name editor and saved/current
 official-route state. The current-user upgrade preserved Codex/Switcher state
 and Credential Manager metadata.
 
@@ -230,10 +296,12 @@ whose SHA-256 equals the installed application SHA-256.
 
 The application and installer are unsigned internal artifacts. This run
 deliberately did not activate the official route or change the user's current
-Codex login. Interactive prepare/login/save/API-profile/official-profile
-round-trip testing remains a release gate. It also did not repeat a live
-upstream request, so the 0.2.2 request evidence below remains the latest proof
-of the local credential-helper and proxy boundary.
+Codex login. The then-current route-only
+prepare/login/save/API-profile/official-profile round trip remained a release
+gate. That historical flow is superseded by the current App Server
+login/status/logout flow. The run also did not repeat a live upstream request,
+so the 0.2.2 request evidence below remains the latest proof of the local
+credential-helper and proxy boundary.
 
 On 2026-07-25, version 0.2.4 on Windows 11 x64 build 22631 on `ydy001`
 passed the TypeScript check, four runtime tests, production WebView build,

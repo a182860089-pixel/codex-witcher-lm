@@ -56,7 +56,7 @@ pub struct ProviderProfile {
     pub credential_required: bool,
 }
 
-pub const OFFICIAL_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const OFFICIAL_PROFILE_SCHEMA_VERSION: u32 = 3;
 pub const OFFICIAL_PROFILE_DISPLAY_NAME: &str = "OpenAI 官方账号";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +66,10 @@ pub struct OfficialProfile {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
 }
 
 impl OfficialProfile {
@@ -74,6 +78,23 @@ impl OfficialProfile {
             schema_version: OFFICIAL_PROFILE_SCHEMA_VERSION,
             display_name,
             model_id,
+            email: None,
+            plan_type: None,
+        }
+    }
+
+    pub fn with_account(
+        display_name: String,
+        model_id: Option<String>,
+        email: Option<String>,
+        plan_type: Option<String>,
+    ) -> Self {
+        Self {
+            schema_version: OFFICIAL_PROFILE_SCHEMA_VERSION,
+            display_name,
+            model_id,
+            email,
+            plan_type,
         }
     }
 

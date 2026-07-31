@@ -13,14 +13,17 @@ the normal switching flow short without hiding operational controls.
 
 ## Information architecture
 
-- **Model Switching** is the default page. It contains the current state, the
-  official Codex account, saved API connections, and the one primary
-  Add Connection action.
+- **Model Switching** is the default page. It contains the current route and
+  independently verified Codex authentication state, the one active official
+  account, saved API connections, and the primary Add Connection action.
 - **Advanced Settings** contains switching mode selection, local-proxy state,
   fallback direct configuration, and recovery actions.
-- **Add or Edit Connection** is a modal sheet with two explicit steps:
-  connection details and model selection, followed by the save or
-  save-and-switch action.
+- **Add Connection** first asks whether the user wants an official ChatGPT
+  login or an API connection. The official branch returns to the compact
+  official-account flow. The API branch opens the two-step connection details
+  and model-selection sheet.
+- **Edit Connection** opens the existing two-step API editor directly, followed
+  by the save or save-and-switch action.
 - Restart notices use a dedicated confirmation dialog only when the selected
   transition cannot take effect on the next turn.
 
@@ -48,9 +51,36 @@ same user goal, not a different product mode.
 - A saved connection exposes one model picker and one primary Use This Model
   action. Edit and Remove are lower-emphasis actions.
 - The official-account row is visually equal to a saved connection but clearly
-  labels that login remains managed by Codex.
-- Add Connection opens with keyboard focus in the first field. Escape closes
-  the sheet, and focus returns to the button that opened it.
+  labels that login remains managed by Codex. It shows the optional email and
+  plan returned by Codex App Server, not an editable local profile name.
+- The built-in `openai` route is not rendered as an active ChatGPT account
+  unless `account/read` also reports `chatgpt`. An `apiKey`, signed-out, or
+  unknown authentication result receives its own truthful state and action.
+- An inherited `CODEX_ACCESS_TOKEN` is rendered specifically as an external
+  access-token conflict and prevents the UI from claiming that persisted
+  official OAuth is active, even when the credential-free account check finds
+  cached ChatGPT authentication.
+- `OPENAI_API_KEY` and `CODEX_API_KEY` are not rendered as that conflict for
+  the normal TUI/App Server. In `rust-v0.145.0`, neither is an implicit
+  authentication override there; the `CODEX_API_KEY` environment path belongs
+  only to `codex exec`.
+- Official-account actions are limited by state: sign in while signed out, use
+  the account when its route is inactive, or sign in again and explicitly sign
+  out while it is current. Restart guidance appears only after an operation
+  that needs it, not as a permanent account-card action. Completing browser
+  login automatically updates the one credential-free metadata cache; there is
+  no manual Save Official Profile step. Sign-out copy must state that it logs
+  Codex out rather than deleting a restorable local OAuth profile.
+- Current public App Server methods do not provide stable multi-account OAuth
+  persistence or switching. The interface must not render cached emails as
+  separately selectable OAuth sessions; logging in again replaces the one
+  active official account.
+- Fast switching is presented as the default behavior for API connections and
+  is activated on first use. A fresh installation is not described as needing
+  repair merely because no local-proxy route exists yet.
+- Add Connection opens with keyboard focus on the official/API type choice.
+  The API branch then moves focus to the first field. Escape closes the sheet,
+  and focus returns to the button that opened it.
 - The editor reveals one task at a time. Model selection stays unavailable
   until a connection has been checked, and saving stays unavailable until the
   required models are selected.

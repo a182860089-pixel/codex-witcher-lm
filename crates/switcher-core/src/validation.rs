@@ -74,7 +74,7 @@ pub fn validate_official_profile(profile: &OfficialProfile) -> Result<()> {
                 "the legacy official profile display name is invalid".to_string(),
             ));
         }
-        1 | OFFICIAL_PROFILE_SCHEMA_VERSION => {}
+        1 | 2 | OFFICIAL_PROFILE_SCHEMA_VERSION => {}
         _ => {
             return Err(SwitcherError::Validation(
                 "unsupported official profile schema version".to_string(),
@@ -84,6 +84,40 @@ pub fn validate_official_profile(profile: &OfficialProfile) -> Result<()> {
     validate_display_name("official profile display name", &profile.display_name)?;
     if let Some(model_id) = profile.model_id.as_deref() {
         validate_model_id(model_id)?;
+    }
+    if profile.schema_version < 3 && (profile.email.is_some() || profile.plan_type.is_some()) {
+        return Err(SwitcherError::Validation(
+            "legacy official profiles cannot contain account metadata".to_string(),
+        ));
+    }
+    validate_official_account_metadata(profile.email.as_deref(), profile.plan_type.as_deref())?;
+    Ok(())
+}
+
+pub(crate) fn validate_official_account_metadata(
+    email: Option<&str>,
+    plan_type: Option<&str>,
+) -> Result<()> {
+    if let Some(email) = email
+        && (email != email.trim()
+            || email.is_empty()
+            || email.chars().count() > 320
+            || email.chars().any(char::is_control))
+    {
+        return Err(SwitcherError::Validation(
+            "official account email is invalid".to_string(),
+        ));
+    }
+    if let Some(plan_type) = plan_type
+        && (plan_type.is_empty()
+            || plan_type.len() > 32
+            || !plan_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    {
+        return Err(SwitcherError::Validation(
+            "official account plan type is invalid".to_string(),
+        ));
     }
     Ok(())
 }
@@ -232,7 +266,16 @@ mod tests {
             schema_version: 1,
             display_name: OFFICIAL_PROFILE_DISPLAY_NAME.to_string(),
             model_id: None,
+            email: None,
+            plan_type: None,
         })
+        .unwrap();
+        validate_official_profile(&OfficialProfile::with_account(
+            "user@example.com".to_string(),
+            None,
+            Some("user@example.com".to_string()),
+            Some("pro".to_string()),
+        ))
         .unwrap();
     }
 
@@ -244,7 +287,18 @@ mod tests {
                 schema_version: 1,
                 display_name: "个人 Plus".to_string(),
                 model_id: None,
+                email: None,
+                plan_type: None,
             })
+            .is_err()
+        );
+        assert!(
+            validate_official_profile(&OfficialProfile::with_account(
+                "user@example.com".to_string(),
+                None,
+                Some("\nuser@example.com".to_string()),
+                Some("pro".to_string()),
+            ))
             .is_err()
         );
     }

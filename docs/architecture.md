@@ -23,7 +23,12 @@ Rust application boundary
         +-- native Keychain / Credential Manager
         +-- config + internal-state transaction
         +-- exact backup / conflict-aware restore
-        +-- tray + background-login lifecycle
+        +-- tray + background-startup lifecycle
+        +-- official Codex CLI discovery
+        |        `-- codex app-server --stdio
+        |                 +-- account/read
+        |                 +-- account/login/start { type: "chatgpt" }
+        |                 `-- account/logout
         |
         +-- atomic active Route
         |        |
@@ -38,19 +43,36 @@ Rust application boundary
 ```
 
 On launch, `inspect_state` resolves `CODEX_HOME`, reads `config.toml`, and
-reports the active provider name and ID, model, Base URL, and credential kind.
-It does not return an inline token or resolve a provider's environment
-variable. The renderer cannot choose filesystem targets or submit rendered
-TOML. `proxy_status` separately reads the keyless proxy state and starts the
-loopback listener when fast switching was previously enabled. Before restoring
-the Route, it installs the current content-addressed credential helper and
-atomically refreshes the managed `cps-local` helper binding when an upgrade
-left the configuration pointing at an older helper. Background login startup
-uses the same path without showing the main window.
+reports the active provider name and ID, model, Base URL, and configured
+credential kind. That route inspection is not an authentication check:
+`codex_account_status` separately asks Codex App Server `account/read` whether
+the active authentication is ChatGPT, API key, another mode, or signed out,
+and receives optional ChatGPT email and plan metadata. A built-in `openai`
+route is treated as an active official account only when both independent
+checks agree and the Switcher process has no external access-token override.
+When `CODEX_ACCESS_TOKEN` is inherited, the UI reports an external-access-token
+conflict even if the clean App Server child can see a cached ChatGPT login.
+
+This distinction is versioned behavior, not an assumption based on variable
+names. In `rust-v0.145.0`, the normal TUI and App Server both set
+`enable_codex_api_key_env` to `false`; `codex exec` alone sets it to `true`.
+Therefore `OPENAI_API_KEY` is not an implicit authentication override for the
+normal TUI/App Server, and `CODEX_API_KEY` supplies environment authentication
+only to `codex exec`.
+
+Neither inspection returns an inline token or resolves a provider's
+environment variable. The renderer cannot choose filesystem targets or submit
+rendered TOML. `proxy_status` separately reads the keyless proxy state and
+starts the loopback listener when fast switching was previously enabled.
+Before restoring the Route, it installs the current content-addressed
+credential helper and atomically refreshes the managed `cps-local` helper
+binding when an upgrade left the configuration pointing at an older helper.
+Background startup uses the same path without showing the main window.
 
 ## Connection and discovery flow
 
-The normal UI sequence is:
+Add Connection first branches between official ChatGPT login and an API
+connection. The normal API sequence is:
 
 1. Enter an optional connection name, Base URL, and API Key.
 2. Ask the Rust backend to fetch the standard model list.
@@ -111,23 +133,58 @@ provider credential. `prepare_official_login` creates a normal configuration
 transaction that removes `model_provider`, `openai_base_url`, and a shadowing
 `model_providers.openai` table, then leaves `model` unset so Codex can choose
 its own default. It preserves all unrelated settings, including MCP servers,
-hooks, other provider tables, and a user-owned `model_catalog_json`.
+hooks, other provider tables, and a user-owned `model_catalog_json`. This
+changes only the route and is never treated as proof of a ChatGPT login.
 
-After Codex completes its native login, `save_current_official_profile`
-accepts only the built-in `openai` route with no overridden Base URL. It writes
-schema-v2 `official-profile.json` containing a user-chosen display name and
-optional model ID. Existing schema-v1 files with the original fixed name remain
-readable and upgrade to v2 on the next save. `activate_official_profile`
-reapplies that route through the same hash-checked transaction. Neither command
-reads or writes `auth.json`, queries Codex's token cache, or claims that a saved
-route proves login state. Because Codex exposes one active login cache, this is
-one named bookmark rather than a set of independently bound OAuth identities.
+`codex_account_status` starts the discovered official Codex CLI as
+`codex app-server --stdio`, initializes one JSONL connection, and calls
+`account/read` with `refreshToken: false`. It parses only the authentication
+mode, optional ChatGPT email and plan, and `requiresOpenaiAuth`. The child
+process does not inherit `OPENAI_API_KEY`, `CODEX_API_KEY`,
+`CODEX_ACCESS_TOKEN`, or App Server login overrides. This isolates the account
+query from caller-supplied credentials. Removing the two API-key variables is
+defense in depth and does not imply that either one would otherwise override
+persisted authentication in the normal TUI/App Server.
+
+`login_official_account` requires a clean recovery state, a detached local
+proxy, and the unshadowed built-in `openai` route. It calls
+`account/login/start` with `type: "chatgpt"`, opens only a validated HTTPS URL
+on `auth.openai.com`, `chatgpt.com`, or a `chatgpt.com` subdomain, waits for the
+matching `account/login/completed` notification, then calls `account/read`
+again. Codex owns the browser callback, token persistence, and refresh.
+The Switcher neither receives nor asks App Server to return OAuth tokens.
+
+After `account/read` confirms `chatgpt`, the backend automatically writes
+schema-v3 `official-profile.json`. The route metadata remains a display name
+and optional model ID; the only cached account fields are optional `email` and
+`planType`. Existing schema-v1 and schema-v2 files remain readable, but they
+contain no account metadata and the next confirmed account refresh writes v3.
+`activate_official_profile` reapplies the route through the same hash-checked
+transaction; activation still requires a separate `account/read` result before
+the UI may call it an active ChatGPT account.
+
+The current public App Server method registry provides one active
+authentication result and does not expose stable `account/sessions/*` methods
+for saving or switching several OAuth accounts. A new browser login may replace
+Codex's active login, and the Switcher replaces the one cached metadata record.
+It does not copy the prior OAuth session, retain a selectable account archive,
+or present metadata-only cards as restorable logins.
+
+`logout_official_account` is available only when route inspection confirms the
+built-in `openai` route and `account/read` confirms ChatGPT authentication. It
+calls App Server `account/logout`, confirms the resulting signed-out state,
+then removes `official-profile.json` through the regular-file boundary. This
+is a logout of Codex's one active account, not deletion of a locally restorable
+OAuth session.
 
 Switching from fast proxy mode to the official profile first performs the
 validated proxy disable/restore flow. Switching back to an API profile can
 enable the proxy again and create a new activation restore point. The boundary
 between official and API profiles requires a full Codex restart; hot switching
-continues only among API routes.
+continues only among API routes. A running Codex process that inherited
+`CODEX_ACCESS_TOKEN` may be using that external access-token credential ahead
+of persisted OAuth and must be restarted without it before the browser-login
+account can be claimed as active.
 
 ## Local proxy data plane
 
@@ -175,7 +232,8 @@ upstream URL.
 fixed port, revision, restart notice, and a credential-free
 `activationTransactionId`. A new activation preallocates this non-nil UUID
 before applying configuration; hot Route changes preserve it and disabled
-state clears it. Enabling fast switching also enables background login startup.
+state clears it. Enabling fast switching also enables background startup at OS
+login.
 Closing the window hides it in the tray. Choosing Exit stops the current
 process without changing the saved proxy activation or Codex configuration;
 the registered background launch restores that Route at the next login or app
@@ -219,10 +277,12 @@ The Switcher-managed `models.json` is internal transaction companion data for
 the active saved model set and exact restore; it is not installed as a Codex
 catalog pointer.
 
-Official activation uses the same transaction layer with an optional manifest
-model ID. Existing schema-v1 manifests containing a string model deserialize
-as `Some(model)`; proxy validation still requires that value. An official
-manifest may omit it so Codex can select its default.
+Official route activation uses the same transaction layer with an optional
+manifest model ID. Existing schema-v1 manifests containing a string model
+deserialize as `Some(model)`; proxy validation still requires that value. An
+official manifest may omit it so Codex can select its default. This
+configuration transaction does not change or validate Codex authentication;
+that remains the separate App Server account flow above.
 
 The auth argument is an `endpoint-v1-...` fingerprint over the provider ID and
 normalized base URL. Reusing a provider ID with a different endpoint therefore

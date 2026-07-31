@@ -1,9 +1,19 @@
-Codex Provider Switcher {{VERSION}} brings the redesigned two-page interface
-to downloadable native desktop packages.
+Codex Provider Switcher {{VERSION}} adds independently verified Codex account
+status plus Codex-owned browser login and logout to the downloadable native
+desktop packages.
 
 > **Preview release:** the Windows installer is unsigned. The macOS DMGs use
 > an ad-hoc signature but are not Developer ID signed or notarized. Read the
 > first-launch notes below before installing.
+
+## What's new
+
+- Distinguishes the configured provider route from the active Codex
+  authentication mode through App Server `account/read`.
+- Adds Codex-owned ChatGPT browser login, explicit logout, and optional
+  email/plan display without reading or storing OAuth tokens.
+- Makes the local fast-switch path the default for API connections and
+  separates official login from API setup in Add Connection.
 
 ## Choose your download
 
@@ -37,12 +47,17 @@ to downloadable native desktop packages.
 ## First use
 
 1. Open the Switcher; it automatically reads the current non-secret Codex
-   provider and model.
-2. Choose **Add connection**, enter a friendly name, Base URL, and API Key,
-   then fetch and select models.
-3. Choose **Save and use**. The first fast-switch activation may ask you to
-   reopen Codex once; later saved-model changes apply to the next turn while
-   the Switcher is running.
+   provider/model and independently checks the active Codex authentication
+   mode through App Server.
+2. Choose **Add connection**, then select **Official login** or
+   **API connection**.
+3. For an API connection, enter a friendly name, Base URL, and API Key, fetch
+   and select models, then choose **Save and use**. The first fast-switch
+   activation may ask you to reopen Codex once; later saved-model changes apply
+   to the next turn while the Switcher is running.
+4. For official login, complete the Codex-owned browser flow. The Switcher
+   displays optional email/plan metadata returned by App Server and requires a
+   full Codex restart; it never stores an OAuth token.
 
 API Keys stay in macOS Keychain or Windows Credential Manager. The Switcher
 does not copy Codex's official OAuth token or modify the signed Codex Desktop

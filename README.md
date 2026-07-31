@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.3"><strong>下载 v0.3.3 预览版</strong></a>
+  <a href="https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.4"><strong>下载 v0.3.4 预览版</strong></a>
   ·
   <a href="#三步开始使用">使用指南</a>
   ·
@@ -41,24 +41,26 @@ Responses-compatible 服务、保存常用模型，并在之后一键切换。
 | --- | --- | --- |
 | 输入 Base URL 与 API Key，自动获取模型，不必手改 `config.toml`。 | API Key 只进入 macOS Keychain 或 Windows Credential Manager；保存的接入不含 Key。 | 第一次启用快速切换前创建恢复点；关闭时校验并恢复，不覆盖无关配置。 |
 
-- **快速切换是默认模式。** 第一次启用可能需要完整重开一次 Codex；之后保持
-  Switcher 运行，选择的接入和模型会在下一轮对话生效。
-- **官方 ChatGPT 登录仍由 Codex 管理。** Switcher 只恢复内置 `openai`
-  路由，不读取、复制或改写 `auth.json` 与 OAuth 令牌。
+- **快速切换是 API 接入的默认模式。** 第一次使用 API 接入时会自动启用，
+  可能需要完整重开一次 Codex；之后保持 Switcher 运行，选择的接入和模型会在
+  下一轮对话生效。
+- **官方 ChatGPT 登录仍由 Codex 管理。** Switcher 通过 Codex App Server
+  核对真实登录状态并发起官方浏览器登录，不读取、复制或改写 `auth.json` 与
+  OAuth 令牌。
 - **不修改 Codex 安装包。** 不补丁 `app.asar`，不替换签名后的 Codex
   Desktop，也不会擅自生成 `model_catalog_json`。
 
 ## 下载与安装
 
-> 0.3.3 是内部预览版。Windows 安装包尚未代码签名；macOS 包使用 ad-hoc
+> 0.3.4 是公开预览版。Windows 安装包尚未代码签名；macOS 包使用 ad-hoc
 > 签名，但尚未 Developer ID 签名或公证。安装前请核对 Release 中的
 > `SHA256SUMS.txt`。
 
 | 系统 | 安装包 | 安装方法 |
 | --- | --- | --- |
-| Windows x64（已在 Windows 11 验证） | [下载 EXE](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.3/Codex.Provider.Switcher_0.3.3_Windows-x64-Setup.exe) | 双击安装；若 SmartScreen 出现，核对校验值后选择“更多信息 → 仍要运行” |
-| Apple silicon Mac | [下载 arm64 DMG](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.3/Codex.Provider.Switcher_0.3.3_macOS-arm64.dmg) | 打开 DMG，把应用拖到 Applications |
-| Intel Mac | [下载 x64 DMG](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.3/Codex.Provider.Switcher_0.3.3_macOS-x64.dmg) | 打开 DMG，把应用拖到 Applications |
+| Windows x64（已在 Windows 11 验证） | [下载 EXE](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.4/Codex.Provider.Switcher_0.3.4_Windows-x64-Setup.exe) | 双击安装；若 SmartScreen 出现，核对校验值后选择“更多信息 → 仍要运行” |
+| Apple silicon Mac | [下载 arm64 DMG](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.4/Codex.Provider.Switcher_0.3.4_macOS-arm64.dmg) | 打开 DMG，把应用拖到 Applications |
+| Intel Mac | [下载 x64 DMG](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.4/Codex.Provider.Switcher_0.3.4_macOS-x64.dmg) | 打开 DMG，把应用拖到 Applications |
 
 这个仓库目前是**桌面应用**，支持 Windows 与 macOS。它需要访问当前用户的
 Codex Desktop 配置和系统凭据库，因此不支持 iPhone/iPad，也没有可安装的 iOS
@@ -67,9 +69,9 @@ Codex Desktop 配置和系统凭据库，因此不支持 iPhone/iPad，也没有
 <details>
 <summary><strong>macOS 第一次打开提示“无法验证开发者”</strong></summary>
 
-0.3.3 预览包尚未完成 Apple 公证。确认 Release 校验值后，打开
-**系统设置 → 隐私与安全性**，在安全提示旁选择**仍要打开**。公开发布前仍需
-Developer ID 签名和公证。
+0.3.4 预览包尚未完成 Apple 公证。确认 Release 校验值后，打开
+**系统设置 → 隐私与安全性**，在安全提示旁选择**仍要打开**。正式稳定发布前
+仍需 Developer ID 签名和公证。
 
 </details>
 
@@ -79,13 +81,13 @@ Developer ID 签名和公证。
 Windows PowerShell：
 
 ```powershell
-Get-FileHash '.\Codex.Provider.Switcher_0.3.3_Windows-x64-Setup.exe' -Algorithm SHA256
+Get-FileHash '.\Codex.Provider.Switcher_0.3.4_Windows-x64-Setup.exe' -Algorithm SHA256
 ```
 
 macOS：
 
 ```bash
-shasum -a 256 Codex.Provider.Switcher_0.3.3_macOS-arm64.dmg
+shasum -a 256 Codex.Provider.Switcher_0.3.4_macOS-arm64.dmg
 ```
 
 将结果与同一 Release 中的 `SHA256SUMS.txt` 对比。
@@ -96,14 +98,18 @@ shasum -a 256 Codex.Provider.Switcher_0.3.3_macOS-arm64.dmg
 
 ### 1. 打开应用，确认当前状态
 
-Switcher 会自动显示当前模型、接入方式、服务地址和非敏感凭据方式。这里不会
-展示官方 OAuth 令牌，也不会把 API Key 写进 Codex 配置。
+Switcher 会自动显示当前模型、接入方式、服务地址和非敏感凭据方式。官方账号
+状态来自 Codex App Server 的 `account/read`，不会仅凭 `config.toml` 中的
+`openai` 路由推断已经登录。这里不会展示官方 OAuth 令牌，也不会把 API Key
+写进 Codex 配置。
 
-首次使用时，主页面的“快速切换”会显示为尚未开启，这是正常状态。
+快速切换是 API 接入的默认方式；首次使用前尚无本机代理路由是正常状态，选择
+第一个 API 接入时才会自动开启。
 
-### 2. 添加模型服务
+### 2. 添加接入
 
-点击**添加接入**，依次完成：
+点击**添加接入**，先选择**官方登录**或**API 接入**。选择 API 接入后依次
+完成：
 
 1. 填写一个便于识别的接入名称。
 2. 输入完整 Base URL，例如 `https://api.example.com/v1`。
@@ -111,7 +117,7 @@ Switcher 会自动显示当前模型、接入方式、服务地址和非敏感�
 4. 勾选需要保留的模型；服务不提供模型列表时，可以手动输入模型 ID。
 5. 选择**仅保存**或**保存并使用**。
 
-![添加模型服务的两步编辑器](docs/assets/connection-editor.png)
+![选择 OpenAI 官方登录或 API 接入](docs/assets/connection-editor.png)
 
 模型发现会优先尝试 `/v1/models`，再尝试 `/models`。远程服务必须使用
 HTTPS；模型列表限制为 2 MiB 和 500 个模型，连接不会跟随重定向。
@@ -128,13 +134,24 @@ HTTPS；模型列表限制为 2 MiB 和 500 个模型，连接不会跟随重定
 
 ## 使用 Codex 官方账号
 
-1. 在**OpenAI 官方账号**卡片中选择切换/更新官方配置。
+1. 点击**添加接入**并选择**官方登录**，或在官方账号卡片中选择登录/重新
+   登录。
 2. Switcher 会先安全关闭本机代理，再恢复 Codex 内置 `openai` 路由。
-3. 完整重开 Codex，并在 Codex 自己的界面完成 ChatGPT 登录。
-4. 返回 Switcher，为这份无凭据配置设置名称并保存。
+3. Switcher 通过 Codex App Server 的 `account/login/start` 打开受校验的
+   OpenAI/ChatGPT 登录页面，并等待 Codex 完成浏览器登录。
+4. 登录完成后，Switcher 用 `account/read` 核对认证方式，显示 Codex 返回的
+   邮箱与套餐，并自动保存无凭据的当前账号元数据。
+5. 完整退出并重开 Codex，让正在运行的 Codex 进程使用官方账号与内置路由。
+6. 需要移除当前官方账号时，可选择**退出并移除**。这会让 Codex 退出当前
+   ChatGPT 账号，并删除 Switcher 保存的邮箱与套餐显示信息。
 
-只有一份 Codex 官方登录缓存。保存的名称是方便识别的书签，不代表多个彼此
-独立绑定的官方账号。
+`official-profile.json` schema v3 保存自动生成的显示名和可选模型；账号相关
+字段只有当前账号的可选 `email`/`planType` 元数据，不含 OAuth 令牌，也没有
+用户编辑官方配置名称的步骤。当前公开 App Server API 只有一个活动官方账号，
+没有稳定的多 OAuth 账号保存/切换接口；重新登录其他账号会替换当前活动账号和
+这份缓存元数据，而不是新增一份可独立恢复的登录。
+“退出并移除”同样作用于 Codex 的这一个活动登录，并不是只删除一张仍可恢复的
+本地账号卡片。
 
 ## 高级设置与恢复
 
@@ -152,8 +169,9 @@ HTTPS；模型列表限制为 2 MiB 和 500 个模型，连接不会跟随重定
 
 - API Key 与本机代理入口令牌存放在操作系统凭据库；`profiles.json` 和
   `proxy.json` 不保存这些令牌。
-- 官方登录由 Codex 持有和刷新；Switcher 不读取、导出或改写 Codex OAuth
-  数据。
+- 官方登录由 Codex 持有和刷新；Switcher 只调用 Codex App Server 的
+  `account/read`、`account/login/start` 与显式 `account/logout`，不读取、
+  导出或改写 Codex OAuth 数据。
 - 所有 Codex 配置写入都基于内容哈希、原子替换和精确备份。
 - 快速切换只监听本机回环地址，并使用独立随机令牌认证 Codex 的本机请求。
 - 不跟随上游重定向，不自动重试请求，并移除传入的认证与 hop-by-hop headers。
@@ -169,6 +187,19 @@ HTTPS；模型列表限制为 2 MiB 和 500 个模型，连接不会跟随重定
 
 首次启用快速切换、切换到官方账号，或使用“直接配置”时，需要完整退出并重开
 Codex。快速切换已经运行时，普通 API 模型切换会从下一轮对话开始生效。
+
+</details>
+
+<details>
+<summary><strong>为什么内置 OpenAI 接入不等于已登录官方账号？</strong></summary>
+
+`config.toml` 只决定请求路由，不能证明 Codex 当前使用 ChatGPT OAuth 还是
+API Key。Switcher 会通过 `account/read` 分开核对真实认证状态。切换到官方
+账号时会退出本机代理。在 `rust-v0.145.0` 中，普通 TUI/App Server 不会把
+`OPENAI_API_KEY` 或 `CODEX_API_KEY` 当成隐式运行时覆盖，后者只用于
+`codex exec`。若进程继承了 `CODEX_ACCESS_TOKEN`，它会作为外部访问令牌并可
+优先于持久化 OAuth；Switcher 会显示该冲突，而不会宣称官方浏览器登录已生效。
+清除该变量后需完整重开 Switcher 和 Codex。
 
 </details>
 

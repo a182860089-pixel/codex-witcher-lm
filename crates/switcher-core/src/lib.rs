@@ -1,6 +1,7 @@
 mod app_server;
 mod catalog;
 mod cdp;
+mod codex_account;
 mod config;
 mod discovery;
 mod domain;
@@ -16,6 +17,10 @@ pub use catalog::render_model_catalog;
 pub use cdp::{
     CdpEndpointKind, CdpTarget, validate_browser_websocket_url, validate_page_target,
     validate_page_target_for_cleanup, validate_page_websocket_url,
+};
+pub use codex_account::{
+    CodexAccountStatus, CodexAuthMode, CodexJsonLineError, parse_codex_account_result,
+    parse_codex_account_updated, read_codex_json_line,
 };
 pub use config::{
     ConfigPlan, LOCAL_PROXY_PROVIDER_ID, LOCAL_PROXY_PROVIDER_NAME, credential_account_for,

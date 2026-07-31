@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+url.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
@@ -22,4 +25,6 @@ windows = { workspace = true, features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Threading",
   "Win32_System_WinRT",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }

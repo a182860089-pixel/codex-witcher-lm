@@ -1,4 +1,53 @@
 #[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
+
+use url::Url;
+
+const CODEX_CLI_NOT_FOUND: &str =
+    "the official Codex CLI could not be found; install or update @openai/codex";
+const MAX_LOGIN_URL_BYTES: usize = 8 * 1024;
+
+pub fn open_login_url(value: &str) -> Result<(), String> {
+    let url = validate_login_url(value)?;
+    open_validated_login_url(url.as_str())
+}
+
+fn validate_login_url(value: &str) -> Result<Url, String> {
+    if value.is_empty()
+        || value.len() > MAX_LOGIN_URL_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err("Codex returned an invalid login URL".to_string());
+    }
+    let url = Url::parse(value).map_err(|_| "Codex returned an invalid login URL".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Codex returned an invalid login URL".to_string())?;
+    let trusted_host = host.eq_ignore_ascii_case("auth.openai.com")
+        || host.eq_ignore_ascii_case("chatgpt.com")
+        || host
+            .to_ascii_lowercase()
+            .strip_suffix(".chatgpt.com")
+            .is_some_and(|prefix| !prefix.is_empty());
+    if url.scheme() != "https"
+        || url.port().is_some_and(|port| port != 443)
+        || !trusted_host
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("Codex returned an untrusted login URL".to_string());
+    }
+    Ok(url)
+}
+
+fn path_entries() -> impl Iterator<Item = PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+}
+
+#[cfg(target_os = "macos")]
 pub fn open_codex() -> Result<String, String> {
     let mut bundles = discover_signed_codex_bundles()?;
     if bundles.len() != 1 {
@@ -15,6 +64,97 @@ pub fn open_codex() -> Result<String, String> {
         return Err("the official Codex application could not be opened".to_string());
     }
     Ok("signed-bundle:com.openai.codex@2DC432GLL2".to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub fn codex_cli_path() -> Result<PathBuf, String> {
+    use std::collections::BTreeSet;
+
+    let (package_name, target_name) = if cfg!(target_arch = "aarch64") {
+        ("codex-darwin-arm64", "aarch64-apple-darwin")
+    } else {
+        ("codex-darwin-x64", "x86_64-apple-darwin")
+    };
+    let mut candidates = BTreeSet::new();
+    for directory in macos_cli_search_roots() {
+        let shim = directory.join("codex");
+        let Ok(canonical) = shim.canonicalize() else {
+            continue;
+        };
+        if canonical.file_name().and_then(|value| value.to_str()) == Some("codex")
+            && code_signature_matches(&canonical, false)
+        {
+            candidates.insert(canonical);
+            continue;
+        }
+        if canonical.file_name().and_then(|value| value.to_str()) != Some("codex.js") {
+            continue;
+        }
+        let Some(package_root) = canonical.parent().and_then(Path::parent) else {
+            continue;
+        };
+        if package_root.file_name().and_then(|value| value.to_str()) != Some("codex")
+            || package_root
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                != Some("@openai")
+        {
+            continue;
+        }
+        let native = package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(package_name)
+            .join("vendor")
+            .join(target_name)
+            .join("bin")
+            .join("codex");
+        let Ok(native) = native.canonicalize() else {
+            continue;
+        };
+        if code_signature_matches(&native, false) {
+            candidates.insert(native);
+        }
+    }
+    if candidates.len() != 1 {
+        return Err(CODEX_CLI_NOT_FOUND.to_string());
+    }
+    Ok(candidates.pop_first().expect("candidate count was checked"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cli_search_roots() -> Vec<PathBuf> {
+    use std::collections::BTreeSet;
+
+    let mut roots = path_entries().collect::<BTreeSet<_>>();
+    roots.insert(PathBuf::from("/opt/homebrew/bin"));
+    roots.insert(PathBuf::from("/usr/local/bin"));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && home.is_absolute()
+    {
+        roots.insert(home.join(".local/bin"));
+        roots.insert(home.join(".npm-global/bin"));
+        roots.insert(home.join("Library/pnpm"));
+    }
+    if let Some(pnpm_home) = std::env::var_os("PNPM_HOME").map(PathBuf::from)
+        && pnpm_home.is_absolute()
+    {
+        roots.insert(pnpm_home);
+    }
+    roots.into_iter().collect()
+}
+
+#[cfg(target_os = "macos")]
+fn open_validated_login_url(value: &str) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(value)
+        .status()
+        .map_err(|_| "could not open the Codex login page".to_string())?;
+    if !status.success() {
+        return Err("could not open the Codex login page".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -171,6 +311,59 @@ pub fn authorize_codex_parent() -> Result<(), String> {
 #[cfg(windows)]
 pub fn open_codex() -> Result<String, String> {
     with_windows_runtime(open_codex_windows)
+}
+
+#[cfg(windows)]
+pub fn codex_cli_path() -> Result<PathBuf, String> {
+    use std::collections::BTreeSet;
+
+    let mut candidates = BTreeSet::new();
+    let mut roots = path_entries().collect::<Vec<_>>();
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        roots.push(PathBuf::from(app_data).join("npm"));
+    }
+    for root in roots {
+        let native = root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-win32-x64")
+            .join("vendor")
+            .join("x86_64-pc-windows-msvc")
+            .join("bin")
+            .join("codex.exe");
+        let Ok(native) = native.canonicalize() else {
+            continue;
+        };
+        let Some(native_text) = native.to_str() else {
+            continue;
+        };
+        if is_official_windows_npm_codex_path(native_text)
+            && authenticode_signer_is_openai(native_text)
+        {
+            candidates.insert(native);
+        }
+    }
+    if candidates.len() != 1 {
+        return Err(CODEX_CLI_NOT_FOUND.to_string());
+    }
+    Ok(candidates.pop_first().expect("candidate count was checked"))
+}
+
+#[cfg(windows)]
+fn open_validated_login_url(value: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::HSTRING;
+
+    let target = HSTRING::from(value);
+    let result = unsafe { ShellExecuteW(None, None, &target, None, None, SW_SHOWNORMAL) };
+    if result.0 as isize <= 32 {
+        return Err("could not open the Codex login page".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -545,6 +738,24 @@ pub fn open_codex() -> Result<String, String> {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
+pub fn codex_cli_path() -> Result<PathBuf, String> {
+    for directory in path_entries() {
+        let candidate = directory.join("codex");
+        if candidate.is_file() {
+            return candidate
+                .canonicalize()
+                .map_err(|_| CODEX_CLI_NOT_FOUND.to_string());
+        }
+    }
+    Err(CODEX_CLI_NOT_FOUND.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn open_validated_login_url(_value: &str) -> Result<(), String> {
+    Err("opening the Codex login page is supported only on macOS and Windows".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn authorize_codex_parent() -> Result<(), String> {
     Err("credential helper caller verification is supported only on macOS and Windows".to_string())
 }
@@ -552,6 +763,25 @@ pub fn authorize_codex_parent() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_only_official_https_login_urls() {
+        assert!(validate_login_url("https://auth.openai.com/oauth/authorize?state=x").is_ok());
+        assert!(validate_login_url("https://chatgpt.com/auth/callback").is_ok());
+        assert!(validate_login_url("https://login.chatgpt.com/").is_ok());
+        assert!(validate_login_url("https://auth.openai.com:443/oauth/authorize").is_ok());
+        assert!(validate_login_url("http://auth.openai.com/oauth/authorize").is_err());
+        assert!(validate_login_url("https://auth.openai.com:444/oauth/authorize").is_err());
+        assert!(validate_login_url("https://auth.openai.com.example.test/").is_err());
+        assert!(validate_login_url("https://user@auth.openai.com/").is_err());
+        assert!(
+            validate_login_url(&format!(
+                "https://auth.openai.com/{}",
+                "x".repeat(MAX_LOGIN_URL_BYTES)
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn recognizes_only_the_official_npm_codex_layout() {

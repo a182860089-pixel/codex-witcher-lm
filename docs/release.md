@@ -25,10 +25,26 @@
   explicit release, and bounded-pin eviction.
 - Keyless `profiles.json` create, replace, remove, lock, permission, schema, and
   atomic-write behavior.
-- Keyless `official-profile.json` schema, permission, corruption, model
-  validation, user-chosen-name validation, v1 read compatibility, and
-  credential-field exclusion. Capturing must accept only the built-in `openai`
-  route without a Base URL and must never access `auth.json`.
+- Keyless `official-profile.json` schema-v3, permission, corruption, display
+  name, model, optional email/plan validation, v1/v2 read compatibility, and
+  credential-field exclusion. Metadata refresh must accept only a confirmed
+  ChatGPT account on the built-in `openai` route without a Base URL and must
+  never access `auth.json`.
+- Codex App Server account tests must cover initialization, `account/read`
+  results for ChatGPT/API-key/signed-out/unknown states,
+  `account/login/start { type: "chatgpt" }`, matching
+  `account/login/completed`, `account/logout` restricted to a confirmed
+  ChatGPT account, timeout and malformed/oversized responses, trusted login-URL
+  validation, child cleanup, and redacted errors. For subprocess isolation, the
+  child must not inherit `OPENAI_API_KEY`, `CODEX_API_KEY`,
+  `CODEX_ACCESS_TOKEN`, or login-override environment variables. Tests must
+  separately prove that only `CODEX_ACCESS_TOKEN` is surfaced as an external
+  access-token conflict for the normal TUI/App Server; in `rust-v0.145.0`,
+  `CODEX_API_KEY` environment authentication is enabled only for `codex exec`,
+  and `OPENAI_API_KEY` is not an implicit override for those normal surfaces.
+- Route and account fixtures must prove that a built-in `openai` route alone
+  is not reported as a ChatGPT login, and that API-key authentication is not
+  reported as an official account.
 - Official-route fixtures must remove `model_provider`, `openai_base_url`, and
   a shadowing `model_providers.openai` table while preserving MCP, hooks, other
   providers, and user-owned `model_catalog_json`. Test optional model manifests
@@ -62,9 +78,18 @@
 - Direct-mode flow: apply an upstream provider, fully restart, start a new
   thread, and exactly restore.
 - Official-account flow: safely disable the proxy, prepare the built-in route,
-  restart into Codex's native ChatGPT login, save the credential-free current
-  route, switch to an API profile, switch back to official, and verify that
-  Codex owns the same login cache throughout.
+  start Codex's browser login through App Server, verify the resulting
+  `account/read` email/plan display and automatic schema-v3 metadata write,
+  fully restart Codex, switch to an API profile, switch back to official, and
+  verify that Codex owns the authentication cache throughout.
+- Repeat official login with a different test account and verify that the one
+  active Codex account and one metadata cache are replaced rather than
+  presented as independently switchable OAuth sessions. Do not claim
+  multi-account persistence until stable public App Server session RPCs exist.
+- From the built-in route, explicitly sign out and remove the official account;
+  confirm that App Server reports signed out, schema-v3 metadata is removed,
+  no API profile or keyring credential changes, and a full Codex restart is
+  requested.
 - Keychain/Credential Manager flow: first-access prompt, locked store, missing
   entry, saved-profile readback into the local editor, unchanged credential
   reuse, endpoint rebinding, replacement, and deletion. Windows tests must
@@ -127,6 +152,17 @@ verified. Signing secrets must remain in the GitHub Actions secret store.
   user-owned `model_catalog_json`.
 - `official-profile.json` contains a credential, token, auth payload, Base URL,
   or any copied content from `auth.json`.
+- A built-in `openai` route or cached official metadata is presented as proof
+  of ChatGPT login without a matching `account/read` result.
+- An inherited `CODEX_ACCESS_TOKEN` is present while the UI reports persisted
+  official OAuth as active or a login transition as complete instead of
+  identifying an external access-token conflict.
+- Official login runs while the local proxy is attached, opens a non-HTTPS or
+  untrusted login URL, starts a child that inherits `OPENAI_API_KEY`,
+  `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, or a login override, or is presented
+  as hot-switched without a full Codex restart.
+- Cached account metadata is presented as several independently restorable
+  OAuth accounts while no stable public App Server session API exists.
 - Exact restore or semantic proxy detach can overwrite a concurrent user edit.
 - Disable can restore an unrelated latest backup or a manifest whose
   provider/status/path/transaction ID does not match the recorded activation,
@@ -143,9 +179,63 @@ verified. Signing secrets must remain in the GitHub Actions secret store.
 - A release is unsigned, unnotarized on macOS, or lacks real target-host smoke
   tests.
 
+## 2026-07-30 Windows 0.3.4 account-interface evidence
+
+The recovered App Server account and connection-flow work was versioned as
+0.3.4, built natively, and installed for Windows user `Admin` on `ydy001`.
+This verified snapshot is the source for the GitHub v0.3.4 prerelease. The
+tag-triggered workflow rebuilds every public package on its target operating
+system, so the published asset hashes are recorded separately from these
+internal Windows deployment hashes.
+
+The exact 0.3.4 working-tree snapshot passed:
+
+- TypeScript checking, four runtime tests, and the production WebView build.
+- Rust formatting, 66 core tests, two Credential Manager tests, nine desktop
+  tests, three launcher tests, six proxy unit tests, and five proxy integration
+  tests.
+- Full Tauri release and NSIS packaging.
+- Isolated NSIS install/remove smoke that restored the existing registration,
+  saved installer state, and two user shortcuts.
+- Current-user upgrade from 0.3.3 without changing the measured Codex config,
+  24-file Switcher state fingerprint, Credential Manager metadata, or absent
+  automatic-startup values.
+- Interactive Session 1 visual verification of the real App Server account
+  status, official-login action, visible version 0.3.4 label, and the separate
+  OpenAI-official/API Add Connection choices.
+
+Artifact evidence:
+
+- Source archive SHA-256:
+  `12314548bf7d13adc47ea281f133b721c03f84969d19ec3601210ba19555a72d`
+  (`796076` bytes)
+- NSIS SHA-256:
+  `46f796f069f3f5ed041809ea169d61fc803514256b46e2cb9f5fa86392241874`
+  (`3995494` bytes)
+- Installed application SHA-256:
+  `5f6829b0b65e1073f45fee78238ff01daae30f7f0c7588ef962b56145f37b070`
+- Main-interface screenshot SHA-256:
+  `07460ae2cb0197523b5127d0a978ebe17539d2111fb48597c637b2546b2b9934`
+- Add Connection screenshot SHA-256:
+  `e67a3b48aeefc025681c37da01b53800a63399565c38a3c82376ae5ee1440a45`
+- Authenticode status: `NotSigned`
+
+The exact pre-upgrade app, current public v0.3.3 rollback installer,
+registration, installer state, shortcuts, and state evidence are retained at
+`D:\CodexProviderSwitcher\rollback-0.3.3-before-0.3.4-20260730T150944Z`.
+The 0.3.4 source archive, installer, logs, state snapshots, deployment
+manifest, and screenshots are retained below
+`D:\CodexProviderSwitcher\deployment-0.3.4`.
+
+The application remains running in interactive Session 1. The proxy remains
+disabled, no listener exists on port 15722, and no temporary deployment task
+remains. This run did not submit browser OAuth, change or read an API Key,
+enable the proxy, or perform a live provider turn. Public packages are rebuilt
+and package-smoked independently by the v0.3.4 GitHub release workflow.
+
 ## 2026-07-29 GitHub 0.3.3 prerelease evidence
 
-The private repository published
+The repository published
 [Codex Provider Switcher v0.3.3](https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.3)
 as an explicit GitHub prerelease from source commit
 `50596d6c1df253ac89b00f7fbcbda93b23b805db`.
@@ -186,7 +276,7 @@ Published installers:
 
 The final GitHub release contains exactly those three installers, three
 per-package `.sha256` files, and `SHA256SUMS.txt`. All seven assets were
-downloaded again from the private release API, and both the aggregate manifest
+downloaded again from the Releases API, and both the aggregate manifest
 and the three individual sidecars passed. The Windows installer remains
 unsigned. The macOS bundles use ad-hoc signing and are not Developer ID signed,
 notarized, or stapled, so this evidence does not satisfy the normal-release
@@ -236,8 +326,9 @@ The version 0.3.2 source snapshot on the `ydy001` Windows 11 x64 host passed:
 - Rust formatting, 60 Windows-applicable core tests, two Credential Manager
   tests, two launcher tests, six desktop tests, six proxy unit tests, and five
   proxy integration tests.
-- Named schema-v2 official-profile validation and legacy schema-v1 read
-  compatibility.
+- Historical schema-v2 named official-profile validation and legacy schema-v1
+  read compatibility. This is 0.3.2 evidence only; current writes use
+  schema-v3 account metadata and no editable official-profile name.
 - Explicit Windows Credential Manager `Local` persistence round-trip coverage
   for newly stored credentials.
 - Full Tauri release and NSIS packaging.
@@ -246,8 +337,9 @@ The version 0.3.2 source snapshot on the `ydy001` Windows 11 x64 host passed:
   Credential Manager metadata.
 - Interactive Session 1 verification that an ordinary launch shows the main
   window, while `--background` remains suitable for a hidden gateway start.
-- Visual verification of the official-profile name editor and current/saved
-  official-route state without reading `auth.json`, OAuth tokens, or API Keys.
+- Visual verification of the then-current official-profile name editor and
+  current/saved official-route state without reading `auth.json`, OAuth tokens,
+  or API Keys. The editor is not part of the current schema-v3 account flow.
 
 Artifact evidence:
 
@@ -303,10 +395,11 @@ Artifact evidence:
 
 This is internal deployment evidence, not a public release approval. The run
 deliberately preserved the user's current API route and did not exercise the
-interactive OpenAI prepare/login/save/switch-back flow. It also did not repeat
-a live upstream model turn. Native Windows DACL/durability, disable/restore,
-uninstall cleanup, signed release gates, and the complete official-account
-round trip remain open.
+then-current route-only OpenAI prepare/login/save/switch-back flow. That
+historical flow is superseded by the App Server login/status/logout flow. It
+also did not repeat a live upstream model turn. Native Windows
+DACL/durability, disable/restore, uninstall cleanup, signed release gates, and
+the complete current official-account round trip remain open.
 
 ## 2026-07-25 Windows 0.2.4 evidence
 

@@ -133,21 +133,63 @@ redacted and never contain the keyring backend's detailed payload.
 - Absolute content CAS against an unrelated writer and Windows power-failure
   durability still require a native implementation/test before release.
 
-The manager does not edit `auth.json`.
+The manager does not edit `auth.json`. Official authentication is accessed
+only through the public Codex App Server account surface:
 
-The official-account profile is a route bookmark, not an authentication
-backup. Schema v2 contains only a user-chosen display name and an optional
-validated model ID; schema v1 with the original fixed name remains readable.
+- `account/read` returns the authentication type and optional ChatGPT
+  `email`/`planType` metadata without returning a credential.
+- `account/login/start` with `type: "chatgpt"` lets Codex own the browser
+  callback, token persistence, and token refresh.
+- The login child removes inherited `OPENAI_API_KEY`, `CODEX_API_KEY`,
+  `CODEX_ACCESS_TOKEN`, and App Server login overrides before starting.
+- The returned browser URL must use HTTPS on `auth.openai.com`,
+  `chatgpt.com`, or a nonempty `chatgpt.com` subdomain, with no URL userinfo.
+- The Switcher waits for the matching `account/login/completed` notification
+  and confirms `chatgpt` through a second `account/read`.
+- Explicit removal first confirms the built-in route and a ChatGPT account,
+  calls `account/logout`, confirms the signed-out result, and only then removes
+  the local metadata file.
+
+Removing all three credential variables from the child is deliberate process
+isolation, not evidence that all three override normal interactive
+authentication. In `rust-v0.145.0`, the TUI and App Server set
+`enable_codex_api_key_env` to `false`, while `codex exec` sets it to `true`.
+Thus `CODEX_API_KEY` environment authentication is limited to `codex exec`,
+and `OPENAI_API_KEY` is not an implicit runtime override for the normal
+TUI/App Server.
+
+The official-account profile is a route and display-metadata cache, not an
+authentication backup. Schema v3 contains a display name, an optional
+validated model ID, and the current account's optional `email` and `planType`.
+Those metadata fields are personal data, so the file uses the same private,
+regular-file and atomic-write boundary as other state. Schema v1 and v2 remain
+readable for migration but cannot contain account metadata.
+
 The app never reads, parses, copies, exports, logs, or writes Codex ChatGPT
 access or refresh tokens, whether Codex stores them in `auth.json` or the
-operating-system keyring. It therefore does not discover an email address or
-username. Login, account selection, expiry, and refresh remain entirely inside
-Codex.
+operating-system keyring. The email and plan are taken only from
+`account/read`; they are not decoded from a token. Login, expiry, and refresh
+remain inside Codex.
+
+The current public App Server method registry exposes one active
+authentication result and no stable `account/sessions/*` RPC for persisting
+and switching multiple OAuth sessions. Signing in again may replace Codex's
+active account and overwrites the Switcher's one metadata cache. A cached email
+must never be presented as an independently restorable OAuth identity.
+Likewise, “退出并移除” logs Codex out of that one active account; it is not a
+local-only profile deletion.
 
 Official activation removes route fields that could redirect the built-in
 `openai` provider, but it does so through the same content-hash transaction and
 preserves unrelated TOML. It does not delete other saved API profiles or their
-system credentials.
+system credentials. Conversely, the built-in route is not evidence of a
+ChatGPT login: UI state must combine route inspection with `account/read`.
+The UI rejects a persisted-official-OAuth claim while the Switcher inherited
+`CODEX_ACCESS_TOKEN`, labels that state as an external access-token conflict,
+and does not treat the two API-key variables as the same condition. Switching
+to official authentication first detaches the local proxy and requires a full
+Codex restart; the Switcher and Codex must both be restarted without the
+external token before persisted OAuth can be reported as active.
 
 In local-proxy mode, the managed Codex provider contains only the strict
 loopback Base URL and a helper reference for the entry bearer. The upstream

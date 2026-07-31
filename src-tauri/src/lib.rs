@@ -1,3 +1,5 @@
+mod codex_account;
+
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -12,6 +14,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_account::login_chatgpt;
+use codex_account::logout_chatgpt;
+use codex_account::read_account;
 use codex_provider_switcher_core::AuthKind;
 use codex_provider_switcher_core::BackupManifest;
 use codex_provider_switcher_core::BackupStatus;
@@ -20,6 +25,7 @@ use codex_provider_switcher_core::CurrentCodexConfig;
 use codex_provider_switcher_core::FetchedModel;
 use codex_provider_switcher_core::LOCAL_PROXY_PROVIDER_ID;
 use codex_provider_switcher_core::ModelSpec;
+use codex_provider_switcher_core::OFFICIAL_PROFILE_DISPLAY_NAME;
 use codex_provider_switcher_core::OfficialProfile;
 use codex_provider_switcher_core::ProfileStore;
 use codex_provider_switcher_core::ProviderProfile;
@@ -52,6 +58,7 @@ use codex_provider_switcher_core::verify_credential_binding as verify_core_crede
 use codex_provider_switcher_core::verify_proxy_config_binding as verify_core_proxy_config_binding;
 use codex_provider_switcher_core::verify_proxy_detach_recoverable;
 use codex_provider_switcher_core::write_private_file;
+use codex_provider_switcher_core::{CodexAccountStatus, CodexAuthMode};
 use codex_provider_switcher_credentials as credentials;
 use codex_provider_switcher_launcher::authorize_codex_parent;
 use codex_provider_switcher_launcher::open_codex as launch_codex;
@@ -177,6 +184,11 @@ struct ProxyRuntime {
 struct ProxyRuntimeState {
     handle: Option<ProxyHandle>,
     last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct AccountRuntime {
+    inner: AsyncMutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,15 +508,79 @@ fn activate_official_profile() -> Result<ApplySummary, String> {
 }
 
 #[tauri::command]
-fn save_current_official_profile(display_name: String) -> Result<OfficialProfile, String> {
+async fn codex_account_status(
+    runtime: tauri::State<'_, AccountRuntime>,
+) -> Result<CodexAccountStatus, String> {
     let paths = app_paths()?;
-    require_clean_recovery_state(&paths)?;
-    require_proxy_detached(&paths)?;
+    let _guard = runtime.inner.lock().await;
+    let codex_home = paths.codex_home.clone();
+    let status = tauri::async_runtime::spawn_blocking(move || read_account(&codex_home))
+        .await
+        .map_err(|_| "Codex account inspection worker failed".to_string())??;
+    if status.auth_mode == CodexAuthMode::Chatgpt {
+        let current =
+            inspect_config(&read_config_safely(&paths.config)?).map_err(redacted_core_error)?;
+        if current.provider_id == "openai"
+            && current.base_url.is_none()
+            && current.auth_kind == AuthKind::OfficialLogin
+        {
+            refresh_official_account_metadata_if_readable(&paths, &current, &status)?;
+        }
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+async fn login_official_account(
+    runtime: tauri::State<'_, AccountRuntime>,
+) -> Result<CodexAccountStatus, String> {
+    let paths = app_paths()?;
+    let _guard = runtime.inner.lock().await;
+    require_builtin_openai_route(&paths)?;
+    let codex_home = paths.codex_home.clone();
+    let status = tauri::async_runtime::spawn_blocking(move || login_chatgpt(&codex_home))
+        .await
+        .map_err(|_| "Codex login worker failed".to_string())??;
+    let current = require_builtin_openai_route(&paths).map_err(|error| {
+        format!("Codex login succeeded, but the official configuration was not saved: {error}")
+    })?;
+    save_official_account_metadata(&paths, &current, &status).map_err(|error| {
+        format!("Codex login succeeded, but the official configuration was not saved: {error}")
+    })?;
+    Ok(status)
+}
+
+#[tauri::command]
+async fn logout_official_account(
+    runtime: tauri::State<'_, AccountRuntime>,
+) -> Result<CodexAccountStatus, String> {
+    let paths = app_paths()?;
+    let _guard = runtime.inner.lock().await;
+    require_builtin_openai_route(&paths)?;
+    let codex_home = paths.codex_home.clone();
+    let status = tauri::async_runtime::spawn_blocking(move || logout_chatgpt(&codex_home))
+        .await
+        .map_err(|_| "Codex logout worker failed".to_string())??;
+    remove_official_profile_metadata(&paths).map_err(|error| {
+        format!(
+            "Codex logged out the current ChatGPT account, but the saved official configuration could not be removed: {error}"
+        )
+    })?;
+    Ok(status)
+}
+
+fn require_builtin_openai_route(paths: &AppPaths) -> Result<CurrentCodexConfig, String> {
+    require_clean_recovery_state(paths)?;
+    require_proxy_detached(paths)?;
     let current =
         inspect_config(&read_config_safely(&paths.config)?).map_err(redacted_core_error)?;
-    let profile = official_profile_from_current(&current, display_name)?;
-    write_official_profile(&paths, &profile)?;
-    Ok(profile)
+    if current.provider_id != "openai"
+        || current.base_url.is_some()
+        || current.auth_kind != AuthKind::OfficialLogin
+    {
+        return Err("prepare the built-in OpenAI route before managing official login".to_string());
+    }
+    Ok(current)
 }
 
 #[tauri::command]
@@ -933,6 +1009,7 @@ pub fn run() {
         ))
         .manage(DiscoveryVault::default())
         .manage(ProxyRuntime::default())
+        .manage(AccountRuntime::default())
         .setup(move |app| {
             setup_tray(app)?;
             start_proxy_on_launch(app.handle().clone(), background);
@@ -954,7 +1031,9 @@ pub fn run() {
             apply_saved_profile,
             prepare_official_login,
             activate_official_profile,
-            save_current_official_profile,
+            codex_account_status,
+            login_official_account,
+            logout_official_account,
             proxy_status,
             enable_proxy,
             switch_proxy_route,
@@ -1809,6 +1888,7 @@ fn generate_proxy_token() -> String {
 }
 
 struct AppPaths {
+    codex_home: PathBuf,
     state: PathBuf,
     config: PathBuf,
     catalog: PathBuf,
@@ -1842,6 +1922,7 @@ fn app_paths() -> Result<AppPaths, String> {
     };
     let helper = state.join("helpers").join(&helper_sha256).join(helper_name);
     Ok(AppPaths {
+        codex_home: codex_home.clone(),
         state: state.clone(),
         config: codex_home.join("config.toml"),
         catalog: state.join("models.json"),
@@ -1906,9 +1987,29 @@ fn write_official_profile(paths: &AppPaths, profile: &OfficialProfile) -> Result
         .map_err(|_| "could not save the official configuration".to_string())
 }
 
-fn official_profile_from_current(
+fn remove_official_profile_metadata(paths: &AppPaths) -> Result<(), String> {
+    match fs::symlink_metadata(&paths.state) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("provider switcher state path is not a safe directory".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("could not inspect provider switcher state".to_string()),
+    }
+    match fs::symlink_metadata(&paths.official_profile) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("official profile path is not a safe regular file".to_string())
+        }
+        Ok(_) => fs::remove_file(&paths.official_profile)
+            .map_err(|_| "could not remove the saved official configuration".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("could not inspect the saved official configuration".to_string()),
+    }
+}
+
+fn official_profile_from_current_account(
     current: &CurrentCodexConfig,
-    display_name: String,
+    account: &CodexAccountStatus,
 ) -> Result<OfficialProfile, String> {
     if current.provider_id != "openai"
         || current.base_url.is_some()
@@ -1919,9 +2020,51 @@ fn official_profile_from_current(
                 .to_string(),
         );
     }
-    let profile = OfficialProfile::new(display_name.trim().to_string(), current.model_id.clone());
+    if account.auth_mode != CodexAuthMode::Chatgpt {
+        return Err("Codex does not have an active ChatGPT login".to_string());
+    }
+    let display_name = account
+        .email
+        .as_ref()
+        .filter(|email| email.chars().count() <= 80)
+        .cloned()
+        .unwrap_or_else(|| OFFICIAL_PROFILE_DISPLAY_NAME.to_string());
+    let profile = OfficialProfile::with_account(
+        display_name,
+        current.model_id.clone(),
+        account.email.clone(),
+        account.plan_type.clone(),
+    );
     validate_official_profile(&profile).map_err(redacted_core_error)?;
     Ok(profile)
+}
+
+fn save_official_account_metadata(
+    paths: &AppPaths,
+    current: &CurrentCodexConfig,
+    account: &CodexAccountStatus,
+) -> Result<OfficialProfile, String> {
+    let profile = official_profile_from_current_account(current, account)?;
+    let existing = load_official_profile(paths)?;
+    if existing.as_ref() != Some(&profile) {
+        write_official_profile(paths, &profile)?;
+    }
+    Ok(profile)
+}
+
+fn refresh_official_account_metadata_if_readable(
+    paths: &AppPaths,
+    current: &CurrentCodexConfig,
+    account: &CodexAccountStatus,
+) -> Result<(), String> {
+    let profile = official_profile_from_current_account(current, account)?;
+    let Ok(existing) = load_official_profile(paths) else {
+        return Ok(());
+    };
+    if existing.as_ref() != Some(&profile) {
+        write_official_profile(paths, &profile)?;
+    }
+    Ok(())
 }
 
 fn ensure_state_root(paths: &AppPaths) -> Result<(), String> {
@@ -2409,12 +2552,20 @@ mod tests {
             auth_kind: AuthKind::OfficialLogin,
             catalog_path: None,
         };
-        let captured = official_profile_from_current(&official, "个人 Plus".to_string()).unwrap();
-        assert_eq!(captured.display_name, "个人 Plus");
+        let account = CodexAccountStatus {
+            auth_mode: CodexAuthMode::Chatgpt,
+            email: Some("user@example.com".to_string()),
+            plan_type: Some("plus".to_string()),
+            requires_openai_auth: true,
+            codex_access_token_environment_present: false,
+        };
+        let captured = official_profile_from_current_account(&official, &account).unwrap();
+        assert_eq!(captured.display_name, "user@example.com");
         assert_eq!(captured.model_id.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(captured.plan_type.as_deref(), Some("plus"));
 
         let mut redirected = official;
         redirected.base_url = Some("https://redirect.example/v1".to_string());
-        assert!(official_profile_from_current(&redirected, "个人 Plus".to_string()).is_err());
+        assert!(official_profile_from_current_account(&redirected, &account).is_err());
     }
 }

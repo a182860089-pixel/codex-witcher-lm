@@ -10,23 +10,36 @@ modify `app.asar`, the signed macOS app bundle, or the Windows Store package.
 
 - Treat the primary audience as a non-developer. On launch, inspect the active
   Codex provider, model, Base URL, and credential method automatically.
-- The normal setup path is Base URL + API Key, fetch models, select the models
-  to keep, then save or save-and-switch.
+- Add Connection must first distinguish official ChatGPT login from an API
+  connection. The API branch is Base URL + API Key, fetch models, select the
+  models to keep, then save or save-and-switch.
 - Support manual model IDs when a compatible service does not expose a
   standard model-list endpoint.
 - Saved connections are shortcuts in `profiles.json`; they must never contain
   API keys.
-- Official ChatGPT login remains owned by Codex. The Switcher may save only a
-  credential-free `official-profile.json` containing the approved schema,
-  user-chosen display name, and optional model ID. It must never read, copy,
-  export, or rewrite `auth.json` or keyring-backed Codex login tokens. Codex
-  exposes one active login cache, so do not present multiple saved official
-  names as independently bound OAuth accounts.
+- Official ChatGPT authentication remains owned by Codex. Inspect it through
+  the Codex App Server `account/read` method and start browser login through
+  `account/login/start` with `type: "chatgpt"`; never infer the authentication
+  mode from the configured provider route alone.
+- The Switcher may save only credential-free schema-v3
+  `official-profile.json` route metadata plus the current account's optional
+  `email` and `planType`. It must never read, copy, export, or rewrite
+  `auth.json`, OAuth tokens, or keyring-backed Codex login credentials.
+- Current public App Server methods expose one active Codex authentication
+  session, not a stable multi-account save/switch API. Do not present cached
+  metadata as independently restorable OAuth accounts; a later login replaces
+  the active account and the one cached official profile.
+- Removing the current official account must be an explicit Codex
+  `account/logout`, limited to a confirmed ChatGPT account on the built-in
+  route. It also removes the local metadata cache and must not be presented as
+  deleting a locally restorable OAuth profile.
 - Switching to the official profile must first detach the local proxy, restore
   the built-in `openai` provider by removing route-hijacking fields, preserve
   unrelated user configuration, and require a Codex restart. API-profile
   switches may remain hot while the proxy is active.
-- The default switching mode is the loopback local proxy. Its first enable
+- The default switching mode for API connections is the loopback local proxy.
+  Do not describe an unused installation as misconfigured merely because the
+  proxy has not yet been activated. Its first API-profile enable
   transactionally points Codex at the managed `cps-local` provider and may
   require a full Codex restart. Once that provider is active, changing a saved
   connection or model atomically updates the proxy route and applies to the
@@ -43,8 +56,19 @@ modify `app.asar`, the signed macOS app bundle, or the Windows Store package.
 - Prefer documented Codex configuration and App Server requests.
 - Never write API keys to `config.toml`, `auth.json`, logs, state, or command
   arguments. Use macOS Keychain or Windows Credential Manager.
-- Never treat a saved official profile as proof that the user is logged in.
-  Login and refresh status remain visible only to Codex.
+- Never treat the built-in `openai` route or a saved official profile as proof
+  that the user is logged in with ChatGPT. `account/read` is authoritative for
+  whether the active authentication is ChatGPT, API key, another mode, or
+  signed out. For the normal TUI and App Server, only an inherited
+  `CODEX_ACCESS_TOKEN` is an external-access-token conflict that can take
+  precedence over persisted OAuth. In `rust-v0.145.0`, neither
+  `OPENAI_API_KEY` nor `CODEX_API_KEY` is an implicit override for those
+  surfaces; the `CODEX_API_KEY` environment path is enabled only by
+  `codex exec`.
+- Launch the official-login App Server without inherited `OPENAI_API_KEY`,
+  `CODEX_API_KEY`, or `CODEX_ACCESS_TOKEN`, and open only its validated
+  OpenAI/ChatGPT HTTPS authorization URL. Do not expose the returned URL or
+  account metadata as a credential.
 - Model discovery uses the system proxy, permits HTTPS plus loopback HTTP,
   follows no redirects, and bounds response size and model count.
 - Discovery credentials may exist only in the zeroizing in-process vault:

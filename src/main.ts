@@ -3,6 +3,7 @@ import "./styles.css";
 
 type ReasoningEffort = "low" | "medium" | "high";
 type StatusKind = "info" | "working" | "success" | "error";
+type CodexAuthMode = "none" | "apiKey" | "chatgpt" | "other";
 type AuthKind =
   | "officialLogin"
   | "systemCredential"
@@ -36,6 +37,16 @@ interface OfficialProfile {
   schemaVersion: number;
   displayName: string;
   modelId: string | null;
+  email?: string | null;
+  planType?: string | null;
+}
+
+interface CodexAccountStatus {
+  authMode: CodexAuthMode;
+  email: string | null;
+  planType: string | null;
+  requiresOpenaiAuth: boolean;
+  codexAccessTokenEnvironmentPresent: boolean;
 }
 
 interface CurrentCodexConfig {
@@ -139,9 +150,11 @@ const browserPreview: DashboardState = {
   ],
   profileWarning: null,
   officialProfile: {
-    schemaVersion: 2,
-    displayName: "个人 Plus",
+    schemaVersion: 3,
+    displayName: "alex@example.com",
     modelId: null,
+    email: "alex@example.com",
+    planType: "plus",
   },
   officialProfileWarning: null,
 };
@@ -157,10 +170,28 @@ const stoppedProxy: LocalProxyStatus = {
   lastError: null,
 };
 
+const browserAccountPreview: CodexAccountStatus = {
+  authMode: "chatgpt",
+  email: "alex@example.com",
+  planType: "plus",
+  requiresOpenaiAuth: true,
+  codexAccessTokenEnvironmentPresent: false,
+};
+
+const unavailableAccountStatus: CodexAccountStatus = {
+  authMode: "none",
+  email: null,
+  planType: null,
+  requiresOpenaiAuth: false,
+  codexAccessTokenEnvironmentPresent: false,
+};
+
 let dashboard = browserPreview;
 let nativeAvailable = "__TAURI_INTERNALS__" in window;
 let proxyApiAvailable = true;
 let localProxy = stoppedProxy;
+let codexAccount = browserAccountPreview;
+let codexAccountAvailable = !nativeAvailable;
 let switchMode: SwitchMode = "localProxy";
 let activePage: AppPage = "switcher";
 let discoveryId: string | null = null;
@@ -218,7 +249,7 @@ app.innerHTML = `
             <strong>正在检查</strong>
           </div>
         </div>
-        <span class="version-label">Version 0.3.3</span>
+        <span class="version-label">Version 0.3.4</span>
       </div>
     </aside>
 
@@ -227,7 +258,7 @@ app.innerHTML = `
         <div class="page-heading">
           <p>Codex Provider Switcher</p>
           <h1 id="page-title">模型切换</h1>
-          <span id="page-description">选择接入和模型，下一轮对话即可使用。</span>
+          <span id="page-description" hidden></span>
         </div>
         <button id="refresh" class="button button-toolbar" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -335,8 +366,8 @@ app.innerHTML = `
             </div>
             <div class="mode-summary">
               <div>
-                <strong id="mode-summary-title">快速切换尚未开启</strong>
-                <p id="mode-summary-copy">在模型切换页选择一个接入和模型即可开启。</p>
+                <strong id="mode-summary-title">快速切换将在首次使用时开启</strong>
+                <p id="mode-summary-copy">首次保存并使用 API 接入时，应用会自动启用本机代理。</p>
               </div>
               <div class="mode-summary-actions">
                 <button id="restore" class="button button-quiet" type="button">撤销上次更改</button>
@@ -368,8 +399,8 @@ app.innerHTML = `
       <header class="editor-header">
         <div>
           <p id="editor-kicker" class="section-kicker">添加接入</p>
-          <h2 id="editor-title">连接你的模型服务</h2>
-          <p>通常只需要 Base URL 和 API Key。</p>
+          <h2 id="editor-title">选择接入方式</h2>
+          <p id="editor-description">使用 OpenAI 官方账号，或连接兼容的 API 服务。</p>
         </div>
         <button id="close-editor" class="button button-icon" type="button" aria-label="关闭">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -378,7 +409,31 @@ app.innerHTML = `
         </button>
       </header>
 
-      <div class="editor-progress" aria-label="设置进度">
+      <div id="connection-type-step" class="connection-type-step">
+        <div class="connection-type-options" role="group" aria-label="接入方式">
+          <button id="choose-official-connection" class="connection-type-option" type="button">
+            <span class="connection-type-icon connection-type-icon-official" aria-hidden="true">O</span>
+            <span>
+              <strong>OpenAI 官方登录</strong>
+              <small>在浏览器中登录，由 Codex 管理账号</small>
+            </span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+          </button>
+          <button id="choose-api-connection" class="connection-type-option" type="button">
+            <span class="connection-type-icon connection-type-icon-api" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><circle cx="8" cy="12" r="3" /><path d="M11 12h9M17 9v6" /></svg>
+            </span>
+            <span>
+              <strong>API 接入</strong>
+              <small>填写 Base URL 和 API Key</small>
+            </span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+          </button>
+        </div>
+        <p>首次保存并使用 API 接入时，快速切换会自动开启。</p>
+      </div>
+
+      <div id="editor-progress" class="editor-progress" aria-label="设置进度" hidden>
         <div id="editor-step-connection" class="progress-step progress-step-active">
           <span>1</span>
           <strong>连接信息</strong>
@@ -390,7 +445,7 @@ app.innerHTML = `
         </div>
       </div>
 
-      <div class="editor-body">
+      <div id="api-editor-body" class="editor-body" hidden>
         <div class="connection-fields">
           <label>
             <span>接入名称 <small>可选</small></span>
@@ -491,10 +546,29 @@ required<HTMLButtonElement>("#add-connection").addEventListener("click", openEdi
 required<HTMLElement>("#official-profile").addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLButtonElement)) return;
+  if (target.dataset.officialAction === "login") void loginOfficialAccount();
+  if (target.dataset.officialAction === "relogin") void reloginOfficialAccount();
   if (target.dataset.officialAction === "activate") void activateOfficial();
-  if (target.dataset.officialAction === "save") void saveCurrentOfficial();
-  if (target.dataset.officialAction === "restart") void openCodex();
+  if (target.dataset.officialAction === "logout") void logoutOfficialAccount();
 });
+required<HTMLButtonElement>("#choose-official-connection").addEventListener("click", async () => {
+  await closeEditor();
+  if (codexAccountAvailable && codexAccount.authMode === "chatgpt") {
+    const proxyIsActive =
+      localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
+    if (isOfficialActive(proxyIsActive)) {
+      setStatus("当前已使用这个 OpenAI 官方账号。", "success");
+      return;
+    }
+    await activateOfficial();
+    return;
+  }
+  await loginOfficialAccount();
+});
+required<HTMLButtonElement>("#choose-api-connection").addEventListener(
+  "click",
+  showApiConnectionEditor,
+);
 required<HTMLButtonElement>("#close-editor").addEventListener("click", closeEditor);
 required<HTMLButtonElement>("#fetch-models").addEventListener("click", fetchAvailableModels);
 required<HTMLButtonElement>("#toggle-key").addEventListener("click", toggleKeyVisibility);
@@ -556,9 +630,22 @@ function showRequestedBrowserPreview(): void {
   }
   if (preview === "editor") {
     openEditor();
+    showApiConnectionEditor();
     input("#connection-name").value = "Studio API";
     input("#base-url").value = "https://gateway.example.com/v1";
     input("#api-key").value = "demo-key";
+    return;
+  }
+  if (preview === "connection-type") {
+    openEditor();
+    return;
+  }
+  if (preview === "access-token-conflict") {
+    codexAccount = {
+      ...browserAccountPreview,
+      codexAccessTokenEnvironmentPresent: true,
+    };
+    renderDashboard();
   }
 }
 
@@ -581,7 +668,8 @@ function setAdvancedSettingsVisible(visible: boolean): void {
   pageTitle.textContent = advancedActive ? "高级设置" : "模型切换";
   pageDescription.textContent = advancedActive
     ? "切换工作方式，查看服务状态或安全恢复设置。"
-    : "选择接入和模型，下一轮对话即可使用。";
+    : "";
+  pageDescription.hidden = !advancedActive;
   required<HTMLElement>(".content-scroll").scrollTo({
     top: 0,
     behavior: "smooth",
@@ -595,6 +683,7 @@ async function refreshDashboard(): Promise<void> {
     return;
   }
   await run("正在读取当前状态…", async () => {
+    await refreshCodexAccountStatus();
     dashboard = await invoke<DashboardState>("inspect_state");
     await refreshProxyStatus();
     renderDashboard();
@@ -606,6 +695,9 @@ async function refreshDashboard(): Promise<void> {
     }
     if (dashboard.officialProfileWarning) {
       return "保存的官方配置暂时无法读取；原有内容没有被覆盖。";
+    }
+    if (!codexAccountAvailable) {
+      return "已读取当前设置，但暂时无法确认 Codex 官方账号状态。";
     }
     if (!proxyApiAvailable) {
       return "已读取当前设置。快速切换暂不可用，可从高级设置使用兼容配置。";
@@ -625,11 +717,22 @@ function renderDashboard(): void {
   const proxyIsActive =
     localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
   const officialIsActive = isOfficialActive(proxyIsActive);
+  const builtInOpenAiRoute = isBuiltInOpenAiRoute(proxyIsActive);
+  const accountUsesApiKey =
+    builtInOpenAiRoute && codexAccountAvailable && codexAccount.authMode === "apiKey";
+  const accessTokenEnvironmentConflict =
+    builtInOpenAiRoute &&
+    codexAccountAvailable &&
+    codexAccount.codexAccessTokenEnvironmentPresent;
   const currentConnection = proxyIsActive
     ? (proxyProfile?.display_name ?? "已保存的接入")
     : officialIsActive
       ? (dashboard.officialProfile?.displayName ?? "OpenAI 官方账号")
-      : dashboard.current.providerName;
+      : accountUsesApiKey
+        ? "OpenAI API Key"
+        : accessTokenEnvironmentConflict
+          ? "Codex 外部访问令牌"
+        : dashboard.current.providerName;
   const currentModel = proxyIsActive
     ? (localProxy.currentModelId ?? "自动选择")
     : (dashboard.current.modelId ?? "自动选择");
@@ -638,7 +741,9 @@ function renderDashboard(): void {
     : (dashboard.current.baseUrl ?? "OpenAI 官方服务");
   const currentAuth = proxyIsActive
     ? "系统密钥库 · 本机转发"
-    : authLabel(dashboard.current.authKind);
+    : builtInOpenAiRoute
+      ? codexAccountAuthLabel()
+      : authLabel(dashboard.current.authKind);
   const currentKicker = required<HTMLElement>("#current-kicker");
   const currentTitle = required<HTMLElement>("#current-title");
   const currentBadge = required<HTMLElement>("#current-badge");
@@ -658,6 +763,12 @@ function renderDashboard(): void {
   } else if (officialIsActive) {
     currentBadge.textContent = "官方账号";
     currentBadge.className = "badge badge-official";
+  } else if (accessTokenEnvironmentConflict) {
+    currentBadge.textContent = "环境冲突";
+    currentBadge.className = "badge badge-warning";
+  } else if (accountUsesApiKey) {
+    currentBadge.textContent = "OpenAI API Key";
+    currentBadge.className = "badge badge-neutral";
   } else {
     currentBadge.textContent = dashboard.configExists ? "直接配置" : "默认设置";
     currentBadge.className = "badge badge-neutral";
@@ -693,8 +804,11 @@ function renderOfficialProfile(): void {
   const badge = required<HTMLElement>("#official-badge");
   const proxyIsActive =
     localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
+  const builtInRoute = isBuiltInOpenAiRoute(proxyIsActive);
   const current = isOfficialActive(proxyIsActive);
-  const saved = dashboard.officialProfile;
+  const loggedIn = codexAccountAvailable && codexAccount.authMode === "chatgpt";
+  const accessTokenEnvironmentConflict =
+    codexAccountAvailable && codexAccount.codexAccessTokenEnvironmentPresent;
   const blocked =
     busy ||
     dashboard.recoveryWarnings > 0 ||
@@ -704,38 +818,65 @@ function renderOfficialProfile(): void {
   if (dashboard.officialProfileWarning) {
     badge.textContent = "需检查";
     badge.className = "badge badge-warning";
+  } else if (!codexAccountAvailable) {
+    badge.textContent = "状态不可用";
+    badge.className = "badge badge-warning";
+  } else if (accessTokenEnvironmentConflict) {
+    badge.textContent = "环境冲突";
+    badge.className = "badge badge-warning";
   } else if (current) {
     badge.textContent = "当前使用";
     badge.className = "badge badge-official";
-  } else if (saved) {
-    badge.textContent = "已保存";
+  } else if (loggedIn) {
+    badge.textContent = "已登录";
+    badge.className = "badge badge-neutral";
+  } else if (codexAccount.authMode === "apiKey") {
+    badge.textContent = "OpenAI API Key";
     badge.className = "badge badge-neutral";
   } else {
-    badge.textContent = "未保存";
+    badge.textContent = codexAccount.authMode === "none" ? "未登录" : "其他认证";
     badge.className = "badge badge-neutral";
   }
 
-  const savedModel = saved?.modelId ?? "由 Codex 自动选择";
-  const savedName = saved?.displayName ?? "OpenAI 官方账号";
-  const mainAction = saved ? `切换到 ${savedName}` : "切换到官方登录";
-  const explanation = current
-    ? "当前已使用 Codex 内置 OpenAI 接入。完成登录并选好模型后，可保存这份无凭据配置。"
-    : saved
-      ? `已保存账号配置：${savedName}；模型：${savedModel}。切换后需要重新打开 Codex。`
-      : "先切换到 Codex 内置 OpenAI 接入，重新打开 Codex 并按提示登录；随后返回保存当前配置。";
-  const nameEditor = current
+  const explanation = officialAccountExplanation(current);
+  const email = loggedIn
+    ? (codexAccount.email ?? dashboard.officialProfile?.email ?? "Codex 未返回邮箱")
+    : "登录后显示";
+  const plan = loggedIn
+    ? formatPlanType(codexAccount.planType ?? dashboard.officialProfile?.planType)
+    : codexAccount.authMode === "apiKey"
+      ? "OpenAI API Key"
+      : "登录后显示";
+  const accountMetadata = loggedIn
     ? `
-      <label class="official-name-field">
-        <span>配置名称</span>
-        <input
-          id="official-profile-name"
-          maxlength="80"
-          autocomplete="off"
-          value="${escapeHtml(savedName)}"
-          placeholder="例如：个人 Plus 或工作账号"
-        />
-        <small class="field-help">用于区分这份官方登录配置。本软件不会读取邮箱、用户名或 OAuth 令牌。</small>
-      </label>
+      <dl class="official-account-meta">
+        <div>
+          <dt>账号邮箱</dt>
+          <dd>${escapeHtml(email)}</dd>
+        </div>
+        <div>
+          <dt>订阅</dt>
+          <dd>${escapeHtml(plan)}</dd>
+        </div>
+      </dl>
+    `
+    : "";
+  const accountActions = !loggedIn
+    ? `<button class="button button-primary" data-official-action="login" type="button" ${blocked || dashboard.officialProfileWarning ? "disabled" : ""}>登录 OpenAI</button>`
+    : !builtInRoute
+      ? `
+        <button class="button button-primary" data-official-action="activate" type="button" ${blocked || dashboard.officialProfileWarning ? "disabled" : ""}>使用此账号</button>
+        <button class="button button-secondary" data-official-action="relogin" type="button" ${blocked ? "disabled" : ""}>登录其他账号</button>
+      `
+      : `
+        <button class="button button-secondary" data-official-action="relogin" type="button" ${blocked ? "disabled" : ""}>重新登录</button>
+        <button class="button button-quiet danger-text" data-official-action="logout" type="button" ${blocked ? "disabled" : ""}>退出账号</button>
+      `;
+  const environmentWarning = codexAccount.codexAccessTokenEnvironmentPresent
+    ? `
+      <p class="official-account-warning">
+        检测到 CODEX_ACCESS_TOKEN。若 Codex 从同一环境启动，该外部访问令牌会优先于已保存的 ChatGPT 登录；清除后请完整退出并重新打开本软件和 Codex。
+      </p>
     `
     : "";
 
@@ -743,24 +884,30 @@ function renderOfficialProfile(): void {
     <div class="official-main">
       <div class="official-copy">
         <p>${escapeHtml(explanation)}</p>
-        <span>官方账号与 API 接入互换后需要重启 Codex；API 接入之间仍可快速切换。</span>
       </div>
-      ${nameEditor}
+      ${accountMetadata}
+      ${environmentWarning}
     </div>
     <div class="official-actions">
-      <button class="button button-primary" data-official-action="activate" type="button" ${current ? "hidden" : ""} ${blocked || dashboard.officialProfileWarning ? "disabled" : ""}>${mainAction}</button>
-      <button class="button button-secondary" data-official-action="save" type="button" ${!current || blocked ? "disabled" : ""}>${saved ? "更新官方配置" : "保存官方配置"}</button>
-      <button class="button button-quiet" data-official-action="restart" type="button" ${!current || blocked ? "disabled" : ""}>重新打开 Codex</button>
+      ${accountActions}
     </div>
   `;
 }
 
 function isOfficialActive(proxyIsActive = false): boolean {
   return (
+    isBuiltInOpenAiRoute(proxyIsActive) &&
+    codexAccountAvailable &&
+    codexAccount.authMode === "chatgpt" &&
+    !codexAccount.codexAccessTokenEnvironmentPresent
+  );
+}
+
+function isBuiltInOpenAiRoute(proxyIsActive = false): boolean {
+  return (
     !proxyIsActive &&
     dashboard.current.providerId === "openai" &&
-    dashboard.current.baseUrl === null &&
-    dashboard.current.authKind === "officialLogin"
+    dashboard.current.baseUrl === null
   );
 }
 
@@ -800,7 +947,7 @@ function renderSwitchExperience(): void {
     health.querySelector("strong")!.textContent = "需要重新开启";
   } else {
     health.classList.add("proxy-health-muted");
-    health.querySelector("strong")!.textContent = "尚未开启";
+    health.querySelector("strong")!.textContent = "待首次使用";
   }
 
   if (manualRecoveryBlocked) {
@@ -843,9 +990,9 @@ function renderSwitchExperience(): void {
     saveAndSwitch.textContent = "保存并重新开启";
     openCodexButton.hidden = true;
   } else {
-    summaryTitle.textContent = "快速切换尚未开启";
-    summaryCopy.textContent = "选择一个接入和模型即可开启。";
-    connectionsHelp.textContent = "选择接入和模型，应用会自动配置代理服务。";
+    summaryTitle.textContent = "快速切换将在首次使用时开启";
+    summaryCopy.textContent = "首次保存并使用 API 接入时，应用会自动启用本机代理。";
+    connectionsHelp.textContent = "添加或选择 API 接入和模型，快速切换会自动开启。";
     saveAndSwitch.textContent = "保存并使用";
     openCodexButton.hidden = true;
   }
@@ -961,51 +1108,110 @@ function renderProfiles(): void {
 }
 
 async function activateOfficial(): Promise<void> {
-  if (dashboard.recoveryWarnings > 0 || localProxy.manualRecoveryRequired) {
+  if (
+    dashboard.recoveryWarnings > 0 ||
+    dashboard.officialProfileWarning ||
+    localProxy.manualRecoveryRequired
+  ) {
     setStatus("配置或恢复记录需要人工处理；应用不会在修复前写入 Codex 配置。", "error");
     return;
   }
-  await run("正在切换到 OpenAI 官方账号…", async () => {
+  await run("正在切换到 OpenAI 官方路由…", async () => {
     if (!nativeAvailable) throw new Error("请通过桌面应用切换官方账号配置。");
-    if (localProxy.enabled || localProxy.recoveryRequired) {
-      localProxy = await invokeProxyCommand("disable_proxy");
-      if (localProxy.enabled || localProxy.running || localProxy.recoveryRequired) {
-        throw new Error("快速切换尚未安全关闭，官方配置没有继续写入。");
-      }
+    try {
+      await detachLocalProxyForOfficial();
+      await invoke(
+        dashboard.officialProfile ? "activate_official_profile" : "prepare_official_login",
+      );
+    } finally {
+      await refreshOfficialState();
     }
-    await invoke(
-      dashboard.officialProfile ? "activate_official_profile" : "prepare_official_login",
-    );
-    dashboard = await invoke<DashboardState>("inspect_state");
-    await refreshProxyStatus();
-    renderDashboard();
+    if (codexAccount.codexAccessTokenEnvironmentPresent) {
+      throw new Error(
+        "官方账号已登录，但检测到 CODEX_ACCESS_TOKEN。若 Codex 从同一环境启动，该外部访问令牌会优先于已保存的登录；请清除后完全退出并重新打开本软件和 Codex。",
+      );
+    }
     if (!isOfficialActive(false)) {
-      throw new Error("官方配置已写入，但 Codex 路由被其他程序立即改变。");
+      throw new Error("官方路由已写入，但账号状态或 Codex 路由未能确认。");
     }
-    return dashboard.officialProfile
-      ? `已切换到 ${dashboard.officialProfile.displayName}。请完全退出并重新打开 Codex。`
-      : "已准备 OpenAI 官方登录。请重新打开 Codex，按提示登录；登录后返回保存当前官方配置。";
+    return "已切换到 OpenAI 官方账号。请完全退出并重新打开 Codex。";
   });
 }
 
-async function saveCurrentOfficial(): Promise<void> {
-  const displayName = required<HTMLInputElement>("#official-profile-name").value.trim();
-  if (!displayName) {
-    setStatus("请先填写官方配置名称。", "error");
-    required<HTMLInputElement>("#official-profile-name").focus();
+async function loginOfficialAccount(): Promise<void> {
+  if (
+    dashboard.recoveryWarnings > 0 ||
+    dashboard.officialProfileWarning ||
+    localProxy.manualRecoveryRequired
+  ) {
+    setStatus("配置或恢复记录需要人工处理；应用不会在修复前开始登录。", "error");
     return;
   }
-  await run("正在保存当前官方配置…", async () => {
-    if (!nativeAvailable) throw new Error("请通过桌面应用保存官方配置。");
-    const saved = await invoke<OfficialProfile>("save_current_official_profile", {
-      displayName,
-    });
-    dashboard = await invoke<DashboardState>("inspect_state");
-    renderDashboard();
-    return saved.modelId
-      ? `已保存 ${saved.displayName}，当前模型为 ${saved.modelId}。账号令牌仍由 Codex 管理。`
-      : `已保存 ${saved.displayName}，模型由 Codex 自动选择。账号令牌仍由 Codex 管理。`;
+  await run("等待在浏览器中完成 OpenAI 登录…", async () => {
+    if (!nativeAvailable) throw new Error("请通过桌面应用登录 OpenAI 官方账号。");
+    try {
+      await detachLocalProxyForOfficial();
+      await invoke("prepare_official_login");
+      await invoke<CodexAccountStatus>("login_official_account");
+    } finally {
+      await refreshOfficialState();
+    }
+    if (codexAccount.codexAccessTokenEnvironmentPresent) {
+      throw new Error(
+        "官方账号登录已保存，但检测到 CODEX_ACCESS_TOKEN。若 Codex 从同一环境启动，该外部访问令牌会优先于已保存的登录；请清除后完全退出并重新打开本软件和 Codex。",
+      );
+    }
+    if (!isOfficialActive(false)) {
+      throw new Error("登录已完成，但账号状态或 OpenAI 官方路由未能确认。");
+    }
+    const identity = codexAccount.email ?? "OpenAI 官方账号";
+    return `已登录 ${identity}（${formatPlanType(codexAccount.planType)}）。请重新打开 Codex。`;
   });
+}
+
+async function reloginOfficialAccount(): Promise<void> {
+  const currentIdentity =
+    codexAccount.email ?? dashboard.officialProfile?.email ?? "当前官方账号";
+  if (
+    !window.confirm(
+      `重新登录会替换 Codex 当前的 ${currentIdentity} 登录。Switcher 无法恢复旧账号；是否继续？`,
+    )
+  ) {
+    return;
+  }
+  await loginOfficialAccount();
+}
+
+async function logoutOfficialAccount(): Promise<void> {
+  if (
+    !window.confirm(
+      "退出 Codex 当前官方账号，并移除本软件保存的邮箱和订阅信息？",
+    )
+  ) {
+    return;
+  }
+  await run("正在退出 OpenAI 官方账号…", async () => {
+    if (!nativeAvailable) throw new Error("请通过桌面应用退出 OpenAI 官方账号。");
+    try {
+      await invoke<CodexAccountStatus>("logout_official_account");
+    } finally {
+      await refreshOfficialState();
+    }
+    if (codexAccount.authMode !== "none" || dashboard.officialProfile) {
+      throw new Error("退出已执行，但账号状态或本地账号信息未能确认。");
+    }
+    return codexAccount.codexAccessTokenEnvironmentPresent
+      ? "已退出已保存的 ChatGPT 登录并移除本地账号信息。启动环境仍有 Codex 外部访问令牌，请清除后重新打开本软件和 Codex。"
+      : "已退出官方账号并移除本地账号信息。请完全退出并重新打开 Codex。";
+  });
+}
+
+async function detachLocalProxyForOfficial(): Promise<void> {
+  if (!localProxy.enabled && !localProxy.recoveryRequired) return;
+  localProxy = await invokeProxyCommand("disable_proxy");
+  if (localProxy.enabled || localProxy.running || localProxy.recoveryRequired) {
+    throw new Error("快速切换尚未安全关闭，官方账号操作没有继续。");
+  }
 }
 
 function selectSwitchMode(mode: SwitchMode): void {
@@ -1045,7 +1251,9 @@ function openEditor(): void {
   input("#manual-model").value = "";
   required<HTMLElement>("#model-step").hidden = true;
   required<HTMLElement>("#editor-kicker").textContent = "添加接入";
-  required<HTMLElement>("#editor-title").textContent = "连接你的模型服务";
+  required<HTMLElement>("#editor-title").textContent = "选择接入方式";
+  required<HTMLElement>("#editor-description").textContent =
+    "使用 OpenAI 官方账号，或连接兼容的 API 服务。";
   required<HTMLInputElement>("#api-key").placeholder = "输入 API Key";
   required<HTMLElement>("#api-key-help").textContent =
     "Key 只会保存在这台电脑的系统密钥库中。";
@@ -1053,9 +1261,25 @@ function openEditor(): void {
   required<HTMLButtonElement>("#save-only").textContent = "仅保存";
   required<HTMLButtonElement>("#save-and-switch").textContent = "保存并使用";
   setEditorStep(1);
+  setConnectionEditorView("choice");
   const editor = required<HTMLDialogElement>("#editor");
   if (!editor.open) editor.showModal();
+  required<HTMLButtonElement>("#choose-official-connection").focus();
+}
+
+function showApiConnectionEditor(): void {
+  setConnectionEditorView("api");
+  required<HTMLElement>("#editor-title").textContent = "连接你的模型服务";
+  required<HTMLElement>("#editor-description").textContent =
+    "填写 Base URL 和 API Key，然后选择需要的模型。";
   required<HTMLInputElement>("#connection-name").focus();
+}
+
+function setConnectionEditorView(view: "choice" | "api"): void {
+  const showChoice = view === "choice";
+  required<HTMLElement>("#connection-type-step").hidden = !showChoice;
+  required<HTMLElement>("#editor-progress").hidden = showChoice;
+  required<HTMLElement>("#api-editor-body").hidden = showChoice;
 }
 
 async function openProfileEditor(
@@ -1090,6 +1314,9 @@ async function openProfileEditor(
   input("#model-search").value = "";
   input("#manual-model").value = "";
   required<HTMLElement>("#model-step").hidden = false;
+  setConnectionEditorView("api");
+  required<HTMLElement>("#editor-description").textContent =
+    "更新接入信息、API Key 或可用模型。";
   setEditorStep(2);
   const editor = required<HTMLDialogElement>("#editor");
   if (!editor.open) editor.showModal();
@@ -1162,6 +1389,7 @@ async function closeEditor(): Promise<void> {
   required<HTMLButtonElement>("#toggle-key").textContent = "显示";
   input("#model-search").value = "";
   input("#manual-model").value = "";
+  setConnectionEditorView("choice");
 }
 
 async function fetchAvailableModels(): Promise<void> {
@@ -1538,6 +1766,27 @@ async function refreshProxyStatus(): Promise<void> {
   }
 }
 
+async function refreshCodexAccountStatus(): Promise<void> {
+  try {
+    codexAccount = await invoke<CodexAccountStatus>("codex_account_status");
+    codexAccountAvailable = true;
+  } catch {
+    codexAccount = unavailableAccountStatus;
+    codexAccountAvailable = false;
+  }
+}
+
+async function refreshOfficialState(): Promise<void> {
+  await refreshCodexAccountStatus();
+  try {
+    dashboard = await invoke<DashboardState>("inspect_state");
+  } catch {
+    // Preserve the last readable dashboard while still refreshing account/proxy state.
+  }
+  await refreshProxyStatus();
+  renderDashboard();
+}
+
 async function invokeProxyCommand(
   command: "enable_proxy" | "switch_proxy_route" | "disable_proxy",
   args?: { profileId: string; selectedModel: string },
@@ -1734,6 +1983,58 @@ function normalizedEndpoint(baseUrl: string | null): string {
   return (baseUrl ?? "").trim().replace(/\/+$/u, "");
 }
 
+function officialAccountExplanation(current: boolean): string {
+  if (!codexAccountAvailable) {
+    return "暂时无法确认 Codex 账号状态。可以刷新状态，或重新发起官方登录。";
+  }
+  if (codexAccount.codexAccessTokenEnvironmentPresent) {
+    return codexAccount.authMode === "chatgpt"
+      ? "官方账号登录已保存，但启动环境中存在 Codex 外部访问令牌。"
+      : "检测到 Codex 外部访问令牌。清除后再登录 OpenAI 官方账号。";
+  }
+  if (codexAccount.authMode === "apiKey") {
+    return "Codex 当前使用 OpenAI API Key。登录官方账号后会改用 ChatGPT 账号认证。";
+  }
+  if (codexAccount.authMode === "other") {
+    return "Codex 当前使用其他认证方式。可重新登录 OpenAI 官方账号。";
+  }
+  if (codexAccount.authMode === "none") {
+    return "尚未登录 OpenAI 官方账号。登录将在浏览器中完成。";
+  }
+  return current
+    ? "OpenAI 官方账号已登录，Codex 当前使用内置 OpenAI 路由。"
+    : "OpenAI 官方账号已登录；切换官方路由并重新打开 Codex 后使用。";
+}
+
+function formatPlanType(planType: string | null | undefined): string {
+  if (!planType) return "Codex 未返回套餐";
+  const knownPlans: Record<string, string> = {
+    free: "Free",
+    plus: "Plus",
+    pro: "Pro",
+    team: "Team",
+    business: "Business",
+    enterprise: "Enterprise",
+    edu: "Edu",
+  };
+  return knownPlans[planType.toLocaleLowerCase()] ?? planType;
+}
+
+function codexAccountAuthLabel(): string {
+  if (!codexAccountAvailable) return "Codex 账号状态不可用";
+  if (codexAccount.codexAccessTokenEnvironmentPresent) {
+    return "Codex 外部访问令牌";
+  }
+  return (
+    {
+      none: "尚未登录",
+      apiKey: "OpenAI API Key",
+      chatgpt: "ChatGPT 官方登录",
+      other: "其他 Codex 认证",
+    } satisfies Record<CodexAuthMode, string>
+  )[codexAccount.authMode];
+}
+
 function authLabel(kind: AuthKind): string {
   return (
     {
@@ -1878,7 +2179,7 @@ function friendlyError(error: unknown): string {
     message.includes("built-in OpenAI login") ||
     message.includes("official configuration before activating")
   ) {
-    return "请先切换到 Codex 官方登录并重新打开 Codex；完成登录后再保存当前官方配置。";
+    return "请先切换到 OpenAI 官方路由并完成登录；账号信息会在登录后自动保存。";
   }
   if (message.includes("official configuration")) {
     return "官方配置无法安全读取或保存；原有 Codex 登录凭据没有被修改。";
