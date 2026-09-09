@@ -1,0 +1,24 @@
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor / local
+.idea/
+.vscode/
+*.swp
+*.tmp
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python / Node caches
+__pycache__/
+.venv/
+node_modules/
+dist/
+build/
