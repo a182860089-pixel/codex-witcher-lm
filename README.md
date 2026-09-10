@@ -1,12 +1,16 @@
-# Codex Witcher LM
+# LM Codex Switch 预览
 
-本地 Codex 工作区 `codex_witcher_lm` 的 GitHub 远程仓库。
+独立热更新前端，不改已安装的 Codex Provider Switcher 桌面端。
 
-## 当前状态
+## 启动
 
-- 仓库已完成初始化提交，并连接到 GitHub 远程。
-- 项目源码尚未迁入；后续文件将在此目录继续迭代。
+```powershell
+cd C:\Users\Lenovo\Documents\ChatGPT\codex_witcher_lm
+pnpm install
+pnpm dev
+```
 
-## 本地目录
+浏览器打开 http://127.0.0.1:5174
 
-`C:\Users\Lenovo\Documents\ChatGPT\codex_witcher_lm`
+- 5173 已停用，避免和其它 Vite 项目抢端口
+- 已安装 exe 仍在 `E:\Codex Provider Switcher\codex-provider-switcher.exe`
