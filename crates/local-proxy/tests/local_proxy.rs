@@ -301,7 +301,11 @@ async fn marker_provider(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(body["model"].as_str().unwrap().to_string());
-    Json(json!({"provider": state.marker})).into_response()
+    Json(json!({
+        "provider": state.marker,
+        "id": format!("resp_{}_conversation", state.marker)
+    }))
+    .into_response()
 }
 
 async fn marker_server(marker: &'static str) -> (TestServer, Arc<MarkerState>) {
@@ -510,6 +514,68 @@ async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
     assert_eq!(state_b.requests.load(Ordering::Acquire), 1);
     second.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(bindings_path.parent().expect("temp parent"));
+}
+
+#[tokio::test]
+async fn previous_response_id_keeps_existing_chats_on_the_old_route() {
+    let (upstream_a, state_a) = marker_server("a").await;
+    let (upstream_b, state_b) = marker_server("b").await;
+    let proxy = proxy_with_route(route(
+        &upstream_a,
+        "route-a",
+        "model-a",
+        vec![model("model-a")],
+    ))
+    .await;
+    let client = no_redirect_client();
+    let first: Value = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({ "model": "model-a" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["provider"], "a");
+    let response_id = first["id"].as_str().expect("response id").to_string();
+
+    proxy.set_active_route(route(
+        &upstream_b,
+        "route-b",
+        "model-b",
+        vec![model("model-b")],
+    ));
+
+    let continued: Value = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-b",
+            "previous_response_id": response_id
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fresh: Value = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({ "model": "model-b" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(continued["provider"], "a");
+    assert_eq!(fresh["provider"], "b");
+    assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
+    assert_eq!(state_b.requests.load(Ordering::Acquire), 1);
+    proxy.shutdown().await.unwrap();
 }
 
 async fn sse_provider() -> Response {

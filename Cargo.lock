@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-core"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "fs4",
  "futures-util",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-credentials"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "keyring",
  "keyring-core",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-desktop"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "codex-provider-switcher-core",
  "codex-provider-switcher-credentials",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-launcher"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "libc",
  "url",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "codex-provider-switcher-local-proxy"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "arc-swap",
  "axum",

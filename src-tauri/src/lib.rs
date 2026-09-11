@@ -2465,6 +2465,9 @@ fn remember_saved_proxy_routes(paths: &AppPaths, handle: &ProxyHandle) {
     for binding in bindings.threads {
         keys.push((binding.route_id, binding.selected_model));
     }
+    for binding in bindings.conversations {
+        keys.push((binding.route_id, binding.selected_model));
+    }
     keys.sort();
     keys.dedup();
     for (profile_id, model_id) in keys {
