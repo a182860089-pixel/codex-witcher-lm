@@ -469,9 +469,11 @@ pub fn verify_credential_binding(
         .ok_or_else(|| {
             SwitcherError::Validation("model provider configuration is missing".to_string())
         })?;
-    let helper_parent = credential_helper.parent().ok_or_else(|| {
-        SwitcherError::Validation("credential helper path has no parent".to_string())
-    })?;
+    if credential_helper.parent().is_none() {
+        return Err(SwitcherError::Validation(
+            "credential helper path has no parent".to_string(),
+        ));
+    }
     let expected_args = ["credential", "get", account];
     let mut matches = 0_usize;
 
@@ -493,14 +495,14 @@ pub fn verify_credential_binding(
         let Some(auth) = provider.get("auth").and_then(|item| item.as_table()) else {
             continue;
         };
-        let command_matches = auth
-            .get("command")
-            .and_then(|item| item.as_str())
-            .is_some_and(|command| paths_equivalent(Path::new(command), credential_helper));
-        let cwd_matches = auth
-            .get("cwd")
-            .and_then(|item| item.as_str())
-            .is_some_and(|cwd| paths_equivalent(Path::new(cwd), helper_parent));
+        let configured_command = auth.get("command").and_then(|item| item.as_str());
+        let command_matches = configured_command
+            .is_some_and(|command| helpers_accept(credential_helper, Path::new(command)));
+        let cwd_matches = auth.get("cwd").and_then(|item| item.as_str()).is_some_and(|cwd| {
+            configured_command
+                .and_then(|command| Path::new(command).parent())
+                .is_some_and(|parent| paths_equivalent(Path::new(cwd), parent))
+        });
         let args_match = auth
             .get("args")
             .and_then(|item| item.as_array())
@@ -552,6 +554,45 @@ fn path_as_utf8(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| SwitcherError::Validation("path is not valid UTF-8".to_string()))
+}
+
+fn credential_helper_file_name() -> &'static str {
+    if cfg!(windows) {
+        "codex-provider-switcher-helper.exe"
+    } else {
+        "codex-provider-switcher-helper"
+    }
+}
+
+fn is_managed_helper_dir_name(name: &str) -> bool {
+    name == "current"
+        || (name.len() == 64 && name.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn managed_helper_family_root(path: &Path) -> Option<&Path> {
+    let file_name = path.file_name()?.to_str()?;
+    if file_name != credential_helper_file_name() {
+        return None;
+    }
+    let dir = path.parent()?;
+    if !is_managed_helper_dir_name(dir.file_name()?.to_str()?) {
+        return None;
+    }
+    let root = dir.parent()?;
+    (root.file_name()?.to_str()? == "helpers").then_some(root)
+}
+
+fn helpers_accept(running: &Path, configured: &Path) -> bool {
+    if paths_equivalent(running, configured) {
+        return true;
+    }
+    match (
+        managed_helper_family_root(running),
+        managed_helper_family_root(configured),
+    ) {
+        (Some(left), Some(right)) => paths_equivalent(left, right),
+        _ => false,
+    }
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -952,6 +993,35 @@ base_url = "https://vendor.example/v1"
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn credential_binding_accepts_sibling_managed_helpers_after_upgrade() {
+        let helper_name = credential_helper_file_name();
+        let old_helper = absolute_test_path("helpers")
+            .join("52264bf101336cd4ea6dd25af9e8032327ebcc5b560700f8fcdd7013b744b57d")
+            .join(helper_name);
+        let new_helper = absolute_test_path("helpers")
+            .join("cd33abd35c615322db545dd6b5407e45c848d5947875be1751dbde0a3cbab518")
+            .join(helper_name);
+        let catalog = absolute_test_path("models.json");
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan = plan_proxy_config(
+            "",
+            &profile(),
+            "acme/code",
+            &catalog,
+            &new_helper,
+            base_url,
+        )
+        .unwrap();
+        let account = proxy_credential_account_for(base_url).unwrap();
+        verify_credential_binding(&plan.rendered_config, &account, &old_helper).unwrap();
+        verify_credential_binding(&plan.rendered_config, &account, &new_helper).unwrap();
+        let outsider = absolute_test_path("other-helpers")
+            .join("52264bf101336cd4ea6dd25af9e8032327ebcc5b560700f8fcdd7013b744b57d")
+            .join(helper_name);
+        assert!(verify_credential_binding(&plan.rendered_config, &account, &outsider).is_err());
     }
 
     #[cfg(windows)]

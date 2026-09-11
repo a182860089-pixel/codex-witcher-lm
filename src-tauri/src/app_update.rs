@@ -1,3 +1,8 @@
+use std::fs::File;
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -11,6 +16,9 @@ use url::Url;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_INSTALLER_BYTES: u64 = 80 * 1024 * 1024;
 const RELEASE_HOST: &str = "github.com";
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +337,260 @@ fn open_https_url(url: &str) -> Result<(), String> {
         .map_err(|_| "could not open the update page".to_string())
 }
 
+pub async fn download_and_launch_installer(
+    url: &str,
+    asset_name: Option<&str>,
+) -> Result<(), String> {
+    let download_url = validate_download_url(url)?;
+    let named = match asset_name {
+        Some(name) => Some(sanitize_asset_name(name)?),
+        None => None,
+    };
+    let url_name = url_asset_name(&download_url)?;
+    let asset = match named {
+        Some(name) if name != url_name => {
+            return Err("update asset name does not match the download URL".to_string());
+        }
+        Some(name) => name,
+        None => url_name,
+    };
+    let installer_path = download_installer(&download_url, &asset).await?;
+    launch_installer_after_exit(&installer_path)
+}
+
+fn validate_download_url(value: &str) -> Result<String, String> {
+    let parsed = Url::parse(value.trim()).map_err(|_| "update URL is invalid".to_string())?;
+    let download_prefix = format!("{}download/", release_path_prefix());
+    if parsed.scheme() != "https"
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.host_str() != Some(RELEASE_HOST)
+        || !parsed.path().starts_with(download_prefix.as_str())
+    {
+        return Err("update URL is not an allowed GitHub installer link".to_string());
+    }
+    Ok(parsed.as_str().to_string())
+}
+
+fn allowed_redirect_url(url: &Url) -> bool {
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return false;
+    }
+    match url.host_str() {
+        Some("github.com") => url.path().starts_with(release_path_prefix().as_str()),
+        Some(host) => {
+            host.ends_with(".githubusercontent.com")
+                && !host.starts_with('.')
+                && host != ".githubusercontent.com"
+        }
+        None => false,
+    }
+}
+
+fn sanitize_asset_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name == "."
+        || name == ".."
+        || name.contains("..")
+    {
+        return Err("update asset name is invalid".to_string());
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err("update asset name is invalid".to_string());
+    }
+    let expected_ext = if cfg!(windows) {
+        ".exe"
+    } else if cfg!(target_os = "macos") {
+        ".dmg"
+    } else {
+        return Err("installing updates is unsupported on this platform".to_string());
+    };
+    if !name.ends_with(expected_ext) {
+        return Err("update asset type is not an installer for this platform".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn url_asset_name(url: &str) -> Result<String, String> {
+    let parsed = Url::parse(url).map_err(|_| "update URL is invalid".to_string())?;
+    let name = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "update URL is missing an installer file name".to_string())?;
+    sanitize_asset_name(name)
+}
+
+async fn download_installer(url: &str, asset_name: &str) -> Result<PathBuf, String> {
+    let redirect = Policy::custom(|attempt| {
+        if attempt.previous().len() >= 8 {
+            return attempt.error("too many redirects");
+        }
+        if allowed_redirect_url(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("update download redirected to a disallowed host")
+        }
+    });
+    let client = reqwest::Client::builder()
+        .redirect(redirect)
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout(DOWNLOAD_REQUEST_TIMEOUT)
+        .http1_only()
+        .tcp_nodelay(true)
+        .user_agent(format!("codex-provider-switcher/{}", current_version()))
+        .build()
+        .map_err(|_| "could not create the update client".to_string())?;
+    let response = client
+        .get(url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "update download timed out".to_string()
+            } else {
+                "could not download the installer".to_string()
+            }
+        })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "update download returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    if !allowed_redirect_url(response.url()) {
+        return Err("update download redirected to a disallowed host".to_string());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_INSTALLER_BYTES)
+    {
+        return Err("update installer is too large".to_string());
+    }
+    let path = std::env::temp_dir().join(format!(
+        "lm-codex-switch-update-{}-{}",
+        std::process::id(),
+        asset_name
+    ));
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    let mut file = File::create(&path).map_err(|_| "could not stage the installer".to_string())?;
+    let mut bytes = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "could not read the installer download".to_string())?;
+        bytes = bytes.saturating_add(chunk.len() as u64);
+        if bytes > MAX_INSTALLER_BYTES {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err("update installer is too large".to_string());
+        }
+        if file.write_all(&chunk).is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err("could not write the installer".to_string());
+        }
+    }
+    if file.sync_all().is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err("could not finalize the installer".to_string());
+    }
+    drop(file);
+    if let Err(error) = verify_installer_bytes(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn verify_installer_bytes(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|_| "could not read the installer".to_string())?;
+    if metadata.len() < 64 {
+        return Err("downloaded installer is empty or truncated".to_string());
+    }
+    let mut file = File::open(path).map_err(|_| "could not read the installer".to_string())?;
+    let mut magic = [0u8; 2];
+    file.read_exact(&mut magic)
+        .map_err(|_| "could not read the installer".to_string())?;
+    #[cfg(windows)]
+    {
+        if magic != *b"MZ" {
+            return Err("downloaded installer is not a Windows executable".to_string());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if magic[0] == b'<' {
+            return Err("downloaded installer is not a disk image".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn launch_installer_after_exit(path: &Path) -> Result<(), String> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "installer path is not valid UTF-8".to_string())?;
+    let pid = std::process::id();
+    let result = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            let escaped = path_str.replace('\'', "''");
+            let script = format!(
+                "while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}; Start-Process -FilePath '{escaped}'"
+            );
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let escaped = path_str.replace('\'', "'\\''");
+            let script = format!(
+                "while kill -0 {pid} 2>/dev/null; do sleep 0.25; done; open '{escaped}'"
+            );
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = (path_str, pid);
+            Err(std::io::Error::other("installing updates is unsupported"))
+        }
+    };
+    result
+        .map(|_| ())
+        .map_err(|_| "could not launch the installer".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +654,36 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn installer_download_urls_are_restricted_to_release_assets() {
+        let ok = format!(
+            "{}/releases/download/v0.3.7/Codex.Provider.Switcher_0.3.7_Windows-x64-Setup.exe",
+            github_release_base()
+        );
+        assert!(validate_download_url(&ok).is_ok());
+        assert!(
+            validate_download_url(&format!("{}/releases/tag/v0.3.7", github_release_base())).is_err()
+        );
+        assert!(validate_download_url("https://evil.example/releases/download/v0.3.7/a.exe").is_err());
+        assert!(allowed_redirect_url(
+            &Url::parse("https://release-assets.githubusercontent.com/objects/abc").unwrap()
+        ));
+        assert!(!allowed_redirect_url(
+            &Url::parse("https://evil.githubusercontent.com.example/objects/abc").unwrap()
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_installer_asset_names_are_sanitized() {
+        assert_eq!(
+            sanitize_asset_name("Codex.Provider.Switcher_0.3.7_Windows-x64-Setup.exe").unwrap(),
+            "Codex.Provider.Switcher_0.3.7_Windows-x64-Setup.exe"
+        );
+        assert!(sanitize_asset_name("../evil.exe").is_err());
+        assert!(sanitize_asset_name("payload.dll").is_err());
+        assert!(sanitize_asset_name("foo bar.exe").is_err());
     }
 }
