@@ -1,3 +1,4 @@
+use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
@@ -568,66 +569,279 @@ fn powershell_single_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn launch_installer_after_exit(path: &Path) -> Result<(), String> {
-    let path_str = path
+#[cfg(windows)]
+fn quote_for_cmd(path: &Path) -> Result<String, String> {
+    let value = path
         .to_str()
-        .ok_or_else(|| "installer path is not valid UTF-8".to_string())?;
-    let pid = std::process::id();
+        .ok_or_else(|| "update helper path is not valid UTF-8".to_string())?;
+    Ok(format!("\"{}\"", value.replace('"', "")))
+}
+
+#[cfg(windows)]
+fn nsis_update_arguments(install_dir: &str) -> String {
+    format!(
+        "/S /UPDATE /D={}",
+        install_dir.trim_end_matches(['\\', '/'])
+    )
+}
+
+#[cfg(windows)]
+fn windows_system_root() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+#[cfg(windows)]
+fn write_windows_update_script(
+    installer: &Path,
+    install_dir: &str,
+    relaunch: &str,
+    pid: u32,
+) -> Result<PathBuf, String> {
+    let script_path = std::env::temp_dir().join(format!("lm-codex-switch-update-{pid}.ps1"));
+    let installer = powershell_single_quoted(
+        installer
+            .to_str()
+            .ok_or_else(|| "installer path is not valid UTF-8".to_string())?,
+    );
+    let nsis_arguments = powershell_single_quoted(&nsis_update_arguments(install_dir));
+    let install_dir = powershell_single_quoted(install_dir.trim_end_matches(['\\', '/']));
+    let relaunch = powershell_single_quoted(relaunch);
+    let script = format!(
+        r#"$ErrorActionPreference = 'Continue'
+$log = Join-Path $env:TEMP 'lm-codex-switch-update.log'
+function Write-UpdateLog([string]$Message) {{
+  Add-Content -LiteralPath $log -Value (('{{0}} {{1}}' -f (Get-Date -Format o), $Message))
+}}
+Write-UpdateLog 'helper started'
+$pidToWait = {pid}
+$installer = {installer}
+$installDir = {install_dir}
+$relaunch = {relaunch}
+Write-UpdateLog ('waitPid=' + $pidToWait)
+Write-UpdateLog ('installer=' + $installer)
+Write-UpdateLog ('installDir=' + $installDir)
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {{
+  if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}
+  Start-Sleep -Milliseconds 250
+}}
+Write-UpdateLog 'pid exited'
+$deadline = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadline) {{
+  $running = @(Get-Process -Name 'codex-provider-switcher' -ErrorAction SilentlyContinue)
+  if ($running.Count -eq 0) {{ break }}
+  Start-Sleep -Milliseconds 250
+}}
+$leftover = @(Get-Process -Name 'codex-provider-switcher' -ErrorAction SilentlyContinue)
+if ($leftover.Count -gt 0) {{
+  Write-UpdateLog 'force stopping leftover processes'
+  $leftover | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 800
+}}
+Start-Sleep -Milliseconds 500
+if (Test-Path -LiteralPath $relaunch) {{
+  for ($i = 0; $i -lt 80; $i++) {{
+    try {{
+      $stream = [System.IO.File]::Open($relaunch, 'Open', 'ReadWrite', 'None')
+      $stream.Close()
+      Write-UpdateLog 'exe unlocked'
+      break
+    }} catch {{
+      Start-Sleep -Milliseconds 250
+    }}
+  }}
+}}
+if (-not (Test-Path -LiteralPath $installer)) {{
+  Write-UpdateLog 'installer missing'
+  exit 1
+}}
+Write-UpdateLog 'starting installer'
+try {{
+  $info = New-Object System.Diagnostics.ProcessStartInfo
+  $info.FileName = $installer
+  $info.Arguments = {nsis_arguments}
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  $proc = [System.Diagnostics.Process]::Start($info)
+  if (-not $proc) {{
+    Write-UpdateLog 'installer failed to start'
+    exit 1
+  }}
+  $proc.WaitForExit()
+  Write-UpdateLog ('installer exit=' + $proc.ExitCode)
+}} catch {{
+  Write-UpdateLog ('installer exception=' + $_.Exception.Message)
+  exit 1
+}}
+Start-Sleep -Milliseconds 800
+if (Test-Path -LiteralPath $relaunch) {{
+  Write-UpdateLog 'relaunching'
+  Start-Process -FilePath $relaunch
+}} else {{
+  $exe = Get-ChildItem -LiteralPath $installDir -Filter *.exe -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -notmatch '(?i)uninstall' }} | Select-Object -First 1
+  if ($exe) {{
+    Write-UpdateLog ('relaunching ' + $exe.FullName)
+    Start-Process -FilePath $exe.FullName
+  }} else {{
+    Write-UpdateLog 'relaunch path missing'
+  }}
+}}
+Write-UpdateLog 'helper done'
+"#
+    );
+    fs::write(&script_path, script).map_err(|_| "could not write the update helper".to_string())?;
+    Ok(script_path)
+}
+
+#[cfg(windows)]
+fn write_windows_wmi_launcher(helper_script: &Path, pid: u32) -> Result<PathBuf, String> {
+    let launcher_path =
+        std::env::temp_dir().join(format!("lm-codex-switch-update-launch-{pid}.ps1"));
+    let powershell = windows_system_root().join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let exe = powershell_single_quoted(
+        powershell
+            .to_str()
+            .ok_or_else(|| "powershell path is not valid UTF-8".to_string())?,
+    );
+    let file = powershell_single_quoted(
+        helper_script
+            .to_str()
+            .ok_or_else(|| "update helper path is not valid UTF-8".to_string())?,
+    );
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$exe = {exe}
+$file = {file}
+$cmd = '"' + $exe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $file + '"'
+$created = $false
+try {{
+  $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $cmd }}
+  if ($r -and $r.ReturnValue -eq 0) {{ $created = $true }}
+}} catch {{
+}}
+if (-not $created) {{
+  $r = ([wmiclass]'Win32_Process').Create($cmd)
+  if ($null -eq $r -or $r.ReturnValue -ne 0) {{
+    exit $(if ($r) {{ [int]$r.ReturnValue }} else {{ 1 }})
+  }}
+}}
+exit 0
+"#
+    );
+    fs::write(&launcher_path, script)
+        .map_err(|_| "could not write the update launcher".to_string())?;
+    Ok(launcher_path)
+}
+
+fn launch_installer_after_exit(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
+    {
+        return launch_windows_installer_after_exit(path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| "installer path is not valid UTF-8".to_string())?;
+        let escaped = path_str.replace('\'', "'\\''");
+        let pid = std::process::id();
+        let script = format!(
+            "while kill -0 {pid} 2>/dev/null; do sleep 0.25; done; open '{escaped}'"
+        );
+        return std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "could not launch the installer".to_string());
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = path;
+        Err("installing updates is unsupported on this platform".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn launch_windows_installer_after_exit(path: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     let (install_dir, relaunch) = current_install_paths()?;
-    #[cfg(windows)]
     let install_dir = install_dir
         .to_str()
-        .ok_or_else(|| "install directory is not valid UTF-8".to_string())?
-        .to_string();
-    #[cfg(windows)]
+        .ok_or_else(|| "install directory is not valid UTF-8".to_string())?;
     let relaunch = relaunch
         .to_str()
-        .ok_or_else(|| "app path is not valid UTF-8".to_string())?
-        .to_string();
-    let result = {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            let installer = powershell_single_quoted(path_str);
-            let install_dir = powershell_single_quoted(&install_dir);
-            let relaunch = powershell_single_quoted(&relaunch);
-            let script = format!(
-                "$ErrorActionPreference = 'Stop'; while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}; $installer = {installer}; $installDir = {install_dir}; $relaunch = {relaunch}; $info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $installer; $info.Arguments = '/S /UPDATE /D=' + $installDir; $info.UseShellExecute = $false; $proc = [System.Diagnostics.Process]::Start($info); if (-not $proc) {{ exit 1 }}; $proc.WaitForExit(); if ($proc.ExitCode -ne 0) {{ exit $proc.ExitCode }}; if (Test-Path -LiteralPath $relaunch) {{ Start-Process -FilePath $relaunch }} else {{ $exe = Get-ChildItem -LiteralPath $installDir -Filter *.exe -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -notmatch '(?i)uninstall' }} | Select-Object -First 1; if ($exe) {{ Start-Process -FilePath $exe.FullName }} }}"
-            );
-            std::process::Command::new("powershell")
-                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let escaped = path_str.replace('\'', "'\\''");
-            let script = format!(
-                "while kill -0 {pid} 2>/dev/null; do sleep 0.25; done; open '{escaped}'"
-            );
-            std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            let _ = (path_str, pid);
-            Err(std::io::Error::other("installing updates is unsupported"))
-        }
+        .ok_or_else(|| "app path is not valid UTF-8".to_string())?;
+    let pid = std::process::id();
+    let script_path = write_windows_update_script(path, install_dir, relaunch, pid)?;
+    let system_root = windows_system_root();
+    let cmd = system_root.join(r"System32\cmd.exe");
+    let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let launcher_path = write_windows_wmi_launcher(&script_path, pid)?;
+    let wmi_ok = std::process::Command::new(&powershell)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
+        .arg(&launcher_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .is_some_and(|status| status.success());
+    if wmi_ok {
+        return Ok(());
+    }
+    let command = format!(
+        "start \"\" /MIN {} -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {}",
+        quote_for_cmd(&powershell)?,
+        quote_for_cmd(&script_path)?
+    );
+    let flags =
+        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
+    let spawned = std::process::Command::new(&cmd)
+        .args(["/C", &command])
+        .creation_flags(flags)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(_) => std::process::Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+            ])
+            .arg(&script_path)
+            .creation_flags(flags)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "could not launch the installer".to_string())?,
     };
-    result
-        .map(|_| ())
-        .map_err(|_| "could not launch the installer".to_string())
+    std::mem::forget(child);
+    std::thread::sleep(Duration::from_millis(400));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -712,6 +926,15 @@ mod tests {
         assert!(!allowed_redirect_url(
             &Url::parse("https://evil.githubusercontent.com.example/objects/abc").unwrap()
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nsis_update_arguments_keep_directory_unquoted() {
+        assert_eq!(
+            nsis_update_arguments(r"D:\LM Codex Switch\"),
+            r"/S /UPDATE /D=D:\LM Codex Switch"
+        );
     }
 
     #[cfg(windows)]
