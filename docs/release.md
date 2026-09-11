@@ -179,6 +179,31 @@ verified. Signing secrets must remain in the GitHub Actions secret store.
 - A release is unsigned, unnotarized on macOS, or lacks real target-host smoke
   tests.
 
+## Current repository
+
+This tree is published from
+[`a182860089-pixel/codex-witcher-lm`](https://github.com/a182860089-pixel/codex-witcher-lm).
+Windows installers after 0.3.6 are attached to that repository's GitHub
+Releases. Older 0.3.3/0.3.4 package evidence below still points at the
+original `grey0758/codex-provider-switcher` Actions runs, because those jobs
+did not run on this account.
+
+## 2026-09-11 GitHub 0.3.10
+
+[LM Codex Switch v0.3.10](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.10)
+is a Windows-only overlay release. Existing Codex threads keep the catalog
+model they already selected; the local proxy no longer rewrites a `grok-4.6`
+chat to the switcher's current `gpt-5.6-sol` selection. Failed upstream
+responses do not pin the thread. If a continuation would change models, the
+proxy strips `previous_response_id`.
+
+Published installer:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.10_Windows-x64-Setup.exe`,
+  SHA-256
+  `9829fe9fca8ed73fca410cc03ff8f7baa24072d5457589ab1d168c5786c165ef`.
+
 ## 2026-07-30 GitHub 0.3.4 prerelease evidence
 
 The repository published

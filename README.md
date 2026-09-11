@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/grey0758/codex-provider-switcher/releases/tag/v0.3.4"><strong>下载 v0.3.4 预览版</strong></a>
+  <a href="https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.10"><strong>下载 v0.3.10</strong></a>
   ·
   <a href="#三步开始使用">使用指南</a>
   ·
@@ -21,8 +21,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/grey0758/codex-provider-switcher/actions/workflows/quality.yml">
-    <img src="https://github.com/grey0758/codex-provider-switcher/actions/workflows/quality.yml/badge.svg?branch=main" alt="Quality workflow">
+  <a href="https://github.com/a182860089-pixel/codex-witcher-lm/actions/workflows/quality.yml">
+    <img src="https://github.com/a182860089-pixel/codex-witcher-lm/actions/workflows/quality.yml/badge.svg?branch=main" alt="Quality workflow">
   </a>
   <img src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows11&logoColor=white" alt="Windows x64">
   <img src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%7C%20Intel-111111?logo=apple&logoColor=white" alt="macOS Apple Silicon and Intel">
@@ -52,15 +52,14 @@ Responses-compatible 服务、保存常用模型，并在之后一键切换。
 
 ## 下载与安装
 
-> 0.3.4 是公开预览版。Windows 安装包尚未代码签名；macOS 包使用 ad-hoc
-> 签名，但尚未 Developer ID 签名或公证。安装前请核对 Release 中的
-> `SHA256SUMS.txt`。
+> 当前仓库是 [`a182860089-pixel/codex-witcher-lm`](https://github.com/a182860089-pixel/codex-witcher-lm)。
+> 0.3.10 只发布 Windows x64 安装包，尚未代码签名。安装前请核对 Release 中的 SHA-256。
 
 | 系统 | 安装包 | 安装方法 |
 | --- | --- | --- |
-| Windows x64（已在 Windows 11 验证） | [下载 EXE](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.4/Codex.Provider.Switcher_0.3.4_Windows-x64-Setup.exe) | 双击安装；若 SmartScreen 出现，核对校验值后选择“更多信息 → 仍要运行” |
-| Apple silicon Mac | [下载 arm64 DMG](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.4/Codex.Provider.Switcher_0.3.4_macOS-arm64.dmg) | 打开 DMG，把应用拖到 Applications |
-| Intel Mac | [下载 x64 DMG](https://github.com/grey0758/codex-provider-switcher/releases/download/v0.3.4/Codex.Provider.Switcher_0.3.4_macOS-x64.dmg) | 打开 DMG，把应用拖到 Applications |
+| Windows x64（已在 Windows 11 验证） | [下载 EXE](https://github.com/a182860089-pixel/codex-witcher-lm/releases/download/v0.3.10/Codex.Provider.Switcher_0.3.10_Windows-x64-Setup.exe) | 双击安装；若 SmartScreen 出现，核对校验值后选择“更多信息 → 仍要运行” |
+| Apple silicon Mac | 本仓库暂未发布 | 等后续 Release 提供 DMG |
+| Intel Mac | 本仓库暂未发布 | 等后续 Release 提供 DMG |
 
 这个仓库目前是**桌面应用**，支持 Windows 与 macOS。它需要访问当前用户的
 Codex Desktop 配置和系统凭据库，因此不支持 iPhone/iPad，也没有可安装的 iOS
@@ -69,9 +68,9 @@ Codex Desktop 配置和系统凭据库，因此不支持 iPhone/iPad，也没有
 <details>
 <summary><strong>macOS 第一次打开提示“无法验证开发者”</strong></summary>
 
-0.3.4 预览包尚未完成 Apple 公证。确认 Release 校验值后，打开
-**系统设置 → 隐私与安全性**，在安全提示旁选择**仍要打开**。正式稳定发布前
-仍需 Developer ID 签名和公证。
+本仓库当前只发布 Windows 安装包。若以后提供 macOS 预览包，在核对 Release
+校验值后，打开 **系统设置 → 隐私与安全性**，在安全提示旁选择**仍要打开**。
+正式稳定发布前仍需 Developer ID 签名和公证。
 
 </details>
 
@@ -81,16 +80,14 @@ Codex Desktop 配置和系统凭据库，因此不支持 iPhone/iPad，也没有
 Windows PowerShell：
 
 ```powershell
-Get-FileHash '.\Codex.Provider.Switcher_0.3.4_Windows-x64-Setup.exe' -Algorithm SHA256
+Get-FileHash '.\Codex.Provider.Switcher_0.3.10_Windows-x64-Setup.exe' -Algorithm SHA256
 ```
 
-macOS：
+当前 Windows 安装包 SHA-256：
 
-```bash
-shasum -a 256 Codex.Provider.Switcher_0.3.4_macOS-arm64.dmg
-```
+`9829fe9fca8ed73fca410cc03ff8f7baa24072d5457589ab1d168c5786c165ef`
 
-将结果与同一 Release 中的 `SHA256SUMS.txt` 对比。
+将结果与 [v0.3.10 Release](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.10) 中的说明对比。
 
 </details>
 

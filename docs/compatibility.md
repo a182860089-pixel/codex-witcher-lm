@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | macOS | Apple silicon | Version 0.3.4 passed native Web/Rust/Tauri tests plus ad-hoc DMG build and install/remove smoke on `macos-15`; the published DMG was checksum-verified after download | Add Developer ID signing, notarization, stapling, and run the complete real-host switching lifecycle |
 | macOS | Intel | Version 0.3.4 passed the same native suite plus ad-hoc DMG build and install/remove smoke on `macos-15-intel`; the published DMG was checksum-verified after download | Run the same signed and notarized real-host lifecycle |
-| Windows | x86_64 | Version 0.3.4 passed public native Web/Rust/Tauri tests and NSIS package smoke plus a state-preserving upgrade and real-session interface smoke on `ydy001`; the published installer was checksum-verified after download | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
+| Windows | x86_64 | Version 0.3.10 is published from [`a182860089-pixel/codex-witcher-lm`](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.10) (`Codex.Provider.Switcher_0.3.10_Windows-x64-Setup.exe`, SHA-256 `9829fe9fca8ed73fca410cc03ff8f7baa24072d5457589ab1d168c5786c165ef`). Version 0.3.4 also passed public native Web/Rust/Tauri tests and NSIS package smoke | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
 
