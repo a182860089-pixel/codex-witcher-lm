@@ -58,7 +58,6 @@ use codex_provider_switcher_core::plan_user_no_proxy_persist;
 use codex_provider_switcher_core::proxy_credential_account_for;
 use codex_provider_switcher_core::recover_prepared_backup;
 use codex_provider_switcher_core::refresh_proxy_credential_helper_file;
-use codex_provider_switcher_core::refresh_proxy_selected_model_file;
 use codex_provider_switcher_core::remove_profile;
 use codex_provider_switcher_core::render_profile_store;
 use codex_provider_switcher_core::restore_backup;
@@ -85,6 +84,7 @@ use codex_provider_switcher_local_proxy::ProxyHandle;
 use codex_provider_switcher_local_proxy::ProxyStartOptions;
 use codex_provider_switcher_local_proxy::ReasoningLevelDescriptor;
 use codex_provider_switcher_local_proxy::RouteConfig;
+use codex_provider_switcher_local_proxy::read_proxy_bindings;
 use directories::BaseDirs;
 use fs4::FileExt;
 use rand::RngCore;
@@ -692,7 +692,6 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
                 !proxy_activation_can_restore_automatically(&paths, &state);
             return Ok(status);
         }
-        adopt_codex_selected_model(&paths, &mut state);
         let bypass_changed = match load_proxy_route(&paths, &state) {
             Ok((_, route)) => {
                 match start_proxy_handle(&paths, &state, &mut runtime, route, false).await {
@@ -817,7 +816,6 @@ async fn enable_proxy(
     }
     if !config_needs_write {
         prepare_active_proxy_configuration(&paths, &next)?;
-        sync_managed_proxy_model(&paths, &selected_model)?;
     }
     let bypass_changed = start_proxy_handle(&paths, &next, &mut runtime, route, true).await?;
     next.requires_codex_restart |= bypass_changed;
@@ -911,7 +909,6 @@ async fn switch_proxy_route(
     prepare_active_proxy_configuration(&paths, &previous)?;
     let mut next = proxy_state_for_selection(&previous, &profile_id, &selected_model);
     let (_, route) = load_proxy_route(&paths, &next)?;
-    sync_managed_proxy_model(&paths, &selected_model)?;
     let bypass_changed = start_proxy_handle(&paths, &next, &mut runtime, route, false).await?;
     next.requires_codex_restart |= bypass_changed;
     if let Err(error) = write_proxy_state(&paths, &next) {
@@ -1901,53 +1898,6 @@ fn prepare_active_proxy_configuration(
     verify_active_proxy_configuration(paths, state)
 }
 
-fn sync_managed_proxy_model(paths: &AppPaths, selected_model: &str) -> Result<(), String> {
-    refresh_proxy_selected_model_file(
-        &paths.config,
-        &proxy_base_url(LOCAL_PROXY_PORT),
-        selected_model,
-    )
-    .map(|_| ())
-    .map_err(redacted_core_error)
-}
-
-fn adopt_codex_selected_model(paths: &AppPaths, state: &mut StoredProxyState) {
-    let Some(profile_id) = state.profile_id.clone() else {
-        return;
-    };
-    let Ok(config) = read_config_safely(&paths.config) else {
-        return;
-    };
-    let Ok(current) = inspect_config(&config) else {
-        return;
-    };
-    let Some(config_model) = current.model_id.filter(|id| !id.is_empty()) else {
-        return;
-    };
-    let Ok(store) = load_profiles(paths) else {
-        return;
-    };
-    let Some(profile) = store
-        .profiles
-        .iter()
-        .find(|profile| profile.id == profile_id)
-    else {
-        return;
-    };
-    let Some(next_model) = adopted_proxy_model(state.model_id.as_deref(), profile, &config_model)
-    else {
-        return;
-    };
-    let previous_model = state.model_id.clone();
-    let previous_revision = state.revision;
-    state.model_id = Some(next_model);
-    state.revision = state.revision.saturating_add(1);
-    if write_proxy_state(paths, state).is_err() {
-        state.model_id = previous_model;
-        state.revision = previous_revision;
-    }
-}
-
 fn adopted_proxy_model(
     current_model_id: Option<&str>,
     profile: &ProviderProfile,
@@ -2424,11 +2374,11 @@ async fn start_proxy_handle(
         .is_some_and(|handle| handle.health().running)
         && runtime.use_system_proxy == Some(use_system_proxy);
     if running_same_proxy {
-        runtime
+        let handle = runtime
             .handle
             .as_ref()
-            .expect("running handle checked above")
-            .set_active_route(route);
+            .expect("running handle checked above");
+        handle.set_active_route(route);
         runtime.last_error = None;
         return Ok(persistent_changed);
     }
@@ -2455,6 +2405,7 @@ async fn start_proxy_handle(
         port: state.port,
         max_request_bytes: LOCAL_PROXY_MAX_REQUEST_BYTES,
         use_system_proxy,
+        bindings_path: Some(proxy_bindings_path(paths)),
         ..ProxyStartOptions::default()
     };
     let handle = LocalProxy::start(options, entry_bearer)
@@ -2464,6 +2415,7 @@ async fn start_proxy_handle(
         let _ = handle.shutdown().await;
         return Err("the local proxy started on an unexpected port".to_string());
     }
+    remember_saved_proxy_routes(paths, &handle);
     handle.set_active_route(route);
     if let Err(error) = verify_loopback_not_intercepted(state.port).await {
         let _ = handle.shutdown().await;
@@ -2495,6 +2447,36 @@ async fn rollback_proxy_runtime(
         }
     } else if let Some(handle) = runtime.handle.take() {
         let _ = handle.shutdown().await;
+    }
+}
+
+fn proxy_bindings_path(paths: &AppPaths) -> PathBuf {
+    paths.state.join("proxy-bindings.json")
+}
+
+fn remember_saved_proxy_routes(paths: &AppPaths, handle: &ProxyHandle) {
+    let Some(bindings) = read_proxy_bindings(&proxy_bindings_path(paths)) else {
+        return;
+    };
+    let mut keys = Vec::new();
+    for binding in bindings.recent {
+        keys.push((binding.route_id, binding.selected_model));
+    }
+    for binding in bindings.threads {
+        keys.push((binding.route_id, binding.selected_model));
+    }
+    keys.sort();
+    keys.dedup();
+    for (profile_id, model_id) in keys {
+        let snapshot = StoredProxyState {
+            profile_id: Some(profile_id),
+            model_id: Some(model_id),
+            enabled: true,
+            ..StoredProxyState::default()
+        };
+        if let Ok((_, route)) = load_proxy_route(paths, &snapshot) {
+            handle.remember_route(route);
+        }
     }
 }
 
