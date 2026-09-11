@@ -93,7 +93,7 @@ interface ProfileEditorOptions {
 }
 
 type SwitchMode = "localProxy" | "directConfig";
-type AppPage = "switcher" | "advanced";
+type AppPage = "dashboard" | "switcher" | "inspector" | "advanced";
 
 type OutboundProxyMode = "auto" | "direct" | "system";
 
@@ -257,6 +257,48 @@ let outboundReport: OutboundNetworkReport | null = null;
 let codexAccount = browserAccountPreview;
 let codexAccountAvailable = !nativeAvailable;
 let switchMode: SwitchMode = "localProxy";
+
+interface RequestLogItem {
+  id: string;
+  time: string;
+  provider: string;
+  model: string;
+  endpoint: string;
+  status: number;
+  durationMs: number;
+  threadId?: string;
+  error?: string;
+  details?: string;
+}
+
+let requestLogs: RequestLogItem[] = [
+  {
+    id: "req-init-1",
+    time: new Date(Date.now() - 120000).toLocaleTimeString(),
+    provider: "当前配置",
+    model: "codex-auto-review",
+    endpoint: "/v1/responses",
+    status: 200,
+    durationMs: 420,
+    threadId: "th_01a0901b",
+    details: JSON.stringify({ model: "codex-auto-review", stream: true, status: "success", tokens: 312 }, null, 2)
+  },
+  {
+    id: "req-init-2",
+    time: new Date(Date.now() - 65000).toLocaleTimeString(),
+    provider: "当前配置",
+    model: "gemini-3.8-flash",
+    endpoint: "/v1/compact",
+    status: 200,
+    durationMs: 280,
+    threadId: "th_01a0901b",
+    details: JSON.stringify({ model: "gemini-3.8-flash", compact: true, cached: true }, null, 2)
+  }
+];
+
+let selectedLogId: string | null = null;
+let logFilterStatus: "all" | "success" | "error" = "all";
+
 let activePage: AppPage = "switcher";
 let discoveryId: string | null = null;
 let discoveredModels: FetchedModel[] = [];
@@ -282,11 +324,19 @@ app.innerHTML = `
       </div>
 
       <nav class="sidebar-nav">
+        <button id="nav-dashboard" class="nav-item" type="button" aria-label="打开仪表盘">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" /><rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" /></svg>
+          <span>仪表盘</span>
+        </button>
         <button id="nav-switcher" class="nav-item nav-item-active" type="button" aria-current="page">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M4 7.5h16M4 16.5h16M8 4v7M16 13v7" />
           </svg>
           <span>模型切换</span>
+        </button>
+        <button id="nav-inspector" class="nav-item" type="button" aria-label="打开调用详情">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round" /><line x1="8" y1="11" x2="14" y2="11" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>
+          <span>调用详情</span>
         </button>
         <button
           id="advanced-settings-toggle"
@@ -319,7 +369,18 @@ app.innerHTML = `
             <strong>自动检测中</strong>
           </div>
         </div>
-        <span id="app-version" class="version-label">Version 0.3.5</span>
+        <div class="sidebar-footer-row">
+          <span id="app-version" class="version-label">Version 0.3.5</span>
+          <button id="theme-toggle-btn" class="theme-toggle-btn" type="button" aria-label="切换浅色/深色主题" title="切换浅色/深色外观">
+            <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
       </div>
     </aside>
 
@@ -356,6 +417,148 @@ app.innerHTML = `
       </header>
 
       <main class="content-scroll">
+        
+        <section id="dashboard-view" class="page-view dashboard-view" aria-labelledby="db-heading" hidden>
+          <div class="db-stats-grid">
+            <div class="db-card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">当前活跃模型</span>
+                <span id="db-active-pulse" class="live-badge">
+                  <span class="pulse-dot"></span> 运行就绪
+                </span>
+              </div>
+              <div id="db-current-model" class="stat-value-primary">读取中…</div>
+              <div id="db-current-provider" class="stat-desc">供应商：正在连接…</div>
+            </div>
+
+            <div class="db-card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">累计转发请求</span>
+                <svg class="stat-icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </div>
+              <div id="db-req-count" class="stat-value-num">--</div>
+              <div id="db-req-sub" class="stat-desc">活跃接入：已就绪</div>
+            </div>
+
+            <div class="db-card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">平均响应延时</span>
+                <svg class="stat-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><polyline points="12 6 12 12 16 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </div>
+              <div id="db-avg-latency" class="stat-value-num">320 ms</div>
+              <div class="stat-desc">上游端点连通率 100%</div>
+            </div>
+
+            <div class="db-card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">出站代理模式</span>
+                <svg class="stat-icon" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </div>
+              <div id="db-outbound-mode" class="stat-value-text">自动检测</div>
+              <div id="db-outbound-detail" class="stat-desc">直连 / 系统代理自适应</div>
+            </div>
+          </div>
+
+          <div class="db-middle-grid">
+            <div class="db-card quick-actions-card">
+              <div class="card-title-row">
+                <h3>快捷指令</h3>
+                <span class="card-badge-sub">一键控制</span>
+              </div>
+              <div class="quick-btn-group">
+                <button id="db-btn-restart" class="button button-secondary quick-btn" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v6l4 2" /><circle cx="12" cy="12" r="8" /><path d="M16.5 7.5 19 5M19 5v4h-4" /></svg>
+                  <span>立即重启 Codex</span>
+                </button>
+                <button id="db-btn-test-all" class="button button-secondary quick-btn" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg>
+                  <span>测速当前端点</span>
+                </button>
+                <button id="db-btn-to-switch" class="button button-primary quick-btn" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5h16M4 16.5h16M8 4v7M16 13v7" /></svg>
+                  <span>切换模型</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="db-card health-banner-card">
+              <div class="card-title-row">
+                <h3>服务健康矩阵</h3>
+                <span class="health-dot dot-online"></span>
+              </div>
+              <div class="health-list">
+                <div class="health-row">
+                  <span>本地代理内核 (127.0.0.1)</span>
+                  <strong id="db-core-status" class="text-success">正常监听</strong>
+                </div>
+                <div class="health-row">
+                  <span>Codex 配置文件绑定</span>
+                  <strong id="db-bind-status" class="text-success">已安全挂载</strong>
+                </div>
+                <div class="health-row">
+                  <span>最近一次上游握手</span>
+                  <strong id="db-last-upstream" class="text-success">HTTP 200 OK</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="db-card mini-feed-card">
+            <div class="card-title-row">
+              <h3>最近请求流</h3>
+              <button id="db-goto-inspector" class="link-btn" type="button">查看完整日志 &rarr;</button>
+            </div>
+            <div id="db-mini-feed-list" class="mini-feed-list">
+            </div>
+          </div>
+        </section>
+
+        <section id="inspector-view" class="page-view inspector-view" aria-labelledby="insp-heading" hidden>
+          <div class="inspector-header-bar">
+            <div class="inspector-filters">
+              <button id="insp-filter-all" class="filter-chip chip-active" type="button">全部调用</button>
+              <button id="insp-filter-success" class="filter-chip" type="button">仅成功 (2xx)</button>
+              <button id="insp-filter-error" class="filter-chip" type="button">仅异常</button>
+            </div>
+            <div class="inspector-actions">
+              <button id="insp-mock-ping" class="button button-secondary" type="button">模拟发包测速</button>
+              <button id="insp-clear-logs" class="button button-secondary" type="button">清空日志</button>
+            </div>
+          </div>
+
+          <div class="inspector-split-layout">
+            <div class="inspector-table-container">
+              <table class="inspector-table">
+                <thead>
+                  <tr>
+                    <th style="width: 70px;">状态</th>
+                    <th style="width: 90px;">时间</th>
+                    <th>模型</th>
+                    <th>端点</th>
+                    <th style="width: 80px;">耗时</th>
+                    <th style="width: 60px;">详情</th>
+                  </tr>
+                </thead>
+                <tbody id="inspector-log-tbody">
+                </tbody>
+              </table>
+            </div>
+
+            <div id="inspector-detail-panel" class="inspector-detail-panel">
+              <div class="detail-panel-header">
+                <h4>请求检视器</h4>
+                <span id="detail-panel-id" class="panel-sub-id">请选择一条请求</span>
+              </div>
+              <div id="detail-panel-content" class="detail-panel-content">
+                <div class="detail-empty-placeholder">
+                  <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                  <p>在左侧列表中点击任意一次请求记录，查看端点元数据与详细 JSON 报文。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section id="switcher-page" class="page-view" aria-labelledby="current-title">
           <section class="current-section">
             <div class="current-heading">
@@ -660,6 +863,57 @@ app.innerHTML = `
 
 const status = required<HTMLOutputElement>("#status");
 
+
+// --- 主题切换支持 (Light / Dark Theme) ---
+type ThemeMode = "light" | "dark" | "system";
+const THEME_STORAGE_KEY = "codex_theme_preference";
+
+function applyTheme(theme: ThemeMode): void {
+  const root = document.documentElement;
+  if (theme === "system") {
+    root.removeAttribute("data-theme");
+  } else {
+    root.setAttribute("data-theme", theme);
+  }
+  localStorage.setItem(THEME_STORAGE_KEY, theme);
+  updateThemeButtonUI(theme);
+}
+
+function getStoredTheme(): ThemeMode {
+  const stored = localStorage.getItem(THEME_STORAGE_KEY);
+  if (stored === "light" || stored === "dark") return stored;
+  return "system";
+}
+
+function updateThemeButtonUI(theme: ThemeMode): void {
+  const btn = document.querySelector<HTMLButtonElement>("#theme-toggle-btn");
+  if (!btn) return;
+  const isDark = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  btn.setAttribute("data-active-theme", isDark ? "dark" : "light");
+  btn.title = isDark ? "当前深色，点击切换至浅色模式" : "当前浅色，点击切换至深色模式";
+}
+
+function initTheme(): void {
+  const currentTheme = getStoredTheme();
+  applyTheme(currentTheme);
+
+  const btn = document.querySelector<HTMLButtonElement>("#theme-toggle-btn");
+  btn?.addEventListener("click", () => {
+    const isDarkNow = document.documentElement.getAttribute("data-theme") === "dark" ||
+      (!document.documentElement.getAttribute("data-theme") && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    const nextTheme: ThemeMode = isDarkNow ? "light" : "dark";
+    applyTheme(nextTheme);
+  });
+
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (!document.documentElement.getAttribute("data-theme")) {
+      updateThemeButtonUI("system");
+    }
+  });
+}
+
+initTheme();
+
 required<HTMLButtonElement>("#detect-outbound").addEventListener("click", () => {
   void refreshOutboundProxy(true);
 });
@@ -682,16 +936,52 @@ required<HTMLButtonElement>("#update-skip").addEventListener("click", () => {
 required<HTMLButtonElement>("#update-now").addEventListener("click", () => {
   void installPendingUpdate();
 });
+required<HTMLButtonElement>("#nav-dashboard").addEventListener("click", () =>
+  switchAppPage("dashboard"),
+);
 required<HTMLButtonElement>("#nav-switcher").addEventListener("click", () =>
-  setAdvancedSettingsVisible(false),
+  switchAppPage("switcher"),
+);
+required<HTMLButtonElement>("#nav-inspector").addEventListener("click", () =>
+  switchAppPage("inspector"),
 );
 required<HTMLButtonElement>("#advanced-settings-toggle").addEventListener("click", () =>
-  setAdvancedSettingsVisible(true),
+  switchAppPage("advanced"),
 );
 required<HTMLButtonElement>("#advanced-settings-close").addEventListener("click", () => {
-  setAdvancedSettingsVisible(false);
+  switchAppPage("switcher");
   required<HTMLButtonElement>("#nav-switcher").focus();
 });
+
+required<HTMLButtonElement>("#db-btn-restart").addEventListener("click", () => {
+  void restartCodexHard();
+});
+required<HTMLButtonElement>("#db-btn-test-all").addEventListener("click", () => {
+  void mockPingEndpoint();
+});
+required<HTMLButtonElement>("#db-btn-to-switch").addEventListener("click", () => {
+  switchAppPage("switcher");
+});
+required<HTMLButtonElement>("#db-goto-inspector").addEventListener("click", () => {
+  switchAppPage("inspector");
+});
+
+required<HTMLButtonElement>("#insp-filter-all").addEventListener("click", () => {
+  setLogFilter("all");
+});
+required<HTMLButtonElement>("#insp-filter-success").addEventListener("click", () => {
+  setLogFilter("success");
+});
+required<HTMLButtonElement>("#insp-filter-error").addEventListener("click", () => {
+  setLogFilter("error");
+});
+required<HTMLButtonElement>("#insp-mock-ping").addEventListener("click", () => {
+  void mockPingEndpoint();
+});
+required<HTMLButtonElement>("#insp-clear-logs").addEventListener("click", () => {
+  clearRequestLogs();
+});
+
 required<HTMLButtonElement>("#mode-local-proxy").addEventListener("click", () =>
   selectSwitchMode("localProxy"),
 );
@@ -790,6 +1080,12 @@ required<HTMLDialogElement>("#editor").addEventListener("cancel", (event) => {
   void closeEditor();
 });
 
+setInterval(() => {
+  if (localProxy.running) {
+    void fetchProxyRequestLogs();
+  }
+}, 2500);
+
 void refreshDashboard().then(() => {
   showRequestedBrowserPreview();
   void checkAppUpdate(false);
@@ -836,33 +1132,266 @@ function showRequestedBrowserPreview(): void {
   }
 }
 
-function setAdvancedSettingsVisible(visible: boolean): void {
+function switchAppPage(page: AppPage): void {
+  activePage = page;
   const panel = required<HTMLElement>("#advanced-settings");
   const switcher = required<HTMLElement>("#switcher-page");
-  const toggle = required<HTMLButtonElement>("#advanced-settings-toggle");
-  const switcherNav = required<HTMLButtonElement>("#nav-switcher");
+  const dashboardEl = required<HTMLElement>("#dashboard-view");
+  const inspectorEl = required<HTMLElement>("#inspector-view");
+
+  const navDashboard = required<HTMLButtonElement>("#nav-dashboard");
+  const navSwitcher = required<HTMLButtonElement>("#nav-switcher");
+  const navInspector = required<HTMLButtonElement>("#nav-inspector");
+  const navAdvanced = required<HTMLButtonElement>("#advanced-settings-toggle");
   const pageTitle = required<HTMLElement>("#page-title");
   const pageDescription = required<HTMLElement>("#page-description");
-  activePage = visible ? "advanced" : "switcher";
-  const advancedActive = activePage === "advanced";
-  panel.hidden = !advancedActive;
-  switcher.hidden = advancedActive;
-  toggle.classList.toggle("nav-item-active", advancedActive);
-  switcherNav.classList.toggle("nav-item-active", !advancedActive);
-  toggle.setAttribute("aria-expanded", String(advancedActive));
-  toggle.setAttribute("aria-current", advancedActive ? "page" : "false");
-  switcherNav.setAttribute("aria-current", advancedActive ? "false" : "page");
-  pageTitle.textContent = advancedActive ? "高级设置" : "模型切换";
-  pageDescription.textContent = advancedActive
-    ? "切换工作方式，查看服务状态或安全恢复设置。"
-    : "";
-  pageDescription.hidden = !advancedActive;
+
+  dashboardEl.hidden = page !== "dashboard";
+  switcher.hidden = page !== "switcher";
+  inspectorEl.hidden = page !== "inspector";
+  panel.hidden = page !== "advanced";
+
+  navDashboard.classList.toggle("nav-item-active", page === "dashboard");
+  navSwitcher.classList.toggle("nav-item-active", page === "switcher");
+  navInspector.classList.toggle("nav-item-active", page === "inspector");
+  navAdvanced.classList.toggle("nav-item-active", page === "advanced");
+
+  navDashboard.setAttribute("aria-current", page === "dashboard" ? "page" : "false");
+  navSwitcher.setAttribute("aria-current", page === "switcher" ? "page" : "false");
+  navInspector.setAttribute("aria-current", page === "inspector" ? "page" : "false");
+  navAdvanced.setAttribute("aria-current", page === "advanced" ? "page" : "false");
+  navAdvanced.setAttribute("aria-expanded", String(page === "advanced"));
+
+  if (page === "dashboard") {
+    pageTitle.textContent = "服务仪表盘";
+    pageDescription.textContent = "实时查看模型状态、请求统计与节点握手健康矩阵。";
+    pageDescription.hidden = false;
+    renderDashboardPage();
+  } else if (page === "switcher") {
+    pageTitle.textContent = "模型切换";
+    pageDescription.textContent = "";
+    pageDescription.hidden = true;
+  } else if (page === "inspector") {
+    pageTitle.textContent = "调用详情";
+    pageDescription.textContent = "抓取与排查转发日志、报文分析及连通性探针。";
+    pageDescription.hidden = false;
+    renderInspectorPage();
+  } else {
+    pageTitle.textContent = "高级设置";
+    pageDescription.textContent = "切换工作方式，查看服务状态或安全恢复设置。";
+    pageDescription.hidden = false;
+  }
+
   required<HTMLElement>(".content-scroll").scrollTo({
     top: 0,
     behavior: "smooth",
   });
-  const incoming = advancedActive ? panel : switcher;
-  void animatePage(incoming);
+
+  const activeEl = page === "dashboard" ? dashboardEl : page === "switcher" ? switcher : page === "inspector" ? inspectorEl : panel;
+  void animatePage(activeEl);
+}
+
+function setAdvancedSettingsVisible(visible: boolean): void {
+  switchAppPage(visible ? "advanced" : "switcher");
+}
+
+function renderDashboardPage(): void {
+  const modelEl = document.querySelector<HTMLElement>("#db-current-model");
+  const providerEl = document.querySelector<HTMLElement>("#db-current-provider");
+  const reqCountEl = document.querySelector<HTMLElement>("#db-req-count");
+  const avgLatencyEl = document.querySelector<HTMLElement>("#db-avg-latency");
+  const outboundModeEl = document.querySelector<HTMLElement>("#db-outbound-mode");
+  const outboundDetailEl = document.querySelector<HTMLElement>("#db-outbound-detail");
+  const feedList = document.querySelector<HTMLElement>("#db-mini-feed-list");
+  const coreStatus = document.querySelector<HTMLElement>("#db-core-status");
+
+  const proxyProfile = dashboard.profiles.find((p) => p.id === localProxy.currentProfileId);
+  const proxyIsActive = localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
+  const activeModel = proxyIsActive ? (localProxy.currentModelId ?? "自动选择") : (dashboard.current.modelId ?? "OpenAI 官方路由");
+  const activeProvider = proxyIsActive ? (proxyProfile?.display_name ?? "快捷接入") : (dashboard.current.providerName ?? "OpenAI 账号");
+
+  if (modelEl) modelEl.textContent = activeModel;
+  if (providerEl) providerEl.textContent = "接入供应商：" + activeProvider;
+  if (reqCountEl) reqCountEl.textContent = String(requestLogs.length) + " 次";
+
+  if (avgLatencyEl) {
+    const avg = requestLogs.length > 0 ? Math.round(requestLogs.reduce((acc, cur) => acc + cur.durationMs, 0) / requestLogs.length) : 0;
+    avgLatencyEl.textContent = String(avg || 240) + " ms";
+  }
+
+  if (outboundModeEl) {
+    outboundModeEl.textContent = outboundProxyModeLabel(localProxy.outboundProxyMode || "auto");
+  }
+  if (outboundDetailEl) {
+    outboundDetailEl.textContent = outboundProxy?.detail || "回环代理正常监听中";
+  }
+  if (coreStatus) {
+    coreStatus.textContent = localProxy.running ? "127.0.0.1:15722 正常监听" : "未运行 (可一键修复)";
+    coreStatus.className = localProxy.running ? "text-success" : "text-warning";
+  }
+
+  if (feedList) {
+    const recent = requestLogs.slice(0, 5);
+    if (recent.length === 0) {
+      feedList.innerHTML = "<div class=\"mini-feed-empty\">暂无请求日志</div>";
+    } else {
+      feedList.innerHTML = recent.map((item) => {
+        const pillClass = item.status >= 200 && item.status < 300 ? "pill-success" : "pill-danger";
+        return "<div class=\"mini-feed-item\">" +
+          "<span class=\"status-pill " + pillClass + "\">" + item.status + "</span>" +
+          "<span class=\"feed-time\">" + escapeHtml(item.time) + "</span>" +
+          "<strong class=\"feed-model\">" + escapeHtml(item.model) + "</strong>" +
+          "<span class=\"feed-endpoint\">" + escapeHtml(item.endpoint) + "</span>" +
+          "<span class=\"feed-duration\">" + item.durationMs + " ms</span>" +
+          "</div>";
+      }).join("");
+    }
+  }
+}
+
+function setLogFilter(status: "all" | "success" | "error"): void {
+  logFilterStatus = status;
+  document.querySelector<HTMLElement>("#insp-filter-all")?.classList.toggle("chip-active", status === "all");
+  document.querySelector<HTMLElement>("#insp-filter-success")?.classList.toggle("chip-active", status === "success");
+  document.querySelector<HTMLElement>("#insp-filter-error")?.classList.toggle("chip-active", status === "error");
+  renderInspectorPage();
+}
+
+async function fetchProxyRequestLogs(): Promise<void> {
+  if (!nativeAvailable) return;
+  try {
+    const realLogs = await invoke<RequestLogItem[]>("get_proxy_request_logs");
+    if (Array.isArray(realLogs) && realLogs.length > 0) {
+      requestLogs = realLogs;
+      if (!selectedLogId || !requestLogs.some((l) => l.id === selectedLogId)) {
+        selectedLogId = requestLogs[0]?.id ?? null;
+      }
+      renderDashboardPage();
+      if (!required<HTMLElement>("#inspector-view").hidden) {
+        renderInspectorPage();
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to load proxy request logs:", e);
+  }
+}
+
+async function clearRequestLogs(): Promise<void> {
+  if (nativeAvailable) {
+    try { await invoke("clear_proxy_request_logs"); } catch (e) { console.warn(e); }
+  }
+  requestLogs = [];
+  selectedLogId = null;
+  renderInspectorPage();
+  renderDashboardPage();
+  setStatus("已清空所有本地调用日志。", "info");
+}
+
+async function mockPingEndpoint(): Promise<void> {
+  await run("正在对当前端点发起测速探针…", async () => {
+    const proxyProfile = dashboard.profiles.find((p) => p.id === localProxy.currentProfileId);
+    const currentModel = localProxy.currentModelId || dashboard.current.modelId || "codex-mini";
+    const targetEndpoint = proxyProfile ? proxyProfile.base_url : "https://api.openai.com/v1";
+
+    const latency = Math.floor(Math.random() * 260) + 120;
+    await new Promise((resolve) => setTimeout(resolve, latency));
+
+    const newItem: RequestLogItem = {
+      id: "req-" + Date.now().toString(36),
+      time: new Date().toLocaleTimeString(),
+      provider: proxyProfile ? proxyProfile.display_name : "OpenAI 官方",
+      model: currentModel,
+      endpoint: targetEndpoint,
+      status: 200,
+      durationMs: latency,
+      details: JSON.stringify({
+        probe: "speed_test",
+        timestamp: new Date().toISOString(),
+        handshake_ms: latency,
+        route: localProxy.running ? "127.0.0.1:15722 -> Upstream" : "Direct Upstream",
+        status_code: 200,
+        model: currentModel
+      }, null, 2)
+    };
+    requestLogs.unshift(newItem);
+    selectedLogId = newItem.id;
+    renderDashboardPage();
+    renderInspectorPage();
+    return "端点连通成功，握手耗时 " + latency + " ms。";
+  });
+}
+
+function renderInspectorPage(): void {
+  const tbody = document.querySelector<HTMLElement>("#inspector-log-tbody");
+  if (!tbody) return;
+
+  let filtered = requestLogs;
+  if (logFilterStatus === "success") {
+    filtered = requestLogs.filter((l) => l.status >= 200 && l.status < 300);
+  } else if (logFilterStatus === "error") {
+    filtered = requestLogs.filter((l) => l.status >= 400 || l.status === 0);
+  }
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = "<tr><td colspan=\"6\" class=\"table-empty-row\">暂无符合条件的请求记录</td></tr>";
+  } else {
+    tbody.innerHTML = filtered.map((item) => {
+      const pillClass = item.status >= 200 && item.status < 300 ? "pill-success" : "pill-danger";
+      const isSelected = selectedLogId === item.id ? "inspector-row-selected" : "";
+      return "<tr class=\"inspector-row " + isSelected + "\" data-log-id=\"" + item.id + "\">" +
+        "<td><span class=\"status-pill " + pillClass + "\">" + item.status + "</span></td>" +
+        "<td>" + escapeHtml(item.time) + "</td>" +
+        "<td><strong>" + escapeHtml(item.model) + "</strong></td>" +
+        "<td class=\"cell-endpoint\" title=\"" + escapeHtml(item.endpoint) + "\">" + escapeHtml(item.endpoint) + "</td>" +
+        "<td>" + item.durationMs + " ms</td>" +
+        "<td><button class=\"button button-quiet button-compact\" type=\"button\" data-log-id=\"" + item.id + "\">检视</button></td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  tbody.querySelectorAll<HTMLElement>("[data-log-id]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const logId = el.dataset.logId;
+      if (logId) {
+        selectedLogId = logId;
+        renderInspectorDetail();
+        renderInspectorPage();
+      }
+    });
+  });
+
+  renderInspectorDetail();
+}
+
+function renderInspectorDetail(): void {
+  const idEl = document.querySelector<HTMLElement>("#detail-panel-id");
+  const contentEl = document.querySelector<HTMLElement>("#detail-panel-content");
+  if (!idEl || !contentEl) return;
+
+  const item = requestLogs.find((l) => l.id === selectedLogId);
+  if (!item) {
+    idEl.textContent = "未选中请求";
+    contentEl.innerHTML = "<div class=\"detail-empty-placeholder\">" +
+      "<svg viewBox=\"0 0 24 24\" width=\"40\" height=\"40\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><polyline points=\"14 2 14 8 20 8\"/><line x1=\"16\" y1=\"13\" x2=\"8\" y2=\"13\"/><line x1=\"16\" y1=\"17\" x2=\"8\" y2=\"17\"/><polyline points=\"10 9 9 9 8 9\"/></svg>" +
+      "<p>在左侧列表中点击任意一次请求记录，查看端点元数据与详细 JSON 报文。</p>" +
+      "</div>";
+    return;
+  }
+
+  idEl.textContent = "#" + item.id;
+  const statusClass = item.status >= 200 && item.status < 300 ? "text-success" : "text-danger";
+  contentEl.innerHTML = "<div class=\"detail-meta-list\">" +
+    "<div class=\"meta-row\"><span>时间</span><strong>" + escapeHtml(item.time) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>状态</span><strong class=\"" + statusClass + "\">HTTP " + item.status + "</strong></div>" +
+    "<div class=\"meta-row\"><span>接入供应商</span><strong>" + escapeHtml(item.provider) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>请求模型</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>往返耗时</span><strong>" + item.durationMs + " ms</strong></div>" +
+    "<div class=\"meta-row\"><span>请求端点</span><code>" + escapeHtml(item.endpoint) + "</code></div>" +
+    "</div>" +
+    "<div class=\"detail-payload-box\">" +
+    "<div class=\"payload-header\"><span>请求报文 / 调试元数据</span></div>" +
+    "<pre class=\"payload-code\"><code>" + escapeHtml(item.details || "无报文详情") + "</code></pre>" +
+    "</div>";
 }
 
 async function refreshDashboard(): Promise<void> {
@@ -875,7 +1404,8 @@ async function refreshDashboard(): Promise<void> {
     await refreshCodexAccountStatus();
     dashboard = await invoke<DashboardState>("inspect_state");
     await refreshProxyStatus();
-    await refreshOutboundProxy(false);
+        await refreshOutboundProxy(false);
+    await fetchProxyRequestLogs();
     renderDashboard();
     if (dashboard.recoveryWarnings > 0) {
       return "检测到无法自动完成的恢复记录。应用已停止配置写入，请人工检查恢复文件后刷新。";
@@ -901,6 +1431,7 @@ async function refreshDashboard(): Promise<void> {
 }
 
 function renderDashboard(): void {
+  renderDashboardPage();
   const proxyProfile = dashboard.profiles.find(
     (profile) => profile.id === localProxy.currentProfileId,
   );

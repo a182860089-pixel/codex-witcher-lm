@@ -23,8 +23,8 @@ export async function animatePage(el: HTMLElement): Promise<void> {
   } else {
     pageControls = animate(
       el,
-      { opacity: [0, 1], y: [10, 0] },
-      { type: "spring", bounce: 0, duration: 0.38 },
+      { opacity: [0, 1], y: [8, 0] },
+      { type: "spring", bounce: 0, duration: 0.32 },
     );
   }
   await pageControls;
@@ -43,8 +43,8 @@ export async function animateDialogIn(
   } else {
     dialogControls = animate(
       dialog,
-      { opacity: [0, 1], scale: [0.96, 1], y: [12, 0] },
-      { type: "spring", bounce: 0, duration: 0.36 },
+      { opacity: [0, 1], scale: [0.96, 1], y: [10, 0] },
+      { type: "spring", bounce: 0, duration: 0.34 },
     );
   }
   await dialogControls;
@@ -59,10 +59,20 @@ export async function animateDialogOut(dialog: HTMLElement): Promise<void> {
   } else {
     dialogControls = animate(
       dialog,
-      { opacity: 0, scale: 0.97, y: 8 },
-      { type: "spring", bounce: 0, duration: 0.28 },
+      { opacity: 0, scale: 0.97, y: 6 },
+      { type: "spring", bounce: 0, duration: 0.24 },
     );
   }
   await dialogControls;
   dialog.style.willChange = "";
+}
+
+export function springPress(el: HTMLElement): void {
+  if (reducedMotion()) return;
+  animate(el, { scale: 0.975 }, { type: "spring", bounce: 0, duration: 0.12 });
+}
+
+export function springRelease(el: HTMLElement): void {
+  if (reducedMotion()) return;
+  animate(el, { scale: 1 }, { type: "spring", bounce: 0.25, duration: 0.24 });
 }

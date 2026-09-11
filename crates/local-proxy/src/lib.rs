@@ -490,6 +490,22 @@ pub struct ProxyHealth {
     pub last_upstream_status: Option<u16>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequestLog {
+    pub id: String,
+    pub time: String,
+    pub provider: String,
+    pub model: String,
+    pub endpoint: String,
+    pub status: u16,
+    pub duration_ms: u64,
+    pub thread_id: Option<String>,
+    pub error: Option<String>,
+    pub details: Option<String>,
+}
+
+
 /// Starts proxy instances for Tauri without exposing a command-line surface.
 #[derive(Debug)]
 pub struct LocalProxy;
@@ -547,6 +563,7 @@ impl LocalProxy {
             listen_addr,
             max_request_bytes: options.max_request_bytes,
             metrics: Arc::new(ProxyMetrics::default()),
+            request_logs: Mutex::new(VecDeque::with_capacity(128)),
         });
         state.metrics.running.store(true, Ordering::Release);
 
@@ -646,6 +663,15 @@ impl ProxyHandle {
         self.state.health(self.listen_addr)
     }
 
+    pub fn request_logs(&self) -> Vec<ProxyRequestLog> {
+        self.state.get_request_logs()
+    }
+
+    pub fn clear_request_logs(&self) {
+        self.state.clear_request_logs();
+    }
+
+
     pub async fn shutdown(&self) -> Result<(), ProxyError> {
         if let Some(sender) = lock_unpoisoned(&self.lifecycle.shutdown_sender).take() {
             let _ = sender.send(());
@@ -683,9 +709,33 @@ struct ProxyState {
     listen_addr: SocketAddr,
     max_request_bytes: usize,
     metrics: Arc<ProxyMetrics>,
+    request_logs: Mutex<VecDeque<ProxyRequestLog>>,
 }
 
 impl ProxyState {
+    fn record_request_log(&self, log: ProxyRequestLog) {
+        if let Ok(mut logs) = self.request_logs.lock() {
+            if logs.len() >= 100 {
+                logs.pop_back();
+            }
+            logs.push_front(log);
+        }
+    }
+
+    fn get_request_logs(&self) -> Vec<ProxyRequestLog> {
+        if let Ok(logs) = self.request_logs.lock() {
+            logs.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn clear_request_logs(&self) {
+        if let Ok(mut logs) = self.request_logs.lock() {
+            logs.clear();
+        }
+    }
+
     fn health(&self, listen_addr: SocketAddr) -> ProxyHealth {
         let last_status = self.metrics.last_upstream_status.load(Ordering::Acquire);
         ProxyHealth {
@@ -1535,6 +1585,24 @@ async fn proxy_request(
         headers.insert(USER_AGENT, UPSTREAM_USER_AGENT);
     }
 
+    let request_start_time = std::time::Instant::now();
+    let local_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let log_time = {
+        let secs = local_timestamp % 86400;
+        let hours = (secs / 3600 + 8) % 24;
+        let mins = (secs % 3600) / 60;
+        let s = secs % 60;
+        format!("{:02}:{:02}:{:02}", hours, mins, s)
+    };
+    let log_id = format!("req-{}", uuid::Uuid::new_v4().simple());
+    let log_provider = route.id.clone();
+    let log_model = outbound_model.clone();
+    let log_endpoint = format!("/{}", endpoint.relative_path());
+    let log_thread_id = thread_id.clone();
+
     let lease = RequestLease::begin(Arc::clone(&state.metrics));
     let upstream = match state
         .client
@@ -1547,7 +1615,21 @@ async fn proxy_request(
         Ok(response) => response,
         Err(error) => {
             drop(lease);
-            return error_response(StatusCode::BAD_GATEWAY, classify_upstream_error(&error));
+            let duration_ms = request_start_time.elapsed().as_millis() as u64;
+            let err_msg = classify_upstream_error(&error);
+            state.record_request_log(ProxyRequestLog {
+                id: log_id,
+                time: log_time,
+                provider: log_provider,
+                model: log_model,
+                endpoint: log_endpoint,
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                duration_ms,
+                thread_id: log_thread_id,
+                error: Some(err_msg.to_string()),
+                details: Some(format!("Gateway error: {}", err_msg)),
+            });
+            return error_response(StatusCode::BAD_GATEWAY, err_msg);
         }
     };
 
@@ -1556,6 +1638,19 @@ async fn proxy_request(
         .metrics
         .last_upstream_status
         .store(status.as_u16(), Ordering::Release);
+    let duration_ms = request_start_time.elapsed().as_millis() as u64;
+    state.record_request_log(ProxyRequestLog {
+        id: log_id,
+        time: log_time,
+        provider: log_provider,
+        model: log_model,
+        endpoint: log_endpoint,
+        status: status.as_u16(),
+        duration_ms,
+        thread_id: log_thread_id,
+        error: if status.is_client_error() || status.is_server_error() { Some(format!("HTTP {}", status.as_u16())) } else { None },
+        details: Some(format!("Upstream returned status {} in {} ms", status.as_u16(), duration_ms)),
+    });
     if status.is_client_error() || status.is_server_error() {
         drop(lease);
         return normalize_upstream_error(status, upstream).await;

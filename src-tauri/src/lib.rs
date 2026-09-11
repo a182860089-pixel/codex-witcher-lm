@@ -81,6 +81,7 @@ use codex_provider_switcher_local_proxy::BearerToken;
 use codex_provider_switcher_local_proxy::LocalProxy;
 use codex_provider_switcher_local_proxy::ModelDescriptor;
 use codex_provider_switcher_local_proxy::ProxyHandle;
+use codex_provider_switcher_local_proxy::ProxyRequestLog;
 use codex_provider_switcher_local_proxy::ProxyStartOptions;
 use codex_provider_switcher_local_proxy::ReasoningLevelDescriptor;
 use codex_provider_switcher_local_proxy::RouteConfig;
@@ -619,6 +620,25 @@ fn require_builtin_openai_route(paths: &AppPaths) -> Result<CurrentCodexConfig, 
         return Err("prepare the built-in OpenAI route before managing official login".to_string());
     }
     Ok(current)
+}
+
+#[tauri::command]
+async fn get_proxy_request_logs(runtime: tauri::State<'_, ProxyRuntime>) -> Result<Vec<ProxyRequestLog>, String> {
+    let runtime = runtime.inner.lock().await;
+    if let Some(handle) = runtime.handle.as_ref() {
+        Ok(handle.request_logs())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+async fn clear_proxy_request_logs(runtime: tauri::State<'_, ProxyRuntime>) -> Result<(), String> {
+    let runtime = runtime.inner.lock().await;
+    if let Some(handle) = runtime.handle.as_ref() {
+        handle.clear_request_logs();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1343,6 +1363,8 @@ pub fn run() {
             login_official_account,
             logout_official_account,
             proxy_status,
+            get_proxy_request_logs,
+            clear_proxy_request_logs,
             enable_proxy,
             switch_proxy_route,
             disable_proxy,
