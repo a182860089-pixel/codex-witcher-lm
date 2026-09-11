@@ -17,6 +17,7 @@ use crate::domain::ProviderProfile;
 use crate::error::Result;
 use crate::error::SwitcherError;
 use crate::validation::validate_base_url;
+use crate::validation::validate_model_id;
 use crate::validation::validate_official_profile;
 use crate::validation::validate_profile;
 use crate::validation::validate_provider_id;
@@ -381,6 +382,76 @@ pub fn refresh_proxy_credential_helper(
             )
         },
     )?)?);
+    let rendered = document.to_string();
+    verify_proxy_config_binding(&rendered, proxy_base_url)?;
+    Ok(Some(rendered))
+}
+
+pub fn refresh_proxy_selected_model(
+    config: &str,
+    proxy_base_url: &str,
+    selected_model: &str,
+) -> Result<Option<String>> {
+    validate_model_id(selected_model)?;
+    verify_proxy_config_binding(config, proxy_base_url)?;
+    let mut document = config.parse::<DocumentMut>()?;
+    if document.get("model").and_then(Item::as_str) == Some(selected_model) {
+        return Ok(None);
+    }
+    document["model"] = value(selected_model);
+    let rendered = document.to_string();
+    verify_proxy_config_binding(&rendered, proxy_base_url)?;
+    Ok(Some(rendered))
+}
+
+pub fn retarget_local_proxy_base_url(config: &str, proxy_base_url: &str) -> Result<Option<String>> {
+    validate_proxy_base_url(proxy_base_url)?;
+    let config = config.strip_prefix('\u{feff}').unwrap_or(config);
+    if config.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut document = config.parse::<DocumentMut>()?;
+    let Some(provider) = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(LOCAL_PROXY_PROVIDER_ID))
+        .and_then(Item::as_table_mut)
+    else {
+        return Ok(None);
+    };
+    let current_url = provider
+        .get("base_url")
+        .and_then(Item::as_str)
+        .unwrap_or("");
+    let account = proxy_credential_account_for(proxy_base_url)?;
+    let mut changed = current_url != proxy_base_url;
+    if changed {
+        provider["base_url"] = value(proxy_base_url);
+    }
+    if let Some(auth) = provider.get_mut("auth").and_then(Item::as_table_mut)
+        && let Some(args) = auth.get("args").and_then(Item::as_array)
+    {
+        let mut next = Array::new();
+        let mut args_changed = false;
+        for item in args.iter() {
+            let Some(value_text) = item.as_str() else {
+                continue;
+            };
+            if value_text.starts_with("proxy-client-v1-") && value_text != account {
+                next.push(account.as_str());
+                args_changed = true;
+            } else {
+                next.push(value_text);
+            }
+        }
+        if args_changed {
+            auth["args"] = value(next);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
     let rendered = document.to_string();
     verify_proxy_config_binding(&rendered, proxy_base_url)?;
     Ok(Some(rendered))
@@ -814,6 +885,70 @@ base_url = "https://vendor.example/v1"
         );
         assert!(
             refresh_proxy_credential_helper(&refreshed, base_url, &new_helper)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn proxy_model_refresh_changes_only_the_selected_model() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan = plan_proxy_config(
+            "approval_policy = \"never\"\n",
+            &profile(),
+            "acme/code",
+            &catalog,
+            &helper,
+            base_url,
+        )
+        .unwrap();
+
+        let refreshed =
+            refresh_proxy_selected_model(&plan.rendered_config, base_url, "gpt-5.6-sol")
+                .unwrap()
+                .unwrap();
+        assert!(refreshed.contains("approval_policy = \"never\""));
+        assert!(refreshed.contains("model = \"gpt-5.6-sol\""));
+        assert!(!refreshed.contains("model = \"acme/code\""));
+        assert_eq!(
+            verify_proxy_config_binding(&refreshed, base_url).unwrap(),
+            helper
+        );
+        assert!(
+            refresh_proxy_selected_model(&refreshed, base_url, "gpt-5.6-sol")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retarget_rewrites_only_cps_local_loopback_and_proxy_client_account() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let loopback = "http://127.0.0.1:15722/v1";
+        let plan =
+            plan_proxy_config("", &profile(), "acme/code", &catalog, &helper, loopback).unwrap();
+        let drifted = plan
+            .rendered_config
+            .replace("http://127.0.0.1:15722/v1", "https://15.204.123.42/v1");
+        assert!(drifted.contains("https://15.204.123.42/v1"));
+        let retargeted = retarget_local_proxy_base_url(&drifted, loopback)
+            .unwrap()
+            .expect("should rewrite drifted cps-local url");
+        assert!(retargeted.contains("base_url = \"http://127.0.0.1:15722/v1\""));
+        assert!(!retargeted.contains("https://15.204.123.42/v1"));
+        let account = proxy_credential_account_for(loopback).unwrap();
+        assert!(retargeted.contains(&account));
+        verify_proxy_config_binding(&retargeted, loopback).unwrap();
+        assert!(
+            retarget_local_proxy_base_url(&retargeted, loopback)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            retarget_local_proxy_base_url("model = \"gpt\"\n", loopback)
                 .unwrap()
                 .is_none()
         );

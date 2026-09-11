@@ -48,6 +48,7 @@ same user goal, not a different product mode.
 ## Interaction rules
 
 - The app opens on Model Switching and loads the current state automatically.
+- Startup silently checks the GitHub Releases page. A newer version opens a dialog with the version number, optional notes, Update, and Skip this version. A header Check for Updates button repeats the check on demand.
 - A saved connection exposes one model picker and one primary Use This Model
   action. Edit and Remove are lower-emphasis actions.
 - The official-account row is visually equal to a saved connection but clearly

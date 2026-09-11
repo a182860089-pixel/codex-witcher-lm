@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { animateDialogIn, animateDialogOut, animatePage } from "./motion";
 import "./styles.css";
+import "./styles-polish.css";
 
 type ReasoningEffort = "low" | "medium" | "high";
 type StatusKind = "info" | "working" | "success" | "error";
@@ -93,6 +95,8 @@ interface ProfileEditorOptions {
 type SwitchMode = "localProxy" | "directConfig";
 type AppPage = "switcher" | "advanced";
 
+type OutboundProxyMode = "auto" | "direct" | "system";
+
 interface LocalProxyStatus {
   enabled: boolean;
   running: boolean;
@@ -102,6 +106,62 @@ interface LocalProxyStatus {
   currentModelId: string | null;
   requiresCodexRestart: boolean;
   lastError: string | null;
+  ccSwitchDetected: boolean;
+  outboundProxyMode: OutboundProxyMode;
+}
+
+interface RepairFastSwitchReport {
+  steps: string[];
+  status: LocalProxyStatus;
+}
+
+interface OutboundProxyStatus {
+  detected: boolean;
+  proxyUrl: string | null;
+  source: string;
+  host: string | null;
+  port: number | null;
+  listening: boolean | null;
+  listenerHint: string | null;
+  candidates: Array<{
+    proxyUrl: string;
+    host: string;
+    port: number;
+    listening: boolean;
+    source: string;
+  }>;
+  summary: string;
+  detail: string;
+}
+
+interface OutboundProbeResult {
+  mode: string;
+  url: string;
+  ok: boolean;
+  status: number | null;
+  latencyMs: number;
+  message: string;
+}
+
+interface OutboundNetworkReport {
+  proxy: OutboundProxyStatus;
+  probeBase: string;
+  direct: OutboundProbeResult;
+  viaProxy: OutboundProbeResult | null;
+  verdict: string;
+  recommendations: string[];
+  startedProxy: string | null;
+}
+
+interface AppUpdateStatus {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  skipped: boolean;
+  releaseNotes: string;
+  releaseUrl: string;
+  downloadUrl: string;
+  assetName: string | null;
 }
 
 const app = document.querySelector<HTMLElement>("#app");
@@ -168,6 +228,8 @@ const stoppedProxy: LocalProxyStatus = {
   currentModelId: null,
   requiresCodexRestart: false,
   lastError: null,
+  ccSwitchDetected: false,
+  outboundProxyMode: "auto",
 };
 
 const browserAccountPreview: CodexAccountStatus = {
@@ -190,6 +252,8 @@ let dashboard = browserPreview;
 let nativeAvailable = "__TAURI_INTERNALS__" in window;
 let proxyApiAvailable = true;
 let localProxy = stoppedProxy;
+let outboundProxy: OutboundProxyStatus | null = null;
+let outboundReport: OutboundNetworkReport | null = null;
 let codexAccount = browserAccountPreview;
 let codexAccountAvailable = !nativeAvailable;
 let switchMode: SwitchMode = "localProxy";
@@ -202,18 +266,17 @@ let editingCredentialLoaded = false;
 let editingCredentialDirty = false;
 let restartNoticeShown = false;
 let busy = false;
+let pendingUpdate: AppUpdateStatus | null = null;
 
 app.innerHTML = `
   <div class="app-shell">
     <aside class="sidebar" aria-label="应用导航">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" focusable="false">
-            <path d="m7.5 6.5 5.5 5.5-5.5 5.5M13 6.5l5.5 5.5-5.5 5.5" />
-          </svg>
+          <img src="/icon.png" alt="" />
         </div>
-        <div>
-          <strong>Codex Switcher</strong>
+        <div class="brand-copy">
+          <strong>LM Codex Switch</strong>
           <span>模型与接入</span>
         </div>
       </div>
@@ -249,23 +312,47 @@ app.innerHTML = `
             <strong>正在检查</strong>
           </div>
         </div>
-        <span class="version-label">Version 0.3.4</span>
+        <div id="network-health" class="proxy-health" role="status">
+          <span class="health-dot" aria-hidden="true"></span>
+          <div>
+            <span>出站代理</span>
+            <strong>自动检测中</strong>
+          </div>
+        </div>
+        <span id="app-version" class="version-label">Version 0.3.5</span>
       </div>
     </aside>
 
     <div class="workspace">
       <header class="app-header">
         <div class="page-heading">
-          <p>Codex Provider Switcher</p>
+          <p>LM Codex Switch</p>
           <h1 id="page-title">模型切换</h1>
           <span id="page-description" hidden></span>
         </div>
-        <button id="refresh" class="button button-toolbar" type="button">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" />
-          </svg>
-          <span>刷新</span>
-        </button>
+        <div class="header-actions">
+          <button id="restart-codex" class="button button-toolbar" type="button" title="强制结束 Codex 相关进程并重新打开">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 6v6l4 2" />
+              <circle cx="12" cy="12" r="8" />
+              <path d="M16.5 7.5 19 5M19 5v4h-4" />
+            </svg>
+            <span>重启 Codex</span>
+          </button>
+          <button id="check-update" class="button button-toolbar" type="button" title="检查 GitHub 发布页是否有新版本">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v10M8 11l4 4 4-4" />
+              <path d="M6 19h12" />
+            </svg>
+            <span>检测更新</span>
+          </button>
+          <button id="refresh" class="button button-toolbar" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" />
+            </svg>
+            <span>刷新</span>
+          </button>
+        </div>
       </header>
 
       <main class="content-scroll">
@@ -284,6 +371,11 @@ app.innerHTML = `
               <span id="current-badge" class="badge">读取中</span>
             </div>
             <div id="current-details" class="current-details"></div>
+            <p id="current-https-ip-warning" class="current-https-ip-warning" hidden></p>
+            <div id="current-proxy-actions" class="current-proxy-actions" hidden>
+              <button id="repair-proxy" class="button button-primary" type="button">一键修复</button>
+              <button id="stop-proxy-main" class="button button-secondary danger-text" type="button">关闭快速切换</button>
+            </div>
           </section>
 
           <section class="connections-section" aria-labelledby="connections-title">
@@ -356,6 +448,33 @@ app.innerHTML = `
                   <span>写入 Codex 用户配置；每次切换后需要重新打开 Codex。</span>
                 </span>
               </button>
+            </div>
+          </section>
+
+          <section class="settings-group" aria-labelledby="outbound-heading">
+            <div class="settings-group-heading">
+              <h3 id="outbound-heading">出站代理</h3>
+              <p>默认自动：检测到系统/环境代理在监听则走代理（跳过回环），否则直连。也可手动选择始终直连或始终走系统代理。</p>
+            </div>
+            <div class="mode-summary outbound-summary">
+              <div>
+                <strong id="outbound-summary-title">尚未检测</strong>
+                <p id="outbound-summary-copy">打开高级设置或点击检测后，会显示当前出站代理。</p>
+                <div id="outbound-report" class="outbound-report" hidden></div>
+              </div>
+              <div class="mode-summary-actions">
+                <label class="outbound-mode-field">
+                  <span>出站方式</span>
+                  <select id="outbound-proxy-mode">
+                    <option value="auto">自动（有系统代理则走代理）</option>
+                    <option value="direct">始终直连</option>
+                    <option value="system">始终走系统代理</option>
+                  </select>
+                </label>
+                <button id="detect-outbound" class="button button-secondary" type="button">重新检测</button>
+                <button id="diagnose-outbound" class="button button-primary" type="button">诊断上游网络</button>
+                <button id="ensure-outbound" class="button button-quiet" type="button">检测并尝试启动</button>
+              </div>
             </div>
           </section>
 
@@ -454,6 +573,7 @@ app.innerHTML = `
           <label class="field-wide">
             <span>Base URL</span>
             <input id="base-url" type="url" autocomplete="url" placeholder="https://api.example.com/v1" />
+            <small id="base-url-https-ip-warning" class="field-help field-warning" hidden></small>
           </label>
           <label class="field-wide">
             <span>API Key</span>
@@ -500,6 +620,13 @@ app.innerHTML = `
             <span>保存后首先使用</span>
             <select id="default-model"></select>
           </label>
+          <label class="image-support-field">
+            <input id="supports-images" type="checkbox" checked />
+            <span>
+              支持图片上传和截图
+              <small>开启后 Codex 会显示贴图和截图。上游若不支持视觉，发送后可能失败。</small>
+            </span>
+          </label>
           <div class="editor-actions">
             <button id="save-only" class="button button-secondary" type="button">仅保存</button>
             <button id="save-and-switch" class="button button-primary" type="button">保存并使用</button>
@@ -518,11 +645,43 @@ app.innerHTML = `
       <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
     </div>
   </dialog>
+
+  <dialog id="update-notice" class="restart-dialog update-dialog" aria-labelledby="update-notice-title">
+    <div class="restart-dialog-mark update-dialog-mark" aria-hidden="true">↑</div>
+    <h2 id="update-notice-title">发现新版本</h2>
+    <p id="update-notice-copy">发布页有可用更新。</p>
+    <pre id="update-notice-notes" class="update-notes" hidden></pre>
+    <div class="restart-dialog-actions">
+      <button id="update-skip" class="button button-secondary" type="button">跳过此版本</button>
+      <button id="update-now" class="button button-primary" type="button">立即更新</button>
+    </div>
+  </dialog>
 `;
 
 const status = required<HTMLOutputElement>("#status");
 
+required<HTMLButtonElement>("#detect-outbound").addEventListener("click", () => {
+  void refreshOutboundProxy(true);
+});
+required<HTMLButtonElement>("#diagnose-outbound").addEventListener("click", () => {
+  void diagnoseOutbound(false);
+});
+required<HTMLButtonElement>("#ensure-outbound").addEventListener("click", () => {
+  void diagnoseOutbound(true);
+});
+required<HTMLButtonElement>("#restart-codex").addEventListener("click", () => {
+  void restartCodexHard();
+});
 required<HTMLButtonElement>("#refresh").addEventListener("click", refreshDashboard);
+required<HTMLButtonElement>("#check-update").addEventListener("click", () => {
+  void checkAppUpdate(true);
+});
+required<HTMLButtonElement>("#update-skip").addEventListener("click", () => {
+  void skipPendingUpdate();
+});
+required<HTMLButtonElement>("#update-now").addEventListener("click", () => {
+  void installPendingUpdate();
+});
 required<HTMLButtonElement>("#nav-switcher").addEventListener("click", () =>
   setAdvancedSettingsVisible(false),
 );
@@ -540,6 +699,15 @@ required<HTMLButtonElement>("#mode-direct-config").addEventListener("click", () 
   selectSwitchMode("directConfig"),
 );
 required<HTMLButtonElement>("#stop-proxy").addEventListener("click", disableLocalProxy);
+required<HTMLButtonElement>("#stop-proxy-main").addEventListener("click", disableLocalProxy);
+required<HTMLButtonElement>("#repair-proxy").addEventListener("click", () => {
+  void repairFastSwitch();
+});
+required<HTMLSelectElement>("#outbound-proxy-mode").addEventListener("change", (event) => {
+  const target = event.currentTarget;
+  if (!(target instanceof HTMLSelectElement)) return;
+  void setOutboundProxyMode(target.value);
+});
 required<HTMLButtonElement>("#restore").addEventListener("click", restoreLatest);
 required<HTMLButtonElement>("#open-codex").addEventListener("click", () => openCodex());
 required<HTMLButtonElement>("#add-connection").addEventListener("click", openEditor);
@@ -572,7 +740,10 @@ required<HTMLButtonElement>("#choose-api-connection").addEventListener(
 required<HTMLButtonElement>("#close-editor").addEventListener("click", closeEditor);
 required<HTMLButtonElement>("#fetch-models").addEventListener("click", fetchAvailableModels);
 required<HTMLButtonElement>("#toggle-key").addEventListener("click", toggleKeyVisibility);
-required<HTMLInputElement>("#base-url").addEventListener("input", invalidateDiscovery);
+required<HTMLInputElement>("#base-url").addEventListener("input", () => {
+  updateHttpsLiteralIpWarnings();
+  invalidateDiscovery();
+});
 required<HTMLInputElement>("#base-url").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
@@ -619,7 +790,10 @@ required<HTMLDialogElement>("#editor").addEventListener("cancel", (event) => {
   void closeEditor();
 });
 
-void refreshDashboard().then(showRequestedBrowserPreview);
+void refreshDashboard().then(() => {
+  showRequestedBrowserPreview();
+  void checkAppUpdate(false);
+});
 
 function showRequestedBrowserPreview(): void {
   if (nativeAvailable) return;
@@ -646,6 +820,19 @@ function showRequestedBrowserPreview(): void {
       codexAccessTokenEnvironmentPresent: true,
     };
     renderDashboard();
+    return;
+  }
+  if (preview === "update") {
+    showUpdateDialog({
+      currentVersion: "0.3.4",
+      latestVersion: "0.3.5",
+      updateAvailable: true,
+      skipped: false,
+      releaseNotes: "修复启动检测，并补充手动检查更新入口。",
+      releaseUrl: "https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.5",
+      downloadUrl: "https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.5",
+      assetName: "Codex.Provider.Switcher_0.3.5_Windows-x64-Setup.exe",
+    });
   }
 }
 
@@ -674,6 +861,8 @@ function setAdvancedSettingsVisible(visible: boolean): void {
     top: 0,
     behavior: "smooth",
   });
+  const incoming = advancedActive ? panel : switcher;
+  void animatePage(incoming);
 }
 
 async function refreshDashboard(): Promise<void> {
@@ -686,6 +875,7 @@ async function refreshDashboard(): Promise<void> {
     await refreshCodexAccountStatus();
     dashboard = await invoke<DashboardState>("inspect_state");
     await refreshProxyStatus();
+    await refreshOutboundProxy(false);
     renderDashboard();
     if (dashboard.recoveryWarnings > 0) {
       return "检测到无法自动完成的恢复记录。应用已停止配置写入，请人工检查恢复文件后刷新。";
@@ -997,17 +1187,162 @@ function renderSwitchExperience(): void {
     openCodexButton.hidden = true;
   }
 
+  const issueText = localProxyIssueText();
+  if (issueText) {
+    summaryCopy.textContent = `${summaryCopy.textContent} ${issueText}`;
+  }
+
   stopButton.hidden =
-    localProxy.manualRecoveryRequired ||
-    (!localProxy.enabled && !localProxy.recoveryRequired);
+    !localProxy.enabled &&
+    !localProxy.recoveryRequired &&
+    !localProxy.manualRecoveryRequired &&
+    !localProxy.lastError;
   stopButton.disabled = busy;
+  const showRepairActions = needsProxyRepairActions();
+  const proxyActions = document.querySelector<HTMLElement>("#current-proxy-actions");
+  if (proxyActions) proxyActions.hidden = !showRepairActions;
+  updateHttpsLiteralIpWarnings();
   if (
     manualRecoveryBlocked ||
     (switchMode === "localProxy" && localProxy.recoveryRequired)
   ) {
     saveAndSwitch.disabled = true;
   }
+  renderOutboundNetwork();
 }
+
+function renderOutboundNetwork(): void {
+  const health = document.querySelector<HTMLElement>("#network-health");
+  const title = document.querySelector<HTMLElement>("#outbound-summary-title");
+  const copy = document.querySelector<HTMLElement>("#outbound-summary-copy");
+  const reportEl = document.querySelector<HTMLElement>("#outbound-report");
+  const modeSelect = document.querySelector<HTMLSelectElement>("#outbound-proxy-mode");
+  if (modeSelect && document.activeElement !== modeSelect) {
+    modeSelect.value = localProxy.outboundProxyMode || "auto";
+  }
+  if (!health) return;
+
+  health.className = "proxy-health";
+  const strong = health.querySelector("strong");
+  if (!outboundProxy) {
+    health.classList.add("proxy-health-muted");
+    if (strong) strong.textContent = "未检测";
+  } else if (outboundProxy.detected && outboundProxy.listening) {
+    health.classList.add("proxy-health-running");
+    if (strong) strong.textContent = outboundProxy.proxyUrl ?? "已连接";
+  } else if (outboundProxy.detected) {
+    health.classList.add("proxy-health-warning");
+    if (strong) strong.textContent = "已配置未监听";
+  } else {
+    health.classList.add("proxy-health-muted");
+    if (strong) strong.textContent = "未发现";
+  }
+
+  if (title && copy) {
+    if (outboundReport) {
+      title.textContent = outboundReport.verdict;
+      copy.textContent = outboundProxy?.detail ?? outboundReport.proxy.detail;
+    } else if (outboundProxy) {
+      title.textContent = outboundProxy.summary;
+      copy.textContent = outboundProxy.detail;
+    } else {
+      title.textContent = "尚未检测";
+      copy.textContent = "打开高级设置或点击检测后，会显示当前出站代理。";
+    }
+  }
+
+  if (reportEl) {
+    if (!outboundReport) {
+      reportEl.hidden = true;
+      reportEl.innerHTML = "";
+    } else {
+      reportEl.hidden = false;
+      const via = outboundReport.viaProxy;
+      const recs = outboundReport.recommendations
+        .map((item) => "<li>" + escapeHtml(item) + "</li>")
+        .join("");
+      reportEl.innerHTML =
+        '<div class="outbound-probe-grid">' +
+        '<div><span>直连</span><strong class="' +
+        (outboundReport.direct.ok ? "ok" : "bad") +
+        '">' +
+        escapeHtml(outboundReport.direct.message) +
+        "</strong><small>" +
+        outboundReport.direct.latencyMs +
+        " ms</small></div>" +
+        '<div><span>经代理</span><strong class="' +
+        (via?.ok ? "ok" : "bad") +
+        '">' +
+        escapeHtml(via?.message ?? "无代理") +
+        "</strong><small>" +
+        (via ? via.latencyMs + " ms" : "-") +
+        "</small></div></div>" +
+        '<p class="outbound-probe-base">探测: ' +
+        escapeHtml(outboundReport.probeBase) +
+        "</p>" +
+        (outboundReport.startedProxy
+          ? '<p class="outbound-started">' + escapeHtml(outboundReport.startedProxy) + "</p>"
+          : "") +
+        (recs ? '<ul class="outbound-recs">' + recs + "</ul>" : "");
+    }
+  }
+
+  const detectBtn = document.querySelector<HTMLButtonElement>("#detect-outbound");
+  const diagBtn = document.querySelector<HTMLButtonElement>("#diagnose-outbound");
+  const ensureBtn = document.querySelector<HTMLButtonElement>("#ensure-outbound");
+  if (detectBtn) detectBtn.disabled = busy || !nativeAvailable;
+  if (diagBtn) diagBtn.disabled = busy || !nativeAvailable;
+  if (ensureBtn) ensureBtn.disabled = busy || !nativeAvailable;
+  const restartCodexBtn = document.querySelector<HTMLButtonElement>("#restart-codex");
+  if (restartCodexBtn) restartCodexBtn.disabled = busy || !nativeAvailable;
+  const checkUpdateBtn = document.querySelector<HTMLButtonElement>("#check-update");
+  if (checkUpdateBtn) checkUpdateBtn.disabled = busy || !nativeAvailable;
+}
+
+async function refreshOutboundProxy(userTriggered: boolean): Promise<void> {
+  if (!nativeAvailable) return;
+  try {
+    if (userTriggered) setStatus("正在自动检测出站代理…", "working");
+    outboundProxy = await invoke<OutboundProxyStatus>("detect_outbound_proxy");
+    renderOutboundNetwork();
+    if (userTriggered) {
+      setStatus(
+        outboundProxy.summary,
+        outboundProxy.detected && outboundProxy.listening ? "success" : "info",
+      );
+    }
+  } catch (error) {
+    if (userTriggered) setStatus(String(error) || "出站代理检测失败", "error");
+  }
+}
+
+async function diagnoseOutbound(tryStart: boolean): Promise<void> {
+  if (!nativeAvailable) return;
+  await run(
+    tryStart ? "正在检测并尝试启动代理…" : "正在诊断上游网络（直连 vs 代理）…",
+    async () => {
+      const proxyProfile = dashboard.profiles.find(
+        (p) => p.id === localProxy.currentProfileId,
+      );
+      const lumingProfile = dashboard.profiles.find(
+        (p) => /luming/i.test(p.base_url) || /luming/i.test(p.display_name),
+      );
+      const activeBase =
+        (localProxy.enabled && proxyProfile?.base_url) ||
+        dashboard.current.baseUrl ||
+        lumingProfile?.base_url ||
+        "https://lumingapi.store";
+      outboundReport = await invoke<OutboundNetworkReport>("diagnose_outbound_network", {
+        probeBaseUrl: activeBase,
+        tryStart,
+      });
+      outboundProxy = outboundReport.proxy;
+      renderOutboundNetwork();
+      return outboundReport.verdict;
+    },
+  );
+}
+
 
 function renderProfiles(): void {
   const root = required<HTMLElement>("#profiles");
@@ -1249,6 +1584,7 @@ function openEditor(): void {
   input("#api-key").value = "";
   input("#model-search").value = "";
   input("#manual-model").value = "";
+  required<HTMLInputElement>("#supports-images").checked = true;
   required<HTMLElement>("#model-step").hidden = true;
   required<HTMLElement>("#editor-kicker").textContent = "添加接入";
   required<HTMLElement>("#editor-title").textContent = "选择接入方式";
@@ -1263,7 +1599,10 @@ function openEditor(): void {
   setEditorStep(1);
   setConnectionEditorView("choice");
   const editor = required<HTMLDialogElement>("#editor");
-  if (!editor.open) editor.showModal();
+  if (!editor.open) {
+    editor.showModal();
+    void animateDialogIn(editor);
+  }
   required<HTMLButtonElement>("#choose-official-connection").focus();
 }
 
@@ -1313,13 +1652,19 @@ async function openProfileEditor(
   required<HTMLButtonElement>("#save-and-switch").textContent = "保存并使用";
   input("#model-search").value = "";
   input("#manual-model").value = "";
+  required<HTMLInputElement>("#supports-images").checked = profile.models.some(
+    (model) => model.supports_images,
+  );
   required<HTMLElement>("#model-step").hidden = false;
   setConnectionEditorView("api");
   required<HTMLElement>("#editor-description").textContent =
     "更新接入信息、API Key 或可用模型。";
   setEditorStep(2);
   const editor = required<HTMLDialogElement>("#editor");
-  if (!editor.open) editor.showModal();
+  if (!editor.open) {
+    editor.showModal();
+    void animateDialogIn(editor);
+  }
   renderModelChoices();
   const activeModel =
     localProxy.enabled && localProxy.currentProfileId === profile.id
@@ -1379,7 +1724,10 @@ async function closeEditor(): Promise<void> {
   editingCredentialLoaded = false;
   editingCredentialDirty = false;
   const editor = required<HTMLDialogElement>("#editor");
-  if (editor.open) editor.close();
+  if (editor.open) {
+    await animateDialogOut(editor);
+    editor.close();
+  }
   required<HTMLElement>("#model-step").hidden = true;
   setEditorStep(1);
   input("#connection-name").value = "";
@@ -1809,8 +2157,126 @@ async function invokeProxyCommand(
   }
 }
 
+async function repairFastSwitch(): Promise<void> {
+  await run("\u6b63\u5728\u4e00\u952e\u4fee\u590d\u2026", async () => {
+    const report = await invoke<RepairFastSwitchReport>("repair_fast_switch");
+    localProxy = report.status;
+    proxyApiAvailable = true;
+    try {
+      dashboard = await invoke<DashboardState>("inspect_state");
+    } catch {
+      // Keep the repaired proxy status even if Codex config refresh fails.
+    }
+    await refreshProxyStatus();
+    renderDashboard();
+    const steps = report.steps.filter(Boolean).join("\uFF1B");
+    const issue = localProxyIssueText();
+    if (localProxy.lastError || (localProxy.enabled && !localProxy.running)) {
+      throw new Error(issue ? `${steps}\u3002${issue}` : steps);
+    }
+    return issue ? `${steps}\u3002${issue}` : steps || "\u4e00\u952e\u4fee\u590d\u5df2\u5b8c\u6210\u3002";
+  });
+}
+
+async function setOutboundProxyMode(mode: string): Promise<void> {
+  const normalized = mode.trim().toLowerCase();
+  if (
+    normalized !== "auto" &&
+    normalized !== "direct" &&
+    normalized !== "system"
+  ) {
+    return;
+  }
+  await run("\u6b63\u5728\u66f4\u65b0\u51fa\u7ad9\u4ee3\u7406\u65b9\u5f0f\u2026", async () => {
+    localProxy = await invoke<LocalProxyStatus>("set_outbound_proxy_mode", {
+      mode: normalized,
+    });
+    proxyApiAvailable = true;
+    await refreshProxyStatus();
+    renderDashboard();
+    return `\u51fa\u7ad9\u65b9\u5f0f\u5df2\u8bbe\u4e3a${outboundProxyModeLabel(normalized)}\u3002`;
+  });
+}
+
+function outboundProxyModeLabel(mode: string): string {
+  if (mode === "direct") return "\u59cb\u7ec8\u76f4\u8fde";
+  if (mode === "system") return "\u59cb\u7ec8\u8d70\u7cfb\u7edf\u4ee3\u7406";
+  return "\u81ea\u52a8";
+}
+
+function needsProxyRepairActions(): boolean {
+  if (!proxyApiAvailable) return false;
+  return (
+    dashboard.recoveryWarnings > 0 ||
+    localProxy.manualRecoveryRequired ||
+    localProxy.recoveryRequired ||
+    Boolean(localProxy.lastError) ||
+    (localProxy.enabled && !localProxy.running)
+  );
+}
+
+function localProxyIssueText(): string {
+  const parts: string[] = [];
+  if (localProxy.lastError) parts.push(localProxy.lastError);
+  if (
+    localProxy.enabled &&
+    !localProxy.running &&
+    !(localProxy.lastError || "").includes("15722 \u672a\u76d1\u542c")
+  ) {
+    parts.push("15722 \u672a\u76d1\u542c");
+  }
+  if (localProxy.ccSwitchDetected) {
+    parts.push("\u68c0\u6d4b\u5230 cc-switch\uff0c\u8bf7\u4e0d\u8981\u540c\u65f6\u5f00\u542f\u4e24\u4e2a\u5207\u6362\u5668\u3002");
+  }
+  return parts.join("\uFF1B");
+}
+
+function isHttpsLiteralIpUrl(value: string): boolean {
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.replace(/^\[/, "").replace(/\]$/, "");
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return true;
+    return host.includes(":");
+  } catch {
+    return false;
+  }
+}
+
+function updateHttpsLiteralIpWarnings(): void {
+  const message =
+    "HTTPS \u5b57\u9762 IP \u7684\u8bc1\u4e66\u901a\u5e38\u65e0\u6cd5\u901a\u8fc7\u6d4f\u89c8\u5668\u6821\u9a8c\uff1b\u8bf7\u7528 API \u63a2\u6d4b\u5065\u5eb7\u72b6\u6001\uff0c\u4e0d\u8981\u628a /usage \u9875\u9762\u5f53\u6210\u63a5\u53e3\u662f\u5426\u53ef\u7528\u7684\u4f9d\u636e\u3002";
+  const editorWarning = document.querySelector<HTMLElement>("#base-url-https-ip-warning");
+  if (editorWarning) {
+    const show = isHttpsLiteralIpUrl(input("#base-url").value);
+    editorWarning.hidden = !show;
+    editorWarning.textContent = show ? message : "";
+  }
+  const currentWarning = document.querySelector<HTMLElement>("#current-https-ip-warning");
+  if (currentWarning) {
+    const proxyIsActive =
+      localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
+    const proxyProfile = dashboard.profiles.find(
+      (profile) => profile.id === localProxy.currentProfileId,
+    );
+    const endpoint = proxyIsActive
+      ? (proxyProfile?.base_url ?? "")
+      : (dashboard.current.baseUrl ?? "");
+    const show = isHttpsLiteralIpUrl(endpoint);
+    currentWarning.hidden = !show;
+    currentWarning.textContent = show ? message : "";
+  }
+}
+
 async function disableLocalProxy(): Promise<void> {
-  if (!localProxy.enabled && !localProxy.recoveryRequired) return;
+  if (
+    !localProxy.enabled &&
+    !localProxy.recoveryRequired &&
+    !localProxy.manualRecoveryRequired &&
+    !localProxy.lastError
+  ) {
+    return;
+  }
   if (!window.confirm("关闭快速切换，并恢复开启前的 Codex 设置？")) return;
   await run("正在关闭快速切换…", async () => {
     localProxy = await invokeProxyCommand("disable_proxy");
@@ -1885,6 +2351,27 @@ async function restoreLatest(): Promise<void> {
   });
 }
 
+async function restartCodexHard(): Promise<void> {
+  if (!nativeAvailable) {
+    setStatus("请在桌面应用中使用一键重启 Codex。", "error");
+    return;
+  }
+  if (
+    !window.confirm(
+      "将强制结束 Codex 主进程及其 OpenAI\\Codex 运行时（含卡住的进程），然后重新打开。未保存的对话可能丢失。继续？",
+    )
+  ) {
+    return;
+  }
+  await run("正在强制结束并重启 Codex…", async () => {
+    const detail = await invoke<string>("restart_codex");
+    await refreshProxyStatus();
+    await refreshOutboundProxy(false).catch(() => undefined);
+    renderDashboard();
+    return `Codex 已强制重启（${detail}）。`;
+  });
+}
+
 async function openCodex(confirmFirst = true): Promise<void> {
   if (
     confirmFirst &&
@@ -1935,7 +2422,7 @@ function buildProfile(
         default_reasoning: "medium",
         reasoning_levels: ["low", "medium", "high"],
         supports_parallel_tool_calls: true,
-        supports_images: false,
+        supports_images: required<HTMLInputElement>("#supports-images").checked,
       })),
     supports_websockets: false,
     credential_required: true,
@@ -2056,6 +2543,78 @@ function toggleKeyVisibility(): void {
   button.textContent = key.type === "password" ? "显示" : "隐藏";
 }
 
+async function checkAppUpdate(manual: boolean): Promise<void> {
+  if (!nativeAvailable) {
+    if (manual) {
+      setStatus("请通过桌面应用检查更新。", "info");
+    }
+    return;
+  }
+  if (manual) {
+    setBusy(true);
+    setStatus("正在检查更新…", "working");
+  }
+  try {
+    const status = await invoke<AppUpdateStatus>("check_app_update");
+    required<HTMLElement>("#app-version").textContent = `Version ${status.currentVersion}`;
+    if (!status.updateAvailable) {
+      if (manual) {
+        setStatus(`当前已是最新版本 ${status.currentVersion}`, "success");
+      }
+      return;
+    }
+    if (!manual && status.skipped) return;
+    showUpdateDialog(status);
+    if (manual) {
+      setStatus(`发现新版本 ${status.latestVersion}`, "success");
+    }
+  } catch (error) {
+    if (manual) setStatus(friendlyError(error), "error");
+  } finally {
+    if (manual) setBusy(false);
+  }
+}
+
+function showUpdateDialog(status: AppUpdateStatus): void {
+  pendingUpdate = status;
+  required<HTMLElement>("#update-notice-copy").textContent =
+    `当前 Version ${status.currentVersion}，可更新到 ${status.latestVersion}。`;
+  const notes = required<HTMLElement>("#update-notice-notes");
+  const body = status.releaseNotes.trim();
+  notes.hidden = !body;
+  notes.textContent = body;
+  const dialog = required<HTMLDialogElement>("#update-notice");
+  if (!dialog.open) dialog.showModal();
+}
+
+async function skipPendingUpdate(): Promise<void> {
+  const status = pendingUpdate;
+  required<HTMLDialogElement>("#update-notice").close();
+  if (!status) return;
+  if (!nativeAvailable) {
+    setStatus(`已跳过 ${status.latestVersion}`, "info");
+    return;
+  }
+  await run(`已跳过 ${status.latestVersion}`, async () => {
+    await invoke("skip_app_update", { version: status.latestVersion });
+    return `已跳过 ${status.latestVersion}，有更新版本时会再提醒。`;
+  });
+}
+
+async function installPendingUpdate(): Promise<void> {
+  const status = pendingUpdate;
+  if (!status) return;
+  const url = status.downloadUrl || status.releaseUrl;
+  if (!nativeAvailable) {
+    window.open(url, "_blank", "noopener");
+    return;
+  }
+  await run("正在打开更新发布页…", async () => {
+    await invoke("open_app_update", { url });
+    return `已打开 ${status.latestVersion} 的安装包下载。安装完成后重新打开本应用即可。`;
+  });
+}
+
 async function run(
   message: string,
   action: () => Promise<string>,
@@ -2103,6 +2662,17 @@ function setStatus(message: string, kind: StatusKind): void {
 
 function friendlyError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  if (
+    message.includes("could not check for updates") ||
+    message.includes("update request timed out") ||
+    message.includes("update endpoint") ||
+    message.includes("update response")
+  ) {
+    return "暂时无法检查更新，请检查网络后重试。";
+  }
+  if (message.includes("could not open the update page") || message.includes("update URL")) {
+    return "无法打开更新链接。请稍后重试，或到 GitHub Release 页面手动下载。";
+  }
   if (message.includes("HTTP 401") || message.includes("HTTP 403")) {
     return "API Key 无效，或没有读取模型的权限。";
   }

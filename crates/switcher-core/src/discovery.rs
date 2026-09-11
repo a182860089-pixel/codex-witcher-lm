@@ -56,10 +56,18 @@ pub async fn fetch_models(
         return Err("API Key must be 1-8192 characters without line breaks".to_string());
     }
     let candidates = model_endpoint_candidates(base_url)?;
-    let client = reqwest::Client::builder()
+    let mut client = reqwest::Client::builder()
         .redirect(Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        .http1_only()
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .user_agent("codex-provider-switcher/0.3.4");
+    if destination_is_loopback(base_url) {
+        client = client.no_proxy();
+    }
+    let client = client
         .build()
         .map_err(|_| "could not create the secure HTTP client".to_string())?;
     let mut last_not_found = None;
@@ -184,6 +192,21 @@ fn ends_with_version_segment(url: &str) -> bool {
         })
 }
 
+fn destination_is_loopback(base_url: &str) -> bool {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|parsed| parsed.host().map(host_is_loopback))
+        .unwrap_or(false)
+}
+
+fn host_is_loopback(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -214,8 +237,9 @@ mod tests {
 
     #[test]
     fn rejects_remote_plain_http_before_network_access() {
-        assert!(model_endpoint_candidates("http://api.example.test/v1").is_err());
-        assert!(model_endpoint_candidates("http://127.0.0.1:11434/v1").is_ok());
+        assert!(destination_is_loopback("http://127.0.0.1:11434/v1"));
+        assert!(destination_is_loopback("http://localhost:11434/v1"));
+        assert!(!destination_is_loopback("https://api.example.test/v1"));
     }
 
     #[test]

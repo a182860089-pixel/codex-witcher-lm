@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::error::SwitcherError;
 use crate::validation::validate_profile;
 
-const PROFILE_STORE_SCHEMA_VERSION: u32 = 1;
+const PROFILE_STORE_SCHEMA_VERSION: u32 = 2;
 const MAX_SAVED_PROFILES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,12 +28,33 @@ impl Default for ProfileStore {
 }
 
 pub fn parse_profile_store(contents: &str) -> Result<ProfileStore> {
+    Ok(parse_profile_store_with_migration(contents)?.0)
+}
+
+pub fn parse_profile_store_with_migration(contents: &str) -> Result<(ProfileStore, bool)> {
     if contents.trim().is_empty() {
-        return Ok(ProfileStore::default());
+        return Ok((ProfileStore::default(), false));
     }
-    let store = serde_json::from_str::<ProfileStore>(contents)?;
+    let mut store = serde_json::from_str::<ProfileStore>(contents)?;
+    let migrated = migrate_profile_store(&mut store);
     validate_store(&store)?;
-    Ok(store)
+    Ok((store, migrated))
+}
+
+fn migrate_profile_store(store: &mut ProfileStore) -> bool {
+    if store.schema_version == PROFILE_STORE_SCHEMA_VERSION {
+        return false;
+    }
+    if store.schema_version != 1 {
+        return false;
+    }
+    for profile in &mut store.profiles {
+        for model in &mut profile.models {
+            model.supports_images = true;
+        }
+    }
+    store.schema_version = PROFILE_STORE_SCHEMA_VERSION;
+    true
 }
 
 pub fn render_profile_store(store: &ProfileStore) -> Result<Vec<u8>> {
@@ -159,5 +180,69 @@ mod tests {
         assert!(remove_profile(&mut store, "first").unwrap());
         assert!(!remove_profile(&mut store, "missing").unwrap());
         assert_eq!(store.profiles[0].id, "second");
+    }
+
+    #[test]
+    fn v1_store_enables_image_input_on_parse() {
+        let json = r#"{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "id": "acme",
+      "display_name": "Acme API",
+      "base_url": "https://acme.example/v1",
+      "models": [
+        {
+          "id": "acme/code",
+          "display_name": "acme/code",
+          "description": "",
+          "context_window": 128000,
+          "default_reasoning": "medium",
+          "reasoning_levels": ["low", "medium", "high"],
+          "supports_parallel_tool_calls": true,
+          "supports_images": false
+        }
+      ],
+      "supports_websockets": false,
+      "credential_required": true
+    }
+  ]
+}"#;
+        let (store, migrated) = parse_profile_store_with_migration(json).unwrap();
+        assert!(migrated);
+        assert_eq!(store.schema_version, 2);
+        assert!(store.profiles[0].models[0].supports_images);
+    }
+
+    #[test]
+    fn v2_store_keeps_explicit_image_opt_out() {
+        let json = r#"{
+  "schemaVersion": 2,
+  "profiles": [
+    {
+      "id": "acme",
+      "display_name": "Acme API",
+      "base_url": "https://acme.example/v1",
+      "models": [
+        {
+          "id": "acme/code",
+          "display_name": "acme/code",
+          "description": "",
+          "context_window": 128000,
+          "default_reasoning": "medium",
+          "reasoning_levels": ["low", "medium", "high"],
+          "supports_parallel_tool_calls": true,
+          "supports_images": false
+        }
+      ],
+      "supports_websockets": false,
+      "credential_required": true
+    }
+  ]
+}"#;
+        let (store, migrated) = parse_profile_store_with_migration(json).unwrap();
+        assert!(!migrated);
+        assert_eq!(store.schema_version, 2);
+        assert!(!store.profiles[0].models[0].supports_images);
     }
 }
