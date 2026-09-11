@@ -411,6 +411,18 @@ impl RouteConfig {
             .expect("a validated hierarchical base URL always joins a static path")
     }
 
+    fn contains_model(&self, model: &str) -> bool {
+        self.models.iter().any(|item| item.slug == model)
+    }
+
+    fn with_selected_model(&self, model: &str) -> Option<Self> {
+        if !self.contains_model(model) {
+            return None;
+        }
+        let mut next = self.clone();
+        next.selected_model = model.to_string();
+        Some(next)
+    }
 }
 
 fn catalog_etag_for(catalog: &CodexModelsResponse) -> String {
@@ -601,9 +613,7 @@ impl ProxyHandle {
 
     pub fn pin_thread(&self, thread_id: &str, route: RouteConfig) -> Result<(), ProxyError> {
         validate_turn_key_part("thread_id", thread_id)?;
-        self.state
-            .routes
-            .pin_thread(thread_id, Arc::new(route));
+        self.state.routes.pin_thread(thread_id, Arc::new(route));
         Ok(())
     }
 
@@ -869,17 +879,12 @@ impl RouteTable {
         }
         let mut pins = lock_unpoisoned(&self.conversation_pins);
         for conversation_id in matched_conversations {
-            pins.insert(
-                conversation_id,
-                Arc::clone(&route),
-                self.max_pinned_threads,
-            );
+            pins.insert(conversation_id, Arc::clone(&route), self.max_pinned_threads);
         }
     }
 
     fn pin_thread(&self, thread_id: &str, route: Arc<RouteConfig>) {
-        lock_unpoisoned(&self.pending_threads)
-            .retain(|binding| binding.thread_id != thread_id);
+        lock_unpoisoned(&self.pending_threads).retain(|binding| binding.thread_id != thread_id);
         self.remember(Arc::clone(&route));
         lock_unpoisoned(&self.thread_pins).insert(
             thread_id.to_string(),
@@ -940,22 +945,8 @@ impl RouteTable {
                 None => self.active()?,
             },
         };
-        if let Some(thread_id) = thread_id {
-            let already_pinned = lock_unpoisoned(&self.thread_pins)
-                .routes
-                .get(thread_id)
-                .is_some_and(|pinned| {
-                    pinned.id == route.id && pinned.selected_model == route.selected_model
-                });
-            if !already_pinned {
-                self.pin_thread(thread_id, Arc::clone(&route));
-            }
-        }
         if let Some(key) = turn_key {
             self.pin_turn(key, Arc::clone(&route));
-        }
-        for conversation_id in conversation_ids {
-            self.pin_conversation(conversation_id, Arc::clone(&route));
         }
         Some(route)
     }
@@ -988,9 +979,7 @@ impl RouteTable {
     }
 
     fn route_for_model(&self, model: &str) -> Option<Arc<RouteConfig>> {
-        let matches = |route: &RouteConfig| {
-            route.selected_model == model || route.models.iter().any(|item| item.slug == model)
-        };
+        let matches = |route: &RouteConfig| route.selected_model == model;
         for route in lock_unpoisoned(&self.thread_pins).routes.values() {
             if matches(route) {
                 return Some(Arc::clone(route));
@@ -1092,8 +1081,10 @@ impl RouteTable {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut seen_threads: HashSet<String> =
-            threads.iter().map(|binding| binding.thread_id.clone()).collect();
+        let mut seen_threads: HashSet<String> = threads
+            .iter()
+            .map(|binding| binding.thread_id.clone())
+            .collect();
         for binding in lock_unpoisoned(&self.pending_threads).iter() {
             if seen_threads.insert(binding.thread_id.clone()) {
                 threads.push(binding.clone());
@@ -1179,7 +1170,11 @@ struct LruRoutes {
 impl LruRoutes {
     fn insert(&mut self, route: Arc<RouteConfig>, max: usize) {
         let key = (route.id.clone(), route.selected_model.clone());
-        if self.routes.insert(key.clone(), Arc::clone(&route)).is_some() {
+        if self
+            .routes
+            .insert(key.clone(), Arc::clone(&route))
+            .is_some()
+        {
             self.insertion_order.retain(|item| item != &key);
         }
         self.insertion_order.push_back(key);
@@ -1200,11 +1195,7 @@ struct LruThreads {
 
 impl LruThreads {
     fn insert(&mut self, thread_id: String, route: Arc<RouteConfig>, max: usize) {
-        if self
-            .routes
-            .insert(thread_id.clone(), route)
-            .is_some()
-        {
+        if self.routes.insert(thread_id.clone(), route).is_some() {
             self.insertion_order.retain(|item| item != &thread_id);
         }
         self.insertion_order.push_back(thread_id);
@@ -1262,7 +1253,9 @@ fn extract_thread_id<'a>(headers: &'a HeaderMap, body: &'a Value) -> Option<&'a 
         ],
     )
     .or_else(|| string_at(body, "/client_metadata/thread_id"))
+    .or_else(|| string_at(body, "/client_metadata/session_id"))
     .or_else(|| string_at(body, "/thread_id"))
+    .or_else(|| string_at(body, "/session_id"))
     .or_else(|| string_at(body, "/metadata/thread_id"))
     .or_else(|| string_at(body, "/metadata/session_id"))
 }
@@ -1283,11 +1276,52 @@ fn extract_conversation_ids(headers: &HeaderMap, body: &Value) -> Vec<String> {
     push(string_at(body, "/conversation/id"));
     push(string_at(body, "/conversation"));
     push(string_at(body, "/metadata/conversation_id"));
+    push(string_at(body, "/prompt_cache_key"));
+    push(string_at(body, "/response_id"));
     push(first_header_value(
         headers,
-        &["conversation-id", "x-conversation-id", "x-codex-conversation-id"],
+        &[
+            "conversation-id",
+            "x-conversation-id",
+            "x-codex-conversation-id",
+        ],
     ));
     ids
+}
+
+fn outbound_model(route: &RouteConfig, requested: Option<&str>) -> String {
+    match requested {
+        Some(model) if route.contains_model(model) => model.to_string(),
+        _ => route.selected_model.clone(),
+    }
+}
+
+fn bind_route_to_model(route: &Arc<RouteConfig>, model: &str) -> Arc<RouteConfig> {
+    if route.selected_model == model {
+        return Arc::clone(route);
+    }
+    route
+        .with_selected_model(model)
+        .map(Arc::new)
+        .unwrap_or_else(|| Arc::clone(route))
+}
+
+fn strip_continuation_fields(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "previous_response_id",
+        "conversation_id",
+        "conversation",
+        "prompt_cache_key",
+        "response_id",
+    ] {
+        object.remove(key);
+    }
+    if let Some(Value::Object(metadata)) = object.get_mut("metadata") {
+        metadata.remove("conversation_id");
+    }
 }
 
 #[derive(Default)]
@@ -1315,9 +1349,10 @@ fn extract_provider_ids(bytes: &[u8]) -> Vec<String> {
     let mut ids = Vec::new();
     let mut index = 0;
     while index + 5 <= bytes.len() {
-        let prefix_len = if bytes[index..].starts_with(b"resp_") {
-            5
-        } else if bytes[index..].starts_with(b"conv_") {
+        let prefix_len = if bytes[index..].starts_with(b"resp_")
+            || bytes[index..].starts_with(b"conv_")
+            || bytes[index..].starts_with(b"sess_")
+        {
             5
         } else {
             index += 1;
@@ -1457,24 +1492,25 @@ async fn proxy_request(
             );
         }
     };
-    let thread_id = extract_thread_id(&parts.headers, &body);
+    let thread_id = extract_thread_id(&parts.headers, &body).map(str::to_string);
     let conversation_ids = extract_conversation_ids(&parts.headers, &body);
-    let requested_model = string_at(&body, "/model");
+    let requested_model = string_at(&body, "/model").map(str::to_string);
     let Some(route) = state.routes.resolve_with_conversations(
-        thread_id,
+        thread_id.as_deref(),
         turn_key,
-        requested_model,
+        requested_model.as_deref(),
         &conversation_ids,
     ) else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no active provider route");
     };
 
+    let outbound_model = outbound_model(route.as_ref(), requested_model.as_deref());
+    if !conversation_ids.is_empty() && outbound_model != route.selected_model {
+        strip_continuation_fields(&mut body);
+    }
     body.as_object_mut()
         .expect("object shape checked above")
-        .insert(
-            "model".to_string(),
-            Value::String(route.selected_model.clone()),
-        );
+        .insert("model".to_string(), Value::String(outbound_model.clone()));
     let body = match serde_json::to_vec(&body) {
         Ok(body) => body,
         Err(_) => {
@@ -1524,6 +1560,15 @@ async fn proxy_request(
         drop(lease);
         return normalize_upstream_error(status, upstream).await;
     }
+    let pin_route = bind_route_to_model(&route, &outbound_model);
+    if let Some(thread_id) = thread_id.as_deref() {
+        state.routes.pin_thread(thread_id, Arc::clone(&pin_route));
+    }
+    for conversation_id in &conversation_ids {
+        state
+            .routes
+            .pin_conversation(conversation_id, Arc::clone(&pin_route));
+    }
     let mut headers = sanitize_response_headers(upstream.headers());
     if let Some(catalog) = state.routes.catalog_response() {
         headers.insert(
@@ -1534,7 +1579,7 @@ async fn proxy_request(
     }
     let scanner = RefCell::new(ResponseIdScanner::default());
     let pin_state = Arc::clone(&state);
-    let pin_route = Arc::clone(&route);
+    let pin_route = Arc::clone(&pin_route);
     let stream = upstream.bytes_stream().map(move |item| {
         let _keep_request_active_until_stream_drop = &lease;
         match item {
@@ -1980,6 +2025,7 @@ mod tests {
             .resolve(Some("thread-1"), Some(key.clone()), Some("model-a"))
             .unwrap();
         assert_eq!(first.summary().id, "route-a");
+        table.pin_thread("thread-1", Arc::clone(&first));
 
         table.set_active(route("route-b", "model-b"));
         let pinned = table
@@ -2035,19 +2081,12 @@ mod tests {
     fn previous_response_id_keeps_the_original_route_after_a_switch() {
         let table = RouteTable::new(8);
         table.set_active(route("route-a", "model-a"));
-        let first = table
-            .resolve(None, None, Some("model-a"))
-            .unwrap();
+        let first = table.resolve(None, None, Some("model-a")).unwrap();
         table.pin_conversation("resp_oldchat1", Arc::clone(&first));
 
         table.set_active(route("route-b", "model-b"));
         let continued = table
-            .resolve_with_conversations(
-                None,
-                None,
-                Some("model-b"),
-                &["resp_oldchat1".to_string()],
-            )
+            .resolve_with_conversations(None, None, Some("model-b"), &["resp_oldchat1".to_string()])
             .unwrap();
         let fresh = table.resolve(None, None, Some("model-b")).unwrap();
         assert_eq!(continued.summary().id, "route-a");
@@ -2062,7 +2101,55 @@ mod tests {
         assert!(ids.iter().any(|id| id == "resp_abc12345"));
         let ids = extract_provider_ids(br#"{"id":"conv_hello123","model":"x"}"#);
         assert!(ids.iter().any(|id| id == "conv_hello123"));
+        let ids = extract_provider_ids(br#"{"id":"sess_hello123"}"#);
+        assert!(ids.iter().any(|id| id == "sess_hello123"));
         assert!(extract_provider_ids(b"resp_ab").is_empty());
+    }
+
+    #[test]
+    fn catalog_sibling_is_passed_through_instead_of_selecting_the_active_model() {
+        let mixed = RouteConfig::new(
+            "route-mixed",
+            "https://provider.example/v1",
+            "model-b",
+            vec![
+                ModelDescriptor::new("model-a", "A"),
+                ModelDescriptor::new("model-b", "B"),
+            ],
+            token("upstream-token-for-tests"),
+        )
+        .unwrap();
+        let table = RouteTable::new(8);
+        table.set_active(mixed);
+        let resolved = table.resolve(None, None, Some("model-a")).unwrap();
+        assert_eq!(resolved.summary().selected_model, "model-b");
+        assert_eq!(outbound_model(&resolved, Some("model-a")), "model-a");
+        assert_eq!(outbound_model(&resolved, Some("unknown")), "model-b");
+        assert_eq!(outbound_model(&resolved, None), "model-b");
+    }
+
+    #[test]
+    fn failed_resolve_does_not_pin_a_thread() {
+        let table = RouteTable::new(8);
+        table.set_active(route("route-a", "model-a"));
+        let _ = table
+            .resolve(
+                Some("thread-1"),
+                Some(TurnKey::new("thread-1", "turn-1").unwrap()),
+                Some("model-a"),
+            )
+            .unwrap();
+        assert_eq!(table.thread_pin_count(), 0);
+
+        table.set_active(route("route-b", "model-b"));
+        let next = table
+            .resolve(
+                Some("thread-1"),
+                Some(TurnKey::new("thread-1", "turn-2").unwrap()),
+                Some("model-b"),
+            )
+            .unwrap();
+        assert_eq!(next.summary().id, "route-b");
     }
 
     #[test]

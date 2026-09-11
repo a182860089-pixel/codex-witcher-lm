@@ -747,9 +747,8 @@ fn launch_installer_after_exit(path: &Path) -> Result<(), String> {
             .ok_or_else(|| "installer path is not valid UTF-8".to_string())?;
         let escaped = path_str.replace('\'', "'\\''");
         let pid = std::process::id();
-        let script = format!(
-            "while kill -0 {pid} 2>/dev/null; do sleep 0.25; done; open '{escaped}'"
-        );
+        let script =
+            format!("while kill -0 {pid} 2>/dev/null; do sleep 0.25; done; open '{escaped}'");
         return std::process::Command::new("/bin/sh")
             .args(["-c", &script])
             .stdin(Stdio::null())
@@ -917,9 +916,12 @@ mod tests {
         );
         assert!(validate_download_url(&ok).is_ok());
         assert!(
-            validate_download_url(&format!("{}/releases/tag/v0.3.7", github_release_base())).is_err()
+            validate_download_url(&format!("{}/releases/tag/v0.3.7", github_release_base()))
+                .is_err()
         );
-        assert!(validate_download_url("https://evil.example/releases/download/v0.3.7/a.exe").is_err());
+        assert!(
+            validate_download_url("https://evil.example/releases/download/v0.3.7/a.exe").is_err()
+        );
         assert!(allowed_redirect_url(
             &Url::parse("https://release-assets.githubusercontent.com/objects/abc").unwrap()
         ));

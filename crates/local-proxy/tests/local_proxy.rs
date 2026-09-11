@@ -413,7 +413,11 @@ async fn hot_switches_new_threads_but_keeps_existing_conversations_on_the_old_ro
         .json()
         .await
         .unwrap();
-    let slugs: Vec<_> = catalog.models.iter().map(|model| model.slug.as_str()).collect();
+    let slugs: Vec<_> = catalog
+        .models
+        .iter()
+        .map(|model| model.slug.as_str())
+        .collect();
     assert!(slugs.contains(&"model-a"));
     assert!(slugs.contains(&"model-b"));
 
@@ -575,6 +579,236 @@ async fn previous_response_id_keeps_existing_chats_on_the_old_route() {
     assert_eq!(fresh["provider"], "b");
     assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
     assert_eq!(state_b.requests.load(Ordering::Acquire), 1);
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn catalog_sibling_models_are_forwarded_instead_of_rewritten() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "luming",
+        "gpt-5.6-sol",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let existing = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "grok-4.6",
+            "input": "hello",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("existing chat response");
+    assert_eq!(existing.status(), StatusCode::OK);
+
+    let switched = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "new-thread")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "input": "new",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("switched chat response");
+    assert_eq!(switched.status(), StatusCode::OK);
+
+    let unknown = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "unknown-thread")
+        .json(&json!({
+            "model": "client-model",
+            "input": "unknown",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("unknown model response");
+    assert_eq!(unknown.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].body["model"], "grok-4.6");
+    assert_eq!(requests[1].body["model"], "gpt-5.6-sol");
+    assert_eq!(requests[2].body["model"], "gpt-5.6-sol");
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn switching_selected_model_does_not_rewrite_an_existing_catalog_thread() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "luming",
+        "grok-4.6",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let first = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "grok-4.6",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("first grok turn");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    proxy.set_active_route(route(
+        &upstream,
+        "luming",
+        "gpt-5.6-sol",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ));
+
+    let continued = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "grok-4.6",
+            "client_metadata": {"turn_id": "turn-two"}
+        }))
+        .send()
+        .await
+        .expect("continued grok turn");
+    assert_eq!(continued.status(), StatusCode::OK);
+
+    let fresh = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "other-thread")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("fresh gpt turn");
+    assert_eq!(fresh.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].body["model"], "grok-4.6");
+    assert_eq!(requests[1].body["model"], "grok-4.6");
+    assert_eq!(requests[2].body["model"], "gpt-5.6-sol");
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_turn_does_not_pin_the_thread_to_the_failing_route() {
+    let failing =
+        TestServer::spawn(Router::new().route("/v1/responses", post(json_unavailable))).await;
+    let (ok, state_ok) = marker_server("ok").await;
+    let proxy = proxy_with_route(route(
+        &failing,
+        "route-fail",
+        "model-a",
+        vec![model("model-a")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let first = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "model-a",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("failing turn");
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    proxy.set_active_route(route(&ok, "route-ok", "model-b", vec![model("model-b")]));
+
+    let retry: Value = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "model-b",
+            "client_metadata": {"turn_id": "turn-two"}
+        }))
+        .send()
+        .await
+        .expect("retry after failure")
+        .json()
+        .await
+        .expect("retry JSON");
+    assert_eq!(retry["provider"], "ok");
+    assert_eq!(state_ok.requests.load(Ordering::Acquire), 1);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn strips_continuation_ids_when_outbound_model_would_change() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "luming",
+        "gpt-5.6-sol",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "grok-4.6",
+            "previous_response_id": "resp_oldchat1",
+            "input": "hello"
+        }))
+        .send()
+        .await
+        .expect("stripped continuation response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["model"], "grok-4.6");
+    assert!(requests[0].body.get("previous_response_id").is_none());
+
     proxy.shutdown().await.unwrap();
 }
 

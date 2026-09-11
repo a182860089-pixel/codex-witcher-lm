@@ -127,7 +127,10 @@ mod tests {
         };
 
         let parsed: Value = serde_json::from_str(&render_model_catalog(&profile).unwrap()).unwrap();
-        assert_eq!(parsed["models"][0]["input_modalities"], json!(["text", "image"]));
+        assert_eq!(
+            parsed["models"][0]["input_modalities"],
+            json!(["text", "image"])
+        );
         assert_eq!(parsed["models"][0]["supports_image_detail_original"], true);
     }
 }

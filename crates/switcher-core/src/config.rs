@@ -498,11 +498,14 @@ pub fn verify_credential_binding(
         let configured_command = auth.get("command").and_then(|item| item.as_str());
         let command_matches = configured_command
             .is_some_and(|command| helpers_accept(credential_helper, Path::new(command)));
-        let cwd_matches = auth.get("cwd").and_then(|item| item.as_str()).is_some_and(|cwd| {
-            configured_command
-                .and_then(|command| Path::new(command).parent())
-                .is_some_and(|parent| paths_equivalent(Path::new(cwd), parent))
-        });
+        let cwd_matches = auth
+            .get("cwd")
+            .and_then(|item| item.as_str())
+            .is_some_and(|cwd| {
+                configured_command
+                    .and_then(|command| Path::new(command).parent())
+                    .is_some_and(|parent| paths_equivalent(Path::new(cwd), parent))
+            });
         let args_match = auth
             .get("args")
             .and_then(|item| item.as_array())
@@ -1006,15 +1009,8 @@ base_url = "https://vendor.example/v1"
             .join(helper_name);
         let catalog = absolute_test_path("models.json");
         let base_url = "http://127.0.0.1:15722/v1";
-        let plan = plan_proxy_config(
-            "",
-            &profile(),
-            "acme/code",
-            &catalog,
-            &new_helper,
-            base_url,
-        )
-        .unwrap();
+        let plan = plan_proxy_config("", &profile(), "acme/code", &catalog, &new_helper, base_url)
+            .unwrap();
         let account = proxy_credential_account_for(base_url).unwrap();
         verify_credential_binding(&plan.rendered_config, &account, &old_helper).unwrap();
         verify_credential_binding(&plan.rendered_config, &account, &new_helper).unwrap();

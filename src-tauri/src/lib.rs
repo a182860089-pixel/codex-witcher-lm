@@ -2557,9 +2557,7 @@ fn load_profiles_with_migration(paths: &AppPaths) -> Result<(ProfileStore, bool)
                 .map_err(|_| "could not read saved connections".to_string())?;
             let (store, migrated) = parse_profile_store_with_migration(&contents)
                 .map_err(|_| "saved connections file is invalid".to_string())?;
-            if migrated
-                && let Ok(rendered) = render_profile_store(&store)
-            {
+            if migrated && let Ok(rendered) = render_profile_store(&store) {
                 let _ = write_profiles(paths, &rendered);
             }
             Ok((store, migrated))
@@ -2952,7 +2950,7 @@ fn install_helper_copy(
             Ok(_) => {
                 if sha256_file(destination)? != expected_sha {
                     return Err(
-                        "the installed credential helper failed its integrity check".to_string(),
+                        "the installed credential helper failed its integrity check".to_string()
                     );
                 }
                 sync_helper_parent(destination)
@@ -3589,4 +3587,3 @@ mod tests {
         assert!(parse_outbound_proxy_mode("clash").is_err());
     }
 }
-
