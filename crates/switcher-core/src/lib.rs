@@ -8,6 +8,7 @@ mod domain;
 mod error;
 mod inspection;
 mod profiles;
+mod proxy_bypass;
 mod supervisor;
 mod transaction;
 mod validation;
@@ -25,7 +26,7 @@ pub use codex_account::{
 pub use config::{
     ConfigPlan, LOCAL_PROXY_PROVIDER_ID, LOCAL_PROXY_PROVIDER_NAME, credential_account_for,
     plan_config, plan_official_config, plan_proxy_config, proxy_credential_account_for,
-    verify_credential_binding, verify_proxy_config_binding,
+    retarget_local_proxy_base_url, verify_credential_binding, verify_proxy_config_binding,
 };
 pub use discovery::{
     FetchedModel, ModelDiscovery, fetch_models, model_endpoint_candidates, normalize_api_base_url,
@@ -37,7 +38,13 @@ pub use domain::{
 pub use error::{Result, SwitcherError};
 pub use inspection::{AuthKind, CurrentCodexConfig, inspect_config};
 pub use profiles::{
-    ProfileStore, parse_profile_store, remove_profile, render_profile_store, upsert_profile,
+    ProfileStore, parse_profile_store, parse_profile_store_with_migration, remove_profile,
+    render_profile_store, upsert_profile,
+};
+pub use proxy_bypass::{
+    LOOPBACK_NO_PROXY_HOSTS, NO_PROXY_MAX_CHARS, SanitizedNoProxy, UserNoProxyPersistPlan,
+    loopback_no_proxy_value, merge_no_proxy, no_proxy_covers_loopback, plan_user_no_proxy_persist,
+    sanitize_no_proxy, select_no_proxy_source, should_delete_duplicate_no_proxy,
 };
 pub use supervisor::{
     CdpSupervisor, InjectedScript, ListenerIdentityVerifier, ProcessIdentity,
@@ -46,8 +53,9 @@ pub use supervisor::{
 pub use transaction::{
     ApplyResult, BackupManifest, BackupStatus, ProxyDetachJournal, RecoveryOutcome, RestoreResult,
     apply_config_plan, apply_config_plan_with_transaction_id, backup_matches_applied,
-    create_private_directory, recover_prepared_backup, refresh_proxy_credential_helper_file,
-    restore_backup, restore_proxy_config_preserving_unrelated_changes, verify_backup_integrity,
-    verify_proxy_detach_recoverable, write_private_file,
+    create_private_directory, leftover_backup_requires_manual_review, recover_prepared_backup,
+    refresh_proxy_credential_helper_file, refresh_proxy_selected_model_file, restore_backup,
+    restore_proxy_config_preserving_unrelated_changes, retarget_local_proxy_base_url_file,
+    verify_backup_integrity, verify_proxy_detach_recoverable, write_private_file,
 };
 pub use validation::{validate_official_profile, validate_profile};

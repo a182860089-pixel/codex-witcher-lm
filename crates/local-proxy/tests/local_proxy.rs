@@ -139,6 +139,7 @@ fn no_redirect_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
+        .no_proxy()
         .build()
         .expect("test client")
 }
@@ -179,6 +180,7 @@ async fn authenticates_sanitizes_overwrites_and_exposes_health_and_models() {
         .header("connection", "x-remove")
         .header("x-remove", "hop-by-hop")
         .header("x-preserved", "preserved")
+        .header("accept-encoding", "gzip, deflate, br")
         .header("thread-id", "thread-a")
         .json(&json!({
             "model": "client-model",
@@ -218,6 +220,7 @@ async fn authenticates_sanitizes_overwrites_and_exposes_health_and_models() {
         assert!(!request.headers.contains_key("x-api-key"));
         assert!(!request.headers.contains_key("connection"));
         assert!(!request.headers.contains_key("x-remove"));
+        assert_eq!(request.headers["accept-encoding"], "identity");
         assert_eq!(request.body["model"], "model-a");
     }
     assert_eq!(requests[0].headers["x-preserved"], "preserved");
@@ -538,6 +541,160 @@ async fn never_retries_an_upstream_request() {
         .expect("failure response");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(state.hits.load(Ordering::Acquire), 1);
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn html_bad_gateway() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<html><body>Bad Gateway</body></html>",
+    )
+        .into_response()
+}
+
+async fn cloudflare_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<html><head><title>Attention Required! | Cloudflare</title></head><body>Sorry, you have been blocked</body></html>",
+    )
+        .into_response()
+}
+
+async fn json_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "message": "Service temporarily unavailable",
+                "type": "api_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn error_message(body: &Value) -> &str {
+    body["error"]["message"].as_str().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn html_upstream_errors_are_normalized_to_json() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(html_bad_gateway))).await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-html",
+        "model-html",
+        vec![model("model-html")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("html error response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = response.json().await.expect("json error body");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(
+        error_message(&body),
+        "upstream provider returned 502 Bad Gateway"
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cloudflare_html_blocks_are_normalized_to_json() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(cloudflare_forbidden))).await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-cf",
+        "model-cf",
+        vec![model("model-cf")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("cloudflare error response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: Value = response.json().await.expect("json error body");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(
+        error_message(&body),
+        "Cloudflare blocked the active provider (403 Forbidden)"
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_upstream_error_messages_are_preserved() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(json_unavailable))).await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-json-error",
+        "model-json-error",
+        vec![model("model-json-error")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("json error response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.expect("json error body");
+    assert_eq!(error_message(&body), "Service temporarily unavailable");
+    assert_eq!(body["error"]["type"], "api_error");
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unreachable_upstream_returns_a_json_bad_gateway() {
+    let proxy = proxy_with_route(
+        RouteConfig::single_model(
+            "route-dead",
+            "http://127.0.0.1:1/v1",
+            model("model-dead"),
+            bearer(UPSTREAM_TOKEN),
+        )
+        .expect("loopback dead route"),
+    )
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("dead upstream response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = response.json().await.expect("json error body");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert!(
+        error_message(&body).starts_with("the active provider"),
+        "unexpected gateway message: {}",
+        error_message(&body)
+    );
 
     proxy.shutdown().await.unwrap();
 }

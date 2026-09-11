@@ -1,4 +1,6 @@
+mod app_update;
 mod codex_account;
+mod outbound_proxy;
 
 use std::collections::HashMap;
 use std::fs;
@@ -9,6 +11,8 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -31,6 +35,7 @@ use codex_provider_switcher_core::ProfileStore;
 use codex_provider_switcher_core::ProviderProfile;
 use codex_provider_switcher_core::ReasoningEffort;
 use codex_provider_switcher_core::RecoveryOutcome;
+use codex_provider_switcher_core::UserNoProxyPersistPlan;
 use codex_provider_switcher_core::apply_config_plan;
 use codex_provider_switcher_core::apply_config_plan_with_transaction_id;
 use codex_provider_switcher_core::backup_matches_applied;
@@ -38,19 +43,26 @@ use codex_provider_switcher_core::create_private_directory;
 use codex_provider_switcher_core::credential_account_for;
 use codex_provider_switcher_core::fetch_models;
 use codex_provider_switcher_core::inspect_config;
+use codex_provider_switcher_core::leftover_backup_requires_manual_review;
+use codex_provider_switcher_core::merge_no_proxy;
 use codex_provider_switcher_core::model_endpoint_candidates;
+#[cfg(target_os = "macos")]
+use codex_provider_switcher_core::no_proxy_covers_loopback;
 use codex_provider_switcher_core::normalize_api_base_url;
-use codex_provider_switcher_core::parse_profile_store;
+use codex_provider_switcher_core::parse_profile_store_with_migration;
 use codex_provider_switcher_core::plan_config;
 use codex_provider_switcher_core::plan_official_config;
 use codex_provider_switcher_core::plan_proxy_config;
+use codex_provider_switcher_core::plan_user_no_proxy_persist;
 use codex_provider_switcher_core::proxy_credential_account_for;
 use codex_provider_switcher_core::recover_prepared_backup;
 use codex_provider_switcher_core::refresh_proxy_credential_helper_file;
+use codex_provider_switcher_core::refresh_proxy_selected_model_file;
 use codex_provider_switcher_core::remove_profile;
 use codex_provider_switcher_core::render_profile_store;
 use codex_provider_switcher_core::restore_backup;
 use codex_provider_switcher_core::restore_proxy_config_preserving_unrelated_changes;
+use codex_provider_switcher_core::retarget_local_proxy_base_url_file;
 use codex_provider_switcher_core::upsert_profile;
 use codex_provider_switcher_core::validate_official_profile;
 use codex_provider_switcher_core::verify_backup_integrity;
@@ -61,7 +73,10 @@ use codex_provider_switcher_core::write_private_file;
 use codex_provider_switcher_core::{CodexAccountStatus, CodexAuthMode};
 use codex_provider_switcher_credentials as credentials;
 use codex_provider_switcher_launcher::authorize_codex_parent;
+#[cfg(windows)]
+use codex_provider_switcher_launcher::notify_user_environment_changed;
 use codex_provider_switcher_launcher::open_codex as launch_codex;
+use codex_provider_switcher_launcher::restart_codex as launch_restart_codex;
 use codex_provider_switcher_local_proxy::BearerToken;
 use codex_provider_switcher_local_proxy::LocalProxy;
 use codex_provider_switcher_local_proxy::ModelDescriptor;
@@ -132,6 +147,15 @@ struct CredentialSessionSummary {
     base_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum OutboundProxyMode {
+    #[default]
+    Auto,
+    Direct,
+    System,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalProxyStatus {
@@ -143,6 +167,8 @@ struct LocalProxyStatus {
     current_model_id: Option<String>,
     requires_codex_restart: bool,
     last_error: Option<String>,
+    cc_switch_detected: bool,
+    outbound_proxy_mode: OutboundProxyMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +184,8 @@ struct StoredProxyState {
     revision: u64,
     #[serde(default)]
     requires_codex_restart: bool,
+    #[serde(default)]
+    outbound_proxy_mode: OutboundProxyMode,
 }
 
 impl Default for StoredProxyState {
@@ -171,6 +199,7 @@ impl Default for StoredProxyState {
             port: LOCAL_PROXY_PORT,
             revision: 0,
             requires_codex_restart: false,
+            outbound_proxy_mode: OutboundProxyMode::Auto,
         }
     }
 }
@@ -184,6 +213,7 @@ struct ProxyRuntime {
 struct ProxyRuntimeState {
     handle: Option<ProxyHandle>,
     last_error: Option<String>,
+    use_system_proxy: Option<bool>,
 }
 
 #[derive(Default)]
@@ -206,6 +236,13 @@ struct PendingDiscovery {
 
 #[derive(Clone, Default)]
 struct DiscoveryVault(Arc<Mutex<HashMap<Uuid, PendingDiscovery>>>);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairFastSwitchReport {
+    steps: Vec<String>,
+    status: LocalProxyStatus,
+}
 
 const DISCOVERY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_DISCOVERY_SESSIONS: usize = 8;
@@ -613,12 +650,14 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
                         "Codex settings and fast-switch recovery state could not be read safely"
                             .to_string(),
                     ),
+                    cc_switch_detected: cc_switch_process_running(),
+                    outbound_proxy_mode: OutboundProxyMode::Auto,
                 }),
             };
         }
     };
     let config_selected = config_state != ProxyConfigState::NotSelected;
-    let state = match load_proxy_state(&paths) {
+    let mut state = match load_proxy_state(&paths) {
         Ok(state) => state,
         Err(error) => {
             if let Some(handle) = runtime.handle.take() {
@@ -635,6 +674,8 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
                 current_model_id: None,
                 requires_codex_restart: config_selected,
                 last_error: Some(error),
+                cc_switch_detected: cc_switch_process_running(),
+                outbound_proxy_mode: fallback_state.outbound_proxy_mode,
             });
         }
     };
@@ -650,20 +691,24 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
                 !proxy_activation_can_restore_automatically(&paths, &state);
             return Ok(status);
         }
-        if runtime
-            .handle
-            .as_ref()
-            .is_none_or(|handle| !handle.health().running)
-        {
-            match load_proxy_route(&paths, &state) {
-                Ok((_, route)) => {
-                    if let Err(error) = start_proxy_handle(&state, &mut runtime, route, false).await
-                    {
+        adopt_codex_selected_model(&paths, &mut state);
+        let bypass_changed = match load_proxy_route(&paths, &state) {
+            Ok((_, route)) => {
+                match start_proxy_handle(&paths, &state, &mut runtime, route, false).await {
+                    Ok(changed) => changed,
+                    Err(error) => {
                         runtime.last_error = Some(error);
+                        false
                     }
                 }
-                Err(error) => runtime.last_error = Some(error),
             }
+            Err(error) => {
+                runtime.last_error = Some(error);
+                false
+            }
+        };
+        if bypass_changed {
+            remember_codex_restart_for_loopback_bypass(&paths, &mut state);
         }
         if runtime
             .handle
@@ -771,8 +816,10 @@ async fn enable_proxy(
     }
     if !config_needs_write {
         prepare_active_proxy_configuration(&paths, &next)?;
+        sync_managed_proxy_model(&paths, &selected_model)?;
     }
-    start_proxy_handle(&next, &mut runtime, route, true).await?;
+    let bypass_changed = start_proxy_handle(&paths, &next, &mut runtime, route, true).await?;
+    next.requires_codex_restart |= bypass_changed;
 
     if enable_background_startup(&app).is_err() {
         let _ = disable_background_startup(&app);
@@ -861,9 +908,11 @@ async fn switch_proxy_route(
         );
     }
     prepare_active_proxy_configuration(&paths, &previous)?;
-    let next = proxy_state_for_selection(&previous, &profile_id, &selected_model);
+    let mut next = proxy_state_for_selection(&previous, &profile_id, &selected_model);
     let (_, route) = load_proxy_route(&paths, &next)?;
-    start_proxy_handle(&next, &mut runtime, route, false).await?;
+    sync_managed_proxy_model(&paths, &selected_model)?;
+    let bypass_changed = start_proxy_handle(&paths, &next, &mut runtime, route, false).await?;
+    next.requires_codex_restart |= bypass_changed;
     if let Err(error) = write_proxy_state(&paths, &next) {
         rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
         return Err(error);
@@ -940,6 +989,203 @@ async fn disable_proxy(
 }
 
 #[tauri::command]
+async fn repair_fast_switch(
+    runtime: tauri::State<'_, ProxyRuntime>,
+) -> Result<RepairFastSwitchReport, String> {
+    let paths = app_paths()?;
+    let mut runtime = runtime.inner.lock().await;
+    let mut steps = Vec::new();
+
+    let persist_changed = ensure_loopback_proxy_bypass(&paths);
+    steps.push(if persist_changed {
+        "\u{5df2}\u{622a}\u{65ad}\u{5e76}\u{89c4}\u{8303}\u{5316} NO_PROXY".to_string()
+    } else {
+        "NO_PROXY \u{5df2}\u{5305}\u{542b}\u{56de}\u{73af}\u{5730}\u{5740}".to_string()
+    });
+
+    let quarantined = quarantine_invalid_backups(&paths);
+    steps.push(format!(
+        "\u{5df2}\u{9694}\u{79bb} {quarantined} \u{4e2a}\u{65e0}\u{6548}\u{5907}\u{4efd}\u{76ee}\u{5f55}"
+    ));
+
+    let (mut state, salvaged) = match load_proxy_state(&paths) {
+        Ok(state) => (state, false),
+        Err(_) => (salvage_proxy_state(&paths), true),
+    };
+    if salvaged {
+        steps.push(
+            "proxy.json \u{65e0}\u{6cd5}\u{89e3}\u{6790}\u{ff0c}\u{5df2}\u{4f7f}\u{7528}\u{53ef}\u{4fee}\u{590d}\u{7684}\u{9ed8}\u{8ba4}\u{72b6}\u{6001}"
+                .to_string(),
+        );
+    }
+
+    let mut profiles_migrated = false;
+    if let Ok((store, migrated)) = load_profiles_with_migration(&paths) {
+        profiles_migrated = migrated;
+        if let Some(profile_id) = state.profile_id.clone()
+            && let Some(profile) = store
+                .profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+        {
+            let applied = applied_transaction_model_id(&paths, &state);
+            if let Some(model_id) =
+                fallback_proxy_model_id(state.model_id.as_deref(), profile, applied.as_deref())
+                && state.model_id.as_deref() != Some(model_id.as_str())
+            {
+                state.model_id = Some(model_id);
+                steps.push(
+                    "\u{5df2}\u{5c06}\u{5931}\u{6548}\u{6a21}\u{578b}\u{56de}\u{9000}\u{5230}\u{53ef}\u{7528}\u{6a21}\u{578b}"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if profiles_migrated {
+        steps.push(
+            "\u{5df2}\u{4e3a}\u{5df2}\u{4fdd}\u{5b58}\u{63a5}\u{5165}\u{5f00}\u{542f}\u{56fe}\u{7247}\u{8f93}\u{5165}"
+                .to_string(),
+        );
+        state.requires_codex_restart = true;
+    }
+    coerce_proxy_state_for_repair(&mut state);
+    state.revision = state.revision.saturating_add(1);
+    write_proxy_state(&paths, &state)?;
+    steps.push(
+        "\u{5df2}\u{91cd}\u{5199} proxy.json\u{ff08}\u{53bb}\u{9664} BOM\u{ff09}".to_string(),
+    );
+
+    let proxy_url = proxy_base_url(LOCAL_PROXY_PORT);
+    match retarget_local_proxy_base_url_file(&paths.config, &proxy_url) {
+        Ok(true) => steps.push(
+            "\u{5df2}\u{5c06} Codex cps-local \u{6307}\u{56de} 127.0.0.1:15722".to_string(),
+        ),
+        Ok(false) => steps.push(
+            "Codex \u{672c}\u{5730}\u{4ee3}\u{7406}\u{5730}\u{5740}\u{65e0}\u{9700}\u{4fee}\u{6539}".to_string(),
+        ),
+        Err(error) => steps.push(format!(
+            "\u{672a}\u{80fd}\u{6539}\u{5199} Codex \u{672c}\u{5730}\u{4ee3}\u{7406}\u{5730}\u{5740}: {}",
+            redacted_core_error(error)
+        )),
+    }
+
+    if persist_changed {
+        remember_codex_restart_for_loopback_bypass(&paths, &mut state);
+    }
+
+    if state.enabled {
+        match load_proxy_route(&paths, &state) {
+            Ok((_, route)) => {
+                match start_proxy_handle(&paths, &state, &mut runtime, route, true).await {
+                    Ok(changed) => {
+                        if changed {
+                            remember_codex_restart_for_loopback_bypass(&paths, &mut state);
+                        }
+                        steps.push(
+                            "\u{5df2}\u{91cd}\u{542f}\u{672c}\u{5730} 15722 \u{76d1}\u{542c}"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        runtime.last_error = Some(error.clone());
+                        steps.push(format!(
+                            "\u{91cd}\u{542f}\u{672c}\u{5730}\u{76d1}\u{542c}\u{5931}\u{8d25}: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                runtime.last_error = Some(error.clone());
+                steps.push(format!(
+                    "\u{65e0}\u{6cd5}\u{52a0}\u{8f7d}\u{7ebf}\u{8def}: {error}"
+                ));
+            }
+        }
+    } else {
+        steps.push(
+            "\u{5feb}\u{901f}\u{5207}\u{6362}\u{672a}\u{542f}\u{7528}\u{ff0c}\u{672a}\u{542f}\u{52a8}\u{672c}\u{5730}\u{76d1}\u{542c}"
+                .to_string(),
+        );
+    }
+
+    let running = runtime
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.health().running);
+    if state.enabled && !running {
+        let message = match runtime.last_error.take() {
+            Some(existing) if existing.contains("15722") => existing,
+            Some(existing) => format!("{existing}\u{ff1b}15722 \u{672a}\u{76d1}\u{542c}"),
+            None => "15722 \u{672a}\u{76d1}\u{542c}".to_string(),
+        };
+        runtime.last_error = Some(message);
+    }
+
+    if cc_switch_process_running() {
+        steps.push(
+            "\u{68c0}\u{6d4b}\u{5230} cc-switch\u{ff0c}\u{8bf7}\u{4e0d}\u{8981}\u{540c}\u{65f6}\u{5f00}\u{542f}\u{4e24}\u{4e2a}\u{5207}\u{6362}\u{5668}"
+                .to_string(),
+        );
+    }
+
+    Ok(RepairFastSwitchReport {
+        steps,
+        status: proxy_status_from(&state, &runtime),
+    })
+}
+
+#[tauri::command]
+async fn set_outbound_proxy_mode(
+    mode: String,
+    runtime: tauri::State<'_, ProxyRuntime>,
+) -> Result<LocalProxyStatus, String> {
+    let parsed = parse_outbound_proxy_mode(&mode)?;
+    let paths = app_paths()?;
+    let mut runtime = runtime.inner.lock().await;
+    let mut state = load_proxy_state(&paths)?;
+    let mode_changed = state.outbound_proxy_mode != parsed;
+    state.outbound_proxy_mode = parsed;
+    if mode_changed {
+        state.revision = state.revision.saturating_add(1);
+        runtime.use_system_proxy = None;
+    }
+    write_proxy_state(&paths, &state)?;
+    if state.enabled {
+        match load_proxy_route(&paths, &state) {
+            Ok((_, route)) => {
+                match start_proxy_handle(&paths, &state, &mut runtime, route, false).await {
+                    Ok(changed) => {
+                        if changed {
+                            remember_codex_restart_for_loopback_bypass(&paths, &mut state);
+                        }
+                    }
+                    Err(error) => runtime.last_error = Some(error),
+                }
+            }
+            Err(error) => runtime.last_error = Some(error),
+        }
+    }
+    Ok(proxy_status_from(&state, &runtime))
+}
+
+fn salvage_proxy_state(paths: &AppPaths) -> StoredProxyState {
+    let Ok(contents) = fs::read_to_string(&paths.proxy_state) else {
+        return StoredProxyState::default();
+    };
+    serde_json::from_str::<StoredProxyState>(strip_utf8_bom(&contents)).unwrap_or_default()
+}
+
+fn coerce_proxy_state_for_repair(state: &mut StoredProxyState) {
+    state.schema_version = PROXY_STATE_SCHEMA_VERSION;
+    state.port = LOCAL_PROXY_PORT;
+    if validate_proxy_state(state).is_ok() {
+        return;
+    }
+    state.enabled = false;
+    state.activation_transaction_id = None;
+}
+
+#[tauri::command]
 fn delete_saved_profile(profile_id: String) -> Result<bool, String> {
     let paths = app_paths()?;
     match load_proxy_state(&paths) {
@@ -994,6 +1240,59 @@ fn open_codex() -> Result<String, String> {
     Ok(launched)
 }
 
+#[tauri::command]
+fn restart_codex() -> Result<String, String> {
+    let launched = launch_restart_codex()?;
+    if let Ok(paths) = app_paths()
+        && let Ok(mut state) = load_proxy_state(&paths)
+        && state.requires_codex_restart
+    {
+        state.requires_codex_restart = false;
+        state.revision = state.revision.saturating_add(1);
+        let _ = write_proxy_state(&paths, &state);
+    }
+    Ok(launched)
+}
+
+#[tauri::command]
+fn detect_outbound_proxy() -> outbound_proxy::OutboundProxyStatus {
+    outbound_proxy::detect_outbound_proxy()
+}
+
+#[tauri::command]
+async fn diagnose_outbound_network(
+    probe_base_url: Option<String>,
+    try_start: Option<bool>,
+) -> outbound_proxy::OutboundNetworkReport {
+    outbound_proxy::diagnose_outbound_network(outbound_proxy::DiagnoseOutboundInput {
+        probe_base_url,
+        try_start,
+    })
+    .await
+}
+
+#[tauri::command]
+async fn ensure_outbound_proxy() -> outbound_proxy::OutboundNetworkReport {
+    outbound_proxy::ensure_outbound_proxy().await
+}
+
+#[tauri::command]
+async fn check_app_update() -> Result<app_update::AppUpdateStatus, String> {
+    let skipped = load_skipped_update_version()?;
+    app_update::check_for_update(app_update::current_version(), skipped.as_deref()).await
+}
+
+#[tauri::command]
+fn skip_app_update(version: String) -> Result<(), String> {
+    app_update::validate_version_string(&version)?;
+    save_skipped_update_version(&version)
+}
+
+#[tauri::command]
+fn open_app_update(url: String) -> Result<(), String> {
+    app_update::open_release_url(&url)
+}
+
 pub fn run() {
     let background =
         std::env::args_os().any(|argument| argument == std::ffi::OsStr::new("--background"));
@@ -1038,9 +1337,18 @@ pub fn run() {
             enable_proxy,
             switch_proxy_route,
             disable_proxy,
+            repair_fast_switch,
+            set_outbound_proxy_mode,
             delete_saved_profile,
             restore_latest,
             open_codex,
+            restart_codex,
+            detect_outbound_proxy,
+            diagnose_outbound_network,
+            ensure_outbound_proxy,
+            check_app_update,
+            skip_app_update,
+            open_app_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Codex Provider Switcher");
@@ -1060,7 +1368,11 @@ fn start_proxy_on_launch(app: tauri::AppHandle, background: bool) {
             let runtime = app.state::<ProxyRuntime>();
             let mut runtime = runtime.inner.lock().await;
             let paths = app_paths()?;
-            let state = load_proxy_state(&paths)?;
+            let persist_changed = ensure_loopback_proxy_bypass(&paths);
+            let mut state = load_proxy_state(&paths)?;
+            if persist_changed {
+                remember_codex_restart_for_loopback_bypass(&paths, &mut state);
+            }
             let config_state = current_proxy_config_state(&paths, state.port)?;
             if !state.enabled {
                 if config_state != ProxyConfigState::NotSelected {
@@ -1080,9 +1392,20 @@ fn start_proxy_on_launch(app: tauri::AppHandle, background: bool) {
                     "fast-switch setup is incomplete; choose a connection again".to_string()
                 );
             }
+            if let Ok((_, migrated)) = load_profiles_with_migration(&paths)
+                && migrated
+            {
+                state.requires_codex_restart = true;
+                state.revision = state.revision.saturating_add(1);
+                let _ = write_proxy_state(&paths, &state);
+            }
             prepare_active_proxy_configuration(&paths, &state)?;
             let (_, route) = load_proxy_route(&paths, &state)?;
-            start_proxy_handle(&state, &mut runtime, route, false).await?;
+            let bypass_changed =
+                start_proxy_handle(&paths, &state, &mut runtime, route, false).await?;
+            if bypass_changed {
+                remember_codex_restart_for_loopback_bypass(&paths, &mut state);
+            }
             enable_background_startup(&app)
         }
         .await;
@@ -1104,7 +1427,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tauri::menu::MenuItem::with_id(app, "quit-switcher", "退出", true, None::<&str>)?;
     let menu = tauri::menu::Menu::with_items(app, &[&open_item, &quit_item])?;
     let mut tray = tauri::tray::TrayIconBuilder::new()
-        .tooltip("Codex 模型切换")
+        .tooltip("LM Codex Switch")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1335,6 +1658,8 @@ fn proxy_status_from(state: &StoredProxyState, runtime: &ProxyRuntimeState) -> L
         current_model_id: state.model_id.clone(),
         requires_codex_restart: state.requires_codex_restart,
         last_error: runtime.last_error.clone(),
+        cc_switch_detected: cc_switch_process_running(),
+        outbound_proxy_mode: state.outbound_proxy_mode,
     }
 }
 
@@ -1352,6 +1677,7 @@ fn proxy_state_for_selection(
         port: previous.port,
         revision: previous.revision.saturating_add(1),
         requires_codex_restart: previous.requires_codex_restart,
+        outbound_proxy_mode: previous.outbound_proxy_mode,
     }
 }
 
@@ -1546,14 +1872,6 @@ fn verify_active_proxy_configuration(
     verify_backup_integrity(&manifest_path, &paths.config, &paths.catalog)
         .map_err(redacted_core_error)?;
     let config = read_config_safely(&paths.config)?;
-    let current = inspect_config(&config).map_err(redacted_core_error)?;
-    let manifest_model = manifest
-        .model_id
-        .as_deref()
-        .ok_or_else(|| "the managed local proxy restore point has no model".to_string())?;
-    if current.model_id.as_deref() != Some(manifest_model) {
-        return Err("the managed local proxy model changed after activation".to_string());
-    }
     let helper = verify_core_proxy_config_binding(&config, &proxy_base_url(state.port))
         .map_err(redacted_core_error)?;
     verify_managed_helper(paths, &helper)?;
@@ -1568,6 +1886,68 @@ fn prepare_active_proxy_configuration(
     refresh_proxy_credential_helper_file(&paths.config, &proxy_base_url(state.port), &paths.helper)
         .map_err(redacted_core_error)?;
     verify_active_proxy_configuration(paths, state)
+}
+
+fn sync_managed_proxy_model(paths: &AppPaths, selected_model: &str) -> Result<(), String> {
+    refresh_proxy_selected_model_file(
+        &paths.config,
+        &proxy_base_url(LOCAL_PROXY_PORT),
+        selected_model,
+    )
+    .map(|_| ())
+    .map_err(redacted_core_error)
+}
+
+fn adopt_codex_selected_model(paths: &AppPaths, state: &mut StoredProxyState) {
+    let Some(profile_id) = state.profile_id.clone() else {
+        return;
+    };
+    let Ok(config) = read_config_safely(&paths.config) else {
+        return;
+    };
+    let Ok(current) = inspect_config(&config) else {
+        return;
+    };
+    let Some(config_model) = current.model_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let Ok(store) = load_profiles(paths) else {
+        return;
+    };
+    let Some(profile) = store
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        return;
+    };
+    let Some(next_model) = adopted_proxy_model(state.model_id.as_deref(), profile, &config_model)
+    else {
+        return;
+    };
+    let previous_model = state.model_id.clone();
+    let previous_revision = state.revision;
+    state.model_id = Some(next_model);
+    state.revision = state.revision.saturating_add(1);
+    if write_proxy_state(paths, state).is_err() {
+        state.model_id = previous_model;
+        state.revision = previous_revision;
+    }
+}
+
+fn adopted_proxy_model(
+    current_model_id: Option<&str>,
+    profile: &ProviderProfile,
+    config_model: &str,
+) -> Option<String> {
+    if current_model_id == Some(config_model) {
+        return None;
+    }
+    profile
+        .models
+        .iter()
+        .any(|model| model.id == config_model)
+        .then(|| config_model.to_string())
 }
 
 fn recover_proxy_activation_transaction(paths: &AppPaths) -> Result<Option<Uuid>, String> {
@@ -1671,7 +2051,7 @@ fn load_proxy_state(paths: &AppPaths) -> Result<StoredProxyState, String> {
         Ok(_) => {
             let contents = fs::read_to_string(&paths.proxy_state)
                 .map_err(|_| "could not read fast-switch state".to_string())?;
-            serde_json::from_str::<StoredProxyState>(&contents)
+            serde_json::from_str::<StoredProxyState>(strip_utf8_bom(&contents))
                 .map_err(|_| "fast-switch state is invalid".to_string())?
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => StoredProxyState::default(),
@@ -1734,7 +2114,7 @@ fn load_proxy_route(
         .profile_id
         .as_deref()
         .ok_or_else(|| "choose a saved connection before enabling fast switching".to_string())?;
-    let model_id = state
+    let requested_model = state
         .model_id
         .as_deref()
         .ok_or_else(|| "choose a model before enabling fast switching".to_string())?;
@@ -1743,9 +2123,10 @@ fn load_proxy_route(
         .into_iter()
         .find(|profile| profile.id == profile_id)
         .ok_or_else(|| "the selected saved connection no longer exists".to_string())?;
-    if !profile.models.iter().any(|model| model.id == model_id) {
-        return Err("the selected model no longer belongs to this connection".to_string());
-    }
+    let applied_model = applied_transaction_model_id(paths, state);
+    let model_id =
+        fallback_proxy_model_id(Some(requested_model), &profile, applied_model.as_deref())
+            .ok_or_else(|| "this connection has no models".to_string())?;
     let account =
         credential_account_for(&profile.id, &profile.base_url).map_err(redacted_core_error)?;
     let secret =
@@ -1757,7 +2138,7 @@ fn load_proxy_route(
     let route = RouteConfig::new(
         profile.id.clone(),
         &profile.base_url,
-        model_id,
+        &model_id,
         models,
         bearer,
     )
@@ -1799,24 +2180,231 @@ fn reasoning_effort_id(effort: &ReasoningEffort) -> &'static str {
     }
 }
 
+fn remember_codex_restart_for_loopback_bypass(paths: &AppPaths, state: &mut StoredProxyState) {
+    if state.requires_codex_restart {
+        return;
+    }
+    state.requires_codex_restart = true;
+    state.revision = state.revision.saturating_add(1);
+    let _ = write_proxy_state(paths, state);
+}
+
+fn ensure_loopback_proxy_bypass(paths: &AppPaths) -> bool {
+    let user_upper = windows_user_env("NO_PROXY");
+    let user_lower = windows_user_env("no_proxy");
+    let process = process_no_proxy_value();
+    let plan = plan_user_no_proxy_persist(
+        user_upper.as_deref(),
+        user_lower.as_deref(),
+        process.as_deref(),
+    );
+    set_process_no_proxy(&plan.process_value);
+    if let Some(original) = plan.backup_original.as_ref() {
+        let _ = backup_truncated_no_proxy(paths, original);
+    }
+    persist_loopback_no_proxy(&plan)
+}
+
+fn set_process_no_proxy(value: &str) {
+    unsafe {
+        std::env::set_var("NO_PROXY", value);
+        std::env::set_var("no_proxy", value);
+    }
+}
+
+fn effective_no_proxy_value() -> Option<String> {
+    for key in ["NO_PROXY", "no_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    windows_user_or_machine_env("NO_PROXY").or_else(|| windows_user_or_machine_env("no_proxy"))
+}
+
+fn persist_loopback_no_proxy(plan: &UserNoProxyPersistPlan) -> bool {
+    persist_loopback_no_proxy_platform(plan)
+}
+
+#[cfg(windows)]
+fn persist_loopback_no_proxy_platform(plan: &UserNoProxyPersistPlan) -> bool {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::KEY_READ;
+    use winreg::enums::KEY_SET_VALUE;
+
+    if !plan.persist_changed {
+        return false;
+    }
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(env_key) = current_user.open_subkey_with_flags("Environment", KEY_READ | KEY_SET_VALUE)
+    else {
+        return false;
+    };
+    if env_key
+        .set_value("NO_PROXY", &plan.persist_user_no_proxy)
+        .is_err()
+    {
+        return false;
+    }
+    if plan.delete_user_no_proxy_alt {
+        let _ = env_key.delete_value("no_proxy");
+    }
+    notify_user_environment_changed();
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn persist_loopback_no_proxy_platform(plan: &UserNoProxyPersistPlan) -> bool {
+    fn launchctl_getenv(name: &str) -> Option<String> {
+        let output = std::process::Command::new("/usr/bin/launchctl")
+            .args(["getenv", name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(output.stdout).ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+
+    let existing = launchctl_getenv("NO_PROXY").or_else(|| launchctl_getenv("no_proxy"));
+    if no_proxy_covers_loopback(existing.as_deref())
+        && existing.as_deref() == Some(plan.process_value.as_str())
+    {
+        return false;
+    }
+    let persisted = plan.process_value.clone();
+    let upper = std::process::Command::new("/usr/bin/launchctl")
+        .args(["setenv", "NO_PROXY", &persisted])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let lower = std::process::Command::new("/usr/bin/launchctl")
+        .args(["setenv", "no_proxy", &persisted])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let _ = plan.process_value;
+    upper || lower
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn persist_loopback_no_proxy_platform(_plan: &UserNoProxyPersistPlan) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn windows_user_or_machine_env(name: &str) -> Option<String> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::enums::KEY_READ;
+
+    let user = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ)
+        .ok()
+        .and_then(|key| key.get_value::<String, _>(name).ok());
+    if let Some(value) = user.filter(|value| !value.trim().is_empty()) {
+        return Some(value);
+    }
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            KEY_READ,
+        )
+        .ok()
+        .and_then(|key| key.get_value::<String, _>(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(not(windows))]
+fn windows_user_or_machine_env(_name: &str) -> Option<String> {
+    None
+}
+
+fn detected_http_proxy_url() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    windows_user_or_machine_env("HTTPS_PROXY")
+        .or_else(|| windows_user_or_machine_env("https_proxy"))
+        .or_else(|| windows_user_or_machine_env("HTTP_PROXY"))
+        .or_else(|| windows_user_or_machine_env("http_proxy"))
+}
+
+async fn verify_loopback_not_intercepted(port: u16) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let merged = merge_no_proxy(effective_no_proxy_value().as_deref());
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(3))
+        .http1_only();
+    if let Some(proxy_url) = detected_http_proxy_url()
+        && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
+    {
+        builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(&merged)));
+    } else {
+        builder = builder.no_proxy();
+    }
+    let client = builder
+        .build()
+        .map_err(|_| "could not verify the local proxy listener".to_string())?;
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(()),
+    };
+    if response.status() == reqwest::StatusCode::BAD_GATEWAY {
+        return Err(
+            "a local system proxy is intercepting 127.0.0.1; fully restart Codex so it can reach the fast-switch listener"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 async fn start_proxy_handle(
+    paths: &AppPaths,
     state: &StoredProxyState,
     runtime: &mut ProxyRuntimeState,
     route: RouteConfig,
     allow_create_token: bool,
-) -> Result<(), String> {
-    if runtime
+) -> Result<bool, String> {
+    let persistent_changed = ensure_loopback_proxy_bypass(paths);
+    let use_system_proxy = resolve_use_system_proxy(state);
+    let running_same_proxy = runtime
         .handle
         .as_ref()
         .is_some_and(|handle| handle.health().running)
-    {
+        && runtime.use_system_proxy == Some(use_system_proxy);
+    if running_same_proxy {
         runtime
             .handle
             .as_ref()
             .expect("running handle checked above")
             .set_active_route(route);
         runtime.last_error = None;
-        return Ok(());
+        return Ok(persistent_changed);
     }
     if let Some(stale) = runtime.handle.take() {
         let _ = stale.shutdown().await;
@@ -1840,6 +2428,7 @@ async fn start_proxy_handle(
     let options = ProxyStartOptions {
         port: state.port,
         max_request_bytes: LOCAL_PROXY_MAX_REQUEST_BYTES,
+        use_system_proxy,
         ..ProxyStartOptions::default()
     };
     let handle = LocalProxy::start(options, entry_bearer)
@@ -1850,9 +2439,14 @@ async fn start_proxy_handle(
         return Err("the local proxy started on an unexpected port".to_string());
     }
     handle.set_active_route(route);
+    if let Err(error) = verify_loopback_not_intercepted(state.port).await {
+        let _ = handle.shutdown().await;
+        return Err(error);
+    }
     runtime.handle = Some(handle);
+    runtime.use_system_proxy = Some(use_system_proxy);
     runtime.last_error = None;
-    Ok(())
+    Ok(persistent_changed)
 }
 
 async fn rollback_proxy_runtime(
@@ -1862,7 +2456,9 @@ async fn rollback_proxy_runtime(
 ) {
     if previous.enabled {
         let rollback = match load_proxy_route(paths, previous) {
-            Ok((_, route)) => start_proxy_handle(previous, runtime, route, false).await,
+            Ok((_, route)) => start_proxy_handle(paths, previous, runtime, route, false)
+                .await
+                .map(|_| ()),
             Err(error) => Err(error),
         };
         if let Err(error) = rollback {
@@ -1895,6 +2491,7 @@ struct AppPaths {
     profiles: PathBuf,
     official_profile: PathBuf,
     proxy_state: PathBuf,
+    update_preference: PathBuf,
     backups: PathBuf,
     executable: PathBuf,
     helper: PathBuf,
@@ -1929,6 +2526,7 @@ fn app_paths() -> Result<AppPaths, String> {
         profiles: state.join("profiles.json"),
         official_profile: state.join("official-profile.json"),
         proxy_state: state.join("proxy.json"),
+        update_preference: state.join("update-preference.json"),
         backups: state.join("backups"),
         executable,
         helper,
@@ -1937,6 +2535,10 @@ fn app_paths() -> Result<AppPaths, String> {
 }
 
 fn load_profiles(paths: &AppPaths) -> Result<ProfileStore, String> {
+    Ok(load_profiles_with_migration(paths)?.0)
+}
+
+fn load_profiles_with_migration(paths: &AppPaths) -> Result<(ProfileStore, bool), String> {
     match fs::symlink_metadata(&paths.profiles) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             Err("saved connections path is not a safe regular file".to_string())
@@ -1944,10 +2546,18 @@ fn load_profiles(paths: &AppPaths) -> Result<ProfileStore, String> {
         Ok(_) => {
             let contents = fs::read_to_string(&paths.profiles)
                 .map_err(|_| "could not read saved connections".to_string())?;
-            parse_profile_store(&contents)
-                .map_err(|_| "saved connections file is invalid".to_string())
+            let (store, migrated) = parse_profile_store_with_migration(&contents)
+                .map_err(|_| "saved connections file is invalid".to_string())?;
+            if migrated
+                && let Ok(rendered) = render_profile_store(&store)
+            {
+                let _ = write_profiles(paths, &rendered);
+            }
+            Ok((store, migrated))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProfileStore::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((ProfileStore::default(), false))
+        }
         Err(_) => Err("could not inspect saved connections".to_string()),
     }
 }
@@ -2067,6 +2677,47 @@ fn refresh_official_account_metadata_if_readable(
     Ok(())
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatePreference {
+    schema_version: u32,
+    skipped_version: Option<String>,
+}
+
+fn load_skipped_update_version() -> Result<Option<String>, String> {
+    let paths = app_paths()?;
+    match fs::symlink_metadata(&paths.update_preference) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("update preference path is not a safe regular file".to_string())
+        }
+        Ok(_) => {
+            let contents = fs::read_to_string(&paths.update_preference)
+                .map_err(|_| "could not read update preference".to_string())?;
+            let parsed = serde_json::from_str::<UpdatePreference>(&contents)
+                .map_err(|_| "update preference is invalid".to_string())?;
+            if parsed.schema_version != 1 {
+                return Ok(None);
+            }
+            Ok(parsed
+                .skipped_version
+                .filter(|value| app_update::validate_version_string(value).is_ok()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("could not inspect update preference".to_string()),
+    }
+}
+
+fn save_skipped_update_version(version: &str) -> Result<(), String> {
+    let paths = app_paths()?;
+    ensure_state_root(&paths)?;
+    let rendered = serde_json::to_vec_pretty(&UpdatePreference {
+        schema_version: 1,
+        skipped_version: Some(version.to_string()),
+    })
+    .map_err(|_| "could not encode update preference".to_string())?;
+    write_private_file(&paths.update_preference, &rendered)
+        .map_err(|_| "could not save update preference".to_string())
+}
 fn ensure_state_root(paths: &AppPaths) -> Result<(), String> {
     match fs::symlink_metadata(&paths.state) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -2305,6 +2956,7 @@ fn read_config_safely(path: &Path) -> Result<String, String> {
             Err("Codex configuration path is not a regular file".to_string())
         }
         Ok(_) => fs::read_to_string(path)
+            .map(|contents| strip_utf8_bom(&contents).to_string())
             .map_err(|_| "could not read the Codex configuration as UTF-8".to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(_) => Err("could not inspect the Codex configuration".to_string()),
@@ -2334,6 +2986,9 @@ fn latest_applied_manifest(paths: &AppPaths) -> Result<Option<PathBuf>, String> 
     let mut latest: Option<(u128, PathBuf)> = None;
     for entry in entries.flatten() {
         let path = entry.path().join("manifest.json");
+        if entry.file_name() == std::ffi::OsStr::new(".quarantine") {
+            continue;
+        }
         if recover_prepared_backup(&path, &paths.config, &paths.catalog).is_err() {
             continue;
         }
@@ -2364,17 +3019,198 @@ fn latest_applied_manifest(paths: &AppPaths) -> Result<Option<PathBuf>, String> 
     Ok(latest.map(|(_, path)| path))
 }
 
-fn recover_prepared_manifests(paths: &AppPaths) -> usize {
+fn strip_utf8_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
+fn process_no_proxy_value() -> Option<String> {
+    for key in ["NO_PROXY", "no_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn backup_truncated_no_proxy(paths: &AppPaths, original: &str) -> Result<(), String> {
+    let _ = fs::create_dir_all(&paths.state);
+    write_private_file(&paths.state.join("no_proxy.bak.txt"), original.as_bytes())
+        .map_err(|_| "could not backup NO_PROXY".to_string())
+}
+
+#[cfg(windows)]
+fn windows_user_env(name: &str) -> Option<String> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::KEY_READ;
+
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ)
+        .ok()
+        .and_then(|key| key.get_value::<String, _>(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(not(windows))]
+fn windows_user_env(_name: &str) -> Option<String> {
+    None
+}
+
+fn fallback_proxy_model_id(
+    requested: Option<&str>,
+    profile: &ProviderProfile,
+    applied: Option<&str>,
+) -> Option<String> {
+    for candidate in [requested, applied].into_iter().flatten() {
+        if profile.models.iter().any(|model| model.id == candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    profile.models.first().map(|model| model.id.clone())
+}
+
+fn applied_transaction_model_id(paths: &AppPaths, state: &StoredProxyState) -> Option<String> {
+    let path = proxy_activation_manifest_path(paths, state).ok()?;
+    read_proxy_activation_manifest_metadata(paths, &path)
+        .ok()
+        .and_then(|manifest| manifest.model_id)
+}
+
+fn parse_outbound_proxy_mode(value: &str) -> Result<OutboundProxyMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(OutboundProxyMode::Auto),
+        "direct" => Ok(OutboundProxyMode::Direct),
+        "system" => Ok(OutboundProxyMode::System),
+        _ => Err("outbound proxy mode must be auto, direct, or system".to_string()),
+    }
+}
+
+fn resolve_use_system_proxy(state: &StoredProxyState) -> bool {
+    match state.outbound_proxy_mode {
+        OutboundProxyMode::Direct => false,
+        OutboundProxyMode::System => true,
+        OutboundProxyMode::Auto => cached_outbound_listening(),
+    }
+}
+
+fn cached_outbound_listening() -> bool {
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((at, listening)) = *cache
+        && at.elapsed() < Duration::from_secs(2)
+    {
+        return listening;
+    }
+    let listening = outbound_proxy::detect_outbound_proxy().listening == Some(true);
+    *cache = Some((Instant::now(), listening));
+    listening
+}
+
+fn cc_switch_process_running() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq cc-switch.exe", "/FO", "CSV", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("cc-switch")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn should_quarantine_backup_directory(
+    dir_name: &str,
+    requires_manual: bool,
+    manifest_readable: bool,
+) -> bool {
+    if dir_name == ".quarantine" || dir_name.is_empty() {
+        return false;
+    }
+    !requires_manual && (!manifest_readable || Uuid::parse_str(dir_name).is_err())
+}
+
+fn quarantine_invalid_backups(paths: &AppPaths) -> usize {
     let entries = match fs::read_dir(&paths.backups) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let dest_root = paths.backups.join(".quarantine").join(stamp.to_string());
+    let mut moved = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new(".quarantine") {
+            continue;
+        }
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest_path = dir.join("manifest.json");
+        let requires_manual =
+            leftover_backup_requires_manual_review(&manifest_path, &paths.config, &paths.catalog);
+        let readable = fs::read(&manifest_path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_str::<BackupManifest>(strip_utf8_bom(
+                    std::str::from_utf8(&bytes).ok()?,
+                ))
+                .ok()
+            })
+            .is_some();
+        let name_str = name.to_string_lossy();
+        if !should_quarantine_backup_directory(name_str.as_ref(), requires_manual, readable) {
+            continue;
+        }
+        if moved == 0 {
+            let _ = create_private_directory(&dest_root);
+        }
+        if fs::rename(&dir, dest_root.join(&name)).is_ok() {
+            moved += 1;
+        }
+    }
+    moved
+}
+
+fn recover_prepared_manifests(paths: &AppPaths) -> usize {
+    recover_prepared_manifests_in(&paths.backups, &paths.config, &paths.catalog)
+}
+
+fn recover_prepared_manifests_in(backups: &Path, config: &Path, catalog: &Path) -> usize {
+    let entries = match fs::read_dir(backups) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(_) => return 1,
     };
     entries
         .flatten()
-        .map(|entry| entry.path().join("manifest.json"))
-        .filter(|path| path.exists())
-        .filter(|path| recover_prepared_backup(path, &paths.config, &paths.catalog).is_err())
+        .filter(|entry| entry.file_name() != std::ffi::OsStr::new(".quarantine"))
+        .filter(|entry| {
+            leftover_backup_requires_manual_review(
+                &entry.path().join("manifest.json"),
+                config,
+                catalog,
+            )
+        })
         .count()
 }
 
@@ -2531,6 +3367,23 @@ mod tests {
     }
 
     #[test]
+    fn proxy_adopts_a_codex_model_when_it_still_belongs_to_the_connection() {
+        let profile = profile_with_models("luming", &["grok-4.6", "gpt-5.6-sol"]);
+        assert_eq!(
+            adopted_proxy_model(Some("grok-4.6"), &profile, "gpt-5.6-sol").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            adopted_proxy_model(Some("gpt-5.6-sol"), &profile, "gpt-5.6-sol"),
+            None
+        );
+        assert_eq!(
+            adopted_proxy_model(Some("grok-4.6"), &profile, "unknown-model"),
+            None
+        );
+    }
+
+    #[test]
     fn missing_provider_credential_has_an_actionable_error() {
         assert_eq!(
             map_missing_provider_credential("credential is not stored".to_string()),
@@ -2567,5 +3420,93 @@ mod tests {
         let mut redirected = official;
         redirected.base_url = Some("https://redirect.example/v1".to_string());
         assert!(official_profile_from_current_account(&redirected, &account).is_err());
+    }
+
+    #[test]
+    fn strip_utf8_bom_removes_only_the_prefix() {
+        assert_eq!(strip_utf8_bom("plain"), "plain");
+        assert_eq!(
+            strip_utf8_bom("\u{feff}{\"enabled\":false}"),
+            "{\"enabled\":false}"
+        );
+    }
+
+    #[test]
+    fn proxy_state_json_can_be_parsed_after_stripping_bom() {
+        let json = "\u{feff}{\n  \"schemaVersion\": 2,\n  \"enabled\": false,\n  \"port\": 15722,\n  \"revision\": 0\n}\n";
+        let state: StoredProxyState = serde_json::from_str(strip_utf8_bom(json)).expect("bom json");
+        assert!(!state.enabled);
+        assert_eq!(state.port, LOCAL_PROXY_PORT);
+        assert_eq!(state.outbound_proxy_mode, OutboundProxyMode::Auto);
+    }
+
+    #[test]
+    fn fallback_proxy_model_prefers_requested_then_applied_then_first() {
+        let profile = profile_with_models("luming", &["grok-4.6", "gpt-5.6-sol"]);
+        assert_eq!(
+            fallback_proxy_model_id(Some("gpt-5.6-sol"), &profile, Some("grok-4.6")).as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            fallback_proxy_model_id(Some("missing"), &profile, Some("grok-4.6")).as_deref(),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            fallback_proxy_model_id(Some("missing"), &profile, Some("also-missing")).as_deref(),
+            Some("grok-4.6")
+        );
+        let empty = profile_with_models("empty", &[]);
+        assert_eq!(fallback_proxy_model_id(Some("x"), &empty, None), None);
+    }
+
+    #[test]
+    fn invalid_backup_directories_are_quarantined_except_true_leftovers() {
+        assert!(!should_quarantine_backup_directory(
+            ".quarantine",
+            false,
+            false
+        ));
+        assert!(should_quarantine_backup_directory(
+            "orphan-dir",
+            false,
+            false
+        ));
+        let uuid = Uuid::new_v4().to_string();
+        assert!(!should_quarantine_backup_directory(&uuid, true, true));
+        assert!(!should_quarantine_backup_directory(&uuid, false, true));
+        assert!(should_quarantine_backup_directory(&uuid, false, false));
+    }
+
+    #[test]
+    fn recover_prepared_manifests_ignores_orphan_backup_directories() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let backups = root.path().join("backups");
+        let config = root.path().join("config.toml");
+        let catalog = root.path().join("models.json");
+        std::fs::create_dir_all(backups.join("not-a-uuid")).unwrap();
+        std::fs::create_dir_all(backups.join(".quarantine").join("1")).unwrap();
+        std::fs::write(&config, "model = \"x\"\n").unwrap();
+        std::fs::write(&catalog, "{\n  \"models\": []\n}\n").unwrap();
+        assert_eq!(
+            recover_prepared_manifests_in(&backups, &config, &catalog),
+            0
+        );
+    }
+
+    #[test]
+    fn outbound_proxy_mode_parses_known_values() {
+        assert_eq!(
+            parse_outbound_proxy_mode("AUTO").unwrap(),
+            OutboundProxyMode::Auto
+        );
+        assert_eq!(
+            parse_outbound_proxy_mode("direct").unwrap(),
+            OutboundProxyMode::Direct
+        );
+        assert_eq!(
+            parse_outbound_proxy_mode("system").unwrap(),
+            OutboundProxyMode::System
+        );
+        assert!(parse_outbound_proxy_mode("clash").is_err());
     }
 }

@@ -53,6 +53,7 @@ pub fn render_model_catalog(profile: &ProviderProfile) -> Result<String> {
                     "limit": 10_000
                 },
                 "supports_parallel_tool_calls": model.supports_parallel_tool_calls,
+                "supports_image_detail_original": model.supports_images,
                 "context_window": model.context_window,
                 "max_context_window": model.context_window,
                 "auto_compact_token_limit": null,
@@ -101,6 +102,32 @@ mod tests {
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["models"][0]["slug"], "acme-code");
         assert_eq!(parsed["models"][0]["input_modalities"], json!(["text"]));
+        assert_eq!(parsed["models"][0]["supports_image_detail_original"], false);
         assert!(!rendered.to_ascii_lowercase().contains("api_key"));
+    }
+
+    #[test]
+    fn image_capable_models_advertise_image_modalities() {
+        let profile = ProviderProfile {
+            id: "vision".into(),
+            display_name: "Vision".into(),
+            base_url: "https://api.vision.test/v1".into(),
+            supports_websockets: false,
+            credential_required: true,
+            models: vec![ModelSpec {
+                id: "vision-code".into(),
+                display_name: "Vision Code".into(),
+                description: "Vision model".into(),
+                context_window: 64_000,
+                default_reasoning: ReasoningEffort::Low,
+                reasoning_levels: vec![ReasoningEffort::Low],
+                supports_parallel_tool_calls: true,
+                supports_images: true,
+            }],
+        };
+
+        let parsed: Value = serde_json::from_str(&render_model_catalog(&profile).unwrap()).unwrap();
+        assert_eq!(parsed["models"][0]["input_modalities"], json!(["text", "image"]));
+        assert_eq!(parsed["models"][0]["supports_image_detail_original"], true);
     }
 }

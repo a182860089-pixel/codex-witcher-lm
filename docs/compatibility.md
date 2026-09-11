@@ -30,9 +30,10 @@ uses system proxy settings, follows no redirects, and accepts at most 2 MiB and
 500 model IDs. Users check the models they want in their shortcut, or enter a
 model ID manually when a compatible service does not expose a list.
 
-Each profile has one or more explicit model entries. Context window, reasoning
-levels, parallel tool calls, and image input are advertised conservatively;
-users should enable only capabilities the provider actually implements. A
+Each profile has one or more explicit model entries. Context window and
+reasoning levels stay conservative. Image input defaults to enabled so Codex
+can show paste/screenshot controls; uncheck "support images" when the upstream
+provider cannot accept vision requests. A
 standard model-list response does not become a Codex `model_catalog_json`
 override. In fast-switch mode, the checked entries are rendered as an
 authenticated Codex-compatible `/models` response by the loopback proxy.

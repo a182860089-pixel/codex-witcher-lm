@@ -1,0 +1,427 @@
+/* Apple-design polish: 8pt grid, materials, press feedback, grouped lists. */
+
+.preview-banner {
+  display: none;
+}
+
+.preview-root,
+.app-shell {
+  height: 100%;
+}
+
+.app-shell {
+  grid-template-columns: 244px minmax(0, 1fr);
+  background:
+    radial-gradient(circle at 88% -12%, rgba(10, 132, 255, 0.09), transparent 34%),
+    var(--page);
+}
+
+.sidebar {
+  padding: 18px 12px 14px;
+  background: var(--sidebar);
+}
+
+.brand {
+  gap: 10px;
+  padding: 2px 8px 18px;
+}
+
+.brand-copy {
+  min-width: 0;
+}
+
+.brand strong {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 670;
+  letter-spacing: -0.022em;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand span {
+  margin-top: 2px;
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+
+.nav-item {
+  min-height: 36px;
+  border-radius: 8px;
+  transition:
+    background-color 160ms ease,
+    color 160ms ease,
+    transform 100ms ease-out;
+}
+
+.nav-item:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.nav-item-active,
+.nav-item-active:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.sidebar-footer {
+  gap: 10px;
+  padding-top: 14px;
+}
+
+.preview-chip {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 22px;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid var(--separator);
+  border-radius: 999px;
+  background: var(--control);
+  color: var(--tertiary-label);
+  font-size: 10px;
+  font-weight: 620;
+  letter-spacing: 0.01em;
+}
+
+.app-header {
+  min-height: 56px;
+  padding: 10px 28px 8px;
+  background: color-mix(in srgb, var(--page) 78%, transparent);
+  backdrop-filter: blur(22px) saturate(170%);
+  -webkit-backdrop-filter: blur(22px) saturate(170%);
+}
+
+.app-header::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: -16px;
+  left: 0;
+  height: 16px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--page), transparent);
+}
+
+.page-heading p {
+  letter-spacing: 0.08em;
+}
+
+.page-heading h1 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.content-scroll {
+  padding: 8px 28px 48px;
+}
+
+.page-view {
+  width: min(100%, 920px);
+}
+
+.button {
+  min-height: 32px;
+  border-radius: 8px;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    transform 100ms ease-out;
+}
+
+.button:hover:not(:disabled) {
+  transform: none;
+}
+
+.button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.button-toolbar {
+  min-width: 68px;
+  min-height: 32px;
+}
+
+.current-section,
+.provider-list,
+.settings-group {
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+.current-section {
+  background: var(--surface);
+}
+
+.current-heading {
+  gap: 12px;
+  padding: 16px 16px 14px;
+}
+
+.current-symbol {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+}
+
+.current-copy h2 {
+  font-size: 22px;
+  letter-spacing: -0.03em;
+}
+
+.current-details {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  background: transparent;
+}
+
+.current-details > div {
+  padding: 12px 16px 14px;
+}
+
+.connections-section {
+  margin-top: 22px;
+}
+
+.section-title-row {
+  margin-bottom: 10px;
+  padding: 0 2px;
+}
+
+.section-title-row h2 {
+  font-size: 15px;
+  font-weight: 670;
+  letter-spacing: -0.018em;
+}
+
+.official-section,
+.profile-card {
+  padding: 14px 16px;
+}
+
+.official-profile {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  margin: 10px 0 0 46px;
+}
+
+.profile-card {
+  grid-template-columns: minmax(0, 1.2fr) minmax(148px, 188px) auto;
+  align-items: center;
+  gap: 12px 14px;
+}
+
+.profile-card:hover {
+  background: var(--control);
+}
+
+.profile-card-current {
+  background: var(--accent-soft);
+}
+
+.profile-actions {
+  gap: 6px;
+}
+
+.profile-actions .button {
+  min-height: 32px;
+  padding-inline: 10px;
+}
+
+.status {
+  min-height: 32px;
+  margin: 0 28px 14px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+.editor-dialog {
+  border-radius: 16px;
+}
+
+.connection-type-option,
+.mode-option,
+.model-choice {
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    transform 100ms ease-out;
+}
+
+.connection-type-option:active:not(:disabled),
+.mode-option:active:not(:disabled),
+.model-choice:active {
+  transform: scale(0.985);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #000000;
+    --sidebar: rgba(28, 28, 30, 0.92);
+    --surface: #1c1c1e;
+    --surface-solid: #1c1c1e;
+    --surface-raised: #2c2c2e;
+    --control: rgba(235, 235, 245, 0.08);
+    --separator: rgba(255, 255, 255, 0.08);
+    --separator-strong: rgba(255, 255, 255, 0.14);
+    --shadow-card: none;
+  }
+
+  .app-shell {
+    background:
+      radial-gradient(circle at 86% -18%, rgba(10, 132, 255, 0.12), transparent 32%),
+      #000;
+  }
+
+  .current-section {
+    background: #1c1c1e;
+  }
+
+  .current-details {
+    background: transparent;
+  }
+
+  .app-header::after {
+    background: linear-gradient(to bottom, #000, transparent);
+  }
+}
+
+@media (max-width: 920px) {
+  .profile-card {
+    grid-template-columns: minmax(0, 1fr) minmax(140px, 1fr);
+  }
+
+  .profile-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button,
+  .nav-item,
+  .mode-option,
+  .connection-type-option,
+  .model-choice {
+    transition: none;
+  }
+
+  .button:active:not(:disabled),
+  .nav-item:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+
+.app-header {
+  height: 72px;
+  min-height: 72px;
+  max-height: 72px;
+  padding: 10px 28px;
+  box-sizing: border-box;
+}
+
+.page-heading span {
+  display: block;
+  min-height: 16px;
+  margin-top: 2px;
+  line-height: 1.3;
+}
+
+.content-scroll {
+  display: flex;
+  flex-direction: column;
+}
+
+.page-view {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.advanced-settings {
+  flex: 1;
+  gap: 16px;
+}
+
+.advanced-intro > div {
+  display: none;
+}
+
+.advanced-intro {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0;
+}
+
+.privacy-note {
+  margin-top: auto;
+}
+
+#switcher-page {
+  flex: 1;
+}
+
+.connections-section {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.provider-list {
+  flex: 1;
+}
+
+html,
+body,
+#app,
+.preview-root,
+.app-shell {
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+.app-shell {
+  height: 100dvh;
+  max-height: 100dvh;
+}
+
+.workspace {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.content-scroll {
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Desktop brand mark uses the glowing deer PNG. */
+.brand-mark {
+  width: 32px;
+  height: 32px;
+  overflow: hidden;
+  border-radius: 9px;
+  background: transparent;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 8px 18px rgba(0, 0, 0, 0.18);
+}
+
+.brand-mark svg {
+  display: none;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}

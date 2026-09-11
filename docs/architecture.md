@@ -216,11 +216,19 @@ When both identifiers are available, requests with the same `thread_id` and
 switches meanwhile. A later turn resolves the then-active Route. The bounded
 pin table evicts old entries; callers may explicitly release a completed turn.
 
-The upstream client accepts HTTPS plus loopback HTTP, follows no redirects, and
-uses a retry policy that never replays a request automatically. Response status
-and safe headers are preserved, while hop-by-hop response headers and
-`Set-Cookie` are removed. Response bodies, including SSE, are forwarded as byte
-streams rather than buffered to completion.
+The upstream client accepts HTTPS plus loopback HTTP, uses HTTP/1.1 only so
+local system proxies such as Clash remain compatible, follows no redirects, and
+uses a retry policy that never replays a request automatically. Loopback
+destinations bypass the system proxy because Windows `127.*` override rules are
+not honored by reqwest. Starting the local proxy also merges
+`127.0.0.1,localhost,::1,[::1]` into the user-level `NO_PROXY` / `no_proxy`
+environment so Codex's own reqwest client does not send the loopback listener
+through Clash; a newly applied bypass requires a full Codex restart. Response
+status and safe headers are preserved, while hop-by-hop response headers and
+`Set-Cookie` are removed. Successful response bodies, including SSE, are
+forwarded as byte streams rather than buffered to completion. 4xx/5xx bodies
+are bounded and normalized to `{ "error": { "message", "type": "api_error" } }`
+so Codex can display the upstream failure.
 
 The local `/models` response is generated from the checked models on the active
 Route and includes an ETag. It is a wire response, not a

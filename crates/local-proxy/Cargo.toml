@@ -14,9 +14,12 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle = "2"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
 url.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }

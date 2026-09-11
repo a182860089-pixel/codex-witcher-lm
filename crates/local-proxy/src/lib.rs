@@ -19,7 +19,10 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH};
+use axum::http::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH,
+    USER_AGENT,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -38,6 +41,10 @@ use zeroize::Zeroizing;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_PINNED_TURNS: usize = 4_096;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_ERROR_MESSAGE_BYTES: usize = 300;
+const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.4");
 const MAX_ROUTE_ID_BYTES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_TURN_KEY_BYTES: usize = 512;
@@ -328,7 +335,7 @@ impl RouteConfig {
                     limit: 10_000,
                 },
                 supports_parallel_tool_calls: model.supports_parallel_tool_calls,
-                supports_image_detail_original: false,
+                supports_image_detail_original: model.supports_images,
                 context_window: model.context_window,
                 max_context_window: model.max_context_window.or(model.context_window),
                 auto_compact_token_limit: None,
@@ -388,6 +395,8 @@ pub struct ProxyStartOptions {
     pub max_request_bytes: usize,
     pub max_pinned_turns: usize,
     pub upstream_connect_timeout: Duration,
+    /// When false (crate default), the upstream client ignores `HTTP_PROXY`.
+    pub use_system_proxy: bool,
 }
 
 impl Default for ProxyStartOptions {
@@ -397,6 +406,7 @@ impl Default for ProxyStartOptions {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_pinned_turns: DEFAULT_MAX_PINNED_TURNS,
             upstream_connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            use_system_proxy: false,
         }
     }
 }
@@ -441,12 +451,22 @@ impl LocalProxy {
             return Err(ProxyError::NonLoopbackListener);
         }
 
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(options.upstream_connect_timeout)
-            .build()
-            .map_err(ProxyError::BuildClient)?;
+            .http1_only()
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(UPSTREAM_TCP_KEEPALIVE))
+            .user_agent(UPSTREAM_USER_AGENT.clone());
+        if options.use_system_proxy {
+            if let Some(proxy) = system_proxy_skipping_loopback() {
+                client = client.proxy(proxy);
+            }
+        } else {
+            client = client.no_proxy();
+        }
+        let client = client.build().map_err(ProxyError::BuildClient)?;
 
         let state = Arc::new(ProxyState {
             auth: EntryTokenVerifier::new(entry_bearer),
@@ -916,6 +936,10 @@ async fn proxy_request(
     };
     headers.insert(AUTHORIZATION, upstream_authorization);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    if !headers.contains_key(USER_AGENT) {
+        headers.insert(USER_AGENT, UPSTREAM_USER_AGENT);
+    }
 
     let lease = RequestLease::begin(Arc::clone(&state.metrics));
     let upstream = match state
@@ -927,12 +951,9 @@ async fn proxy_request(
         .await
     {
         Ok(response) => response,
-        Err(_) => {
+        Err(error) => {
             drop(lease);
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "the active provider could not be reached",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, classify_upstream_error(&error));
         }
     };
 
@@ -941,6 +962,10 @@ async fn proxy_request(
         .metrics
         .last_upstream_status
         .store(status.as_u16(), Ordering::Release);
+    if status.is_client_error() || status.is_server_error() {
+        drop(lease);
+        return normalize_upstream_error(status, upstream).await;
+    }
     let mut headers = sanitize_response_headers(upstream.headers());
     if let Some(active_route) = state.routes.active() {
         headers.insert(
@@ -964,8 +989,106 @@ fn unauthorized_response() -> Response {
     error_response(StatusCode::UNAUTHORIZED, "invalid local proxy bearer token")
 }
 
-fn error_response(status: StatusCode, message: &'static str) -> Response {
-    (status, Json(json!({ "error": { "message": message } }))).into_response()
+fn error_response(status: StatusCode, message: impl AsRef<str>) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": sanitize_error_message(message.as_ref()),
+                "type": "api_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn normalize_upstream_error(status: StatusCode, upstream: reqwest::Response) -> Response {
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error_response(
+                status,
+                format!("upstream provider returned {status} and the error body could not be read"),
+            );
+        }
+    };
+    let limited = if bytes.len() > MAX_ERROR_BODY_BYTES {
+        &bytes[..MAX_ERROR_BODY_BYTES]
+    } else {
+        bytes.as_ref()
+    };
+    if let Some(message) = json_error_message(limited) {
+        return error_response(status, message);
+    }
+    if let Some(message) = html_error_message(status, limited) {
+        return error_response(status, message);
+    }
+    error_response(status, format!("upstream provider returned {status}"))
+}
+
+fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "the active provider timed out"
+    } else if error.is_connect() {
+        "the active provider could not be reached"
+    } else {
+        "the active provider request failed"
+    }
+}
+
+fn json_error_message(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    const POINTERS: &[&str] = &["/error/message", "/error/msg", "/message", "/msg", "/error"];
+    for pointer in POINTERS {
+        match value.pointer(pointer) {
+            Some(Value::String(text)) => {
+                let text = sanitize_error_message(text);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn html_error_message(status: StatusCode, bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let lowered = text.to_ascii_lowercase();
+    if !lowered.contains("<html") && !lowered.contains("<!doctype") {
+        return None;
+    }
+    if lowered.contains("sorry, you have been blocked")
+        || lowered.contains("attention required")
+        || lowered.contains("you are unable to access")
+    {
+        return Some(format!("Cloudflare blocked the active provider ({status})"));
+    }
+    if lowered.contains("error code 522")
+        || lowered.contains("error code 524")
+        || lowered.contains("connection timed out")
+    {
+        return Some("the active provider timed out".to_string());
+    }
+    Some(format!("upstream provider returned {status}"))
+}
+
+fn sanitize_error_message(input: &str) -> String {
+    let mut output = String::new();
+    for ch in input.chars() {
+        if output.len() >= MAX_ERROR_MESSAGE_BYTES {
+            break;
+        }
+        if matches!(ch, '\n' | '\r' | '\t') {
+            if !output.ends_with(' ') {
+                output.push(' ');
+            }
+        } else if !ch.is_control() {
+            output.push(ch);
+        }
+    }
+    output.trim().to_string()
 }
 
 fn sanitize_request_headers(source: &HeaderMap) -> HeaderMap {
@@ -1116,6 +1239,79 @@ fn normalize_upstream_base_url(input: &str) -> Result<Url, ProxyError> {
     let normalized_path = format!("{}/", url.path().trim_end_matches('/'));
     url.set_path(&normalized_path);
     Ok(url)
+}
+
+fn system_proxy_skipping_loopback() -> Option<reqwest::Proxy> {
+    let proxy_url = env_proxy_url().or_else(windows_ie_proxy_url)?;
+    Some(
+        reqwest::Proxy::all(proxy_url)
+            .ok()?
+            .no_proxy(reqwest::NoProxy::from_string(
+                "127.0.0.1,localhost,::1,[::1]",
+            )),
+    )
+}
+
+fn env_proxy_url() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(normalize_proxy_url(value));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_ie_proxy_url() -> Option<String> {
+    let settings = windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        .ok()?;
+    if settings.get_u32("ProxyEnable").unwrap_or(0) == 0 {
+        return None;
+    }
+    let raw = settings.get_string("ProxyServer").ok()?;
+    parse_windows_proxy_server(&raw)
+}
+
+#[cfg(not(windows))]
+fn windows_ie_proxy_url() -> Option<String> {
+    None
+}
+
+fn parse_windows_proxy_server(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if !raw.contains('=') {
+        return Some(normalize_proxy_url(raw));
+    }
+    for scheme in ["https=", "http="] {
+        for part in raw.split(';') {
+            if let Some(rest) = part.trim().strip_prefix(scheme) {
+                return Some(normalize_proxy_url(rest));
+            }
+        }
+    }
+    None
+}
+
+fn normalize_proxy_url(value: &str) -> String {
+    if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1277,6 +1473,7 @@ mod tests {
             value["models"][0]["input_modalities"],
             json!(["text", "image"])
         );
+        assert_eq!(value["models"][0]["supports_image_detail_original"], true);
         assert_eq!(value["models"][0]["truncation_policy"]["mode"], "tokens");
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(!serialized.contains("upstream-token-for-tests"));
@@ -1302,5 +1499,201 @@ mod tests {
         assert!(!sanitized.contains_key("connection"));
         assert!(!sanitized.contains_key("x-remove"));
         assert_eq!(sanitized["x-keep"], "keep-me");
+    }
+
+    #[test]
+    fn json_error_message_reads_openai_shaped_bodies_and_ignores_html() {
+        assert_eq!(
+            json_error_message(
+                br#"{"error":{"message":"Service temporarily unavailable","type":"api_error"}}"#
+            )
+            .as_deref(),
+            Some("Service temporarily unavailable")
+        );
+        assert_eq!(
+            json_error_message(br#"{"message":"plain"}"#).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            json_error_message(b"<html><body>Bad Gateway</body></html>"),
+            None
+        );
+        assert_eq!(
+            html_error_message(
+                StatusCode::BAD_GATEWAY,
+                b"<html><body>Bad Gateway</body></html>"
+            )
+            .as_deref(),
+            Some("upstream provider returned 502 Bad Gateway")
+        );
+        assert_eq!(
+            html_error_message(
+                StatusCode::FORBIDDEN,
+                br#"<html><head><title>Attention Required! | Cloudflare</title></head><body>Sorry, you have been blocked</body></html>"#
+            )
+            .as_deref(),
+            Some("Cloudflare blocked the active provider (403 Forbidden)")
+        );
+        assert_eq!(html_error_message(StatusCode::OK, b"not html"), None);
+        assert_eq!(
+            sanitize_error_message("line one\r\nline two\u{0007}"),
+            "line one line two"
+        );
+        assert_eq!(
+            parse_windows_proxy_server("127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            parse_windows_proxy_server("http=127.0.0.1:7890;https=127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    async fn serve_http(
+        status_line: &'static str,
+        body: &'static str,
+        record: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                record.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn default_upstream_client_ignores_http_proxy_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let upstream_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_port =
+            serve_http("HTTP/1.1 200 OK", "upstream-ok", upstream_hits.clone()).await;
+        let proxy_port =
+            serve_http("HTTP/1.1 502 Bad Gateway", "proxy-hit", proxy_hits.clone()).await;
+        let _http = EnvGuard::set("HTTP_PROXY", &format!("http://127.0.0.1:{proxy_port}"));
+        let _https = EnvGuard::set("HTTPS_PROXY", &format!("http://127.0.0.1:{proxy_port}"));
+        let _all = EnvGuard::set("ALL_PROXY", &format!("http://127.0.0.1:{proxy_port}"));
+
+        let handle =
+            LocalProxy::start(ProxyStartOptions::default(), token("entry-token-for-tests"))
+                .await
+                .expect("start local proxy");
+        handle.set_active_route(
+            RouteConfig::single_model(
+                "route",
+                &format!("http://127.0.0.1:{upstream_port}/v1"),
+                ModelDescriptor::new("model", "Model"),
+                token("upstream-token-for-tests"),
+            )
+            .expect("loopback route"),
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses",
+                handle.listen_addr().port()
+            ))
+            .header(AUTHORIZATION, "Bearer entry-token-for-tests")
+            .json(&serde_json::json!({"input":"ping"}))
+            .send()
+            .await
+            .expect("local responses");
+        let body = response.text().await.expect("body");
+        assert!(body.contains("upstream-ok"), "{body}");
+        assert_eq!(upstream_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(proxy_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn system_proxy_mode_uses_http_proxy_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let proxy_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy_port =
+            serve_http("HTTP/1.1 502 Bad Gateway", "proxy-hit", proxy_hits.clone()).await;
+        let _http = EnvGuard::set("HTTP_PROXY", &format!("http://127.0.0.1:{proxy_port}"));
+        let _https = EnvGuard::set("HTTPS_PROXY", &format!("http://127.0.0.1:{proxy_port}"));
+        let _all = EnvGuard::set("ALL_PROXY", &format!("http://127.0.0.1:{proxy_port}"));
+
+        let handle = LocalProxy::start(
+            ProxyStartOptions {
+                use_system_proxy: true,
+                ..ProxyStartOptions::default()
+            },
+            token("entry-token-for-tests"),
+        )
+        .await
+        .expect("start local proxy");
+        handle.set_active_route(
+            RouteConfig::single_model(
+                "route",
+                "https://example.invalid/v1",
+                ModelDescriptor::new("model", "Model"),
+                token("upstream-token-for-tests"),
+            )
+            .expect("https route"),
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let _ = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses",
+                handle.listen_addr().port()
+            ))
+            .header(AUTHORIZATION, "Bearer entry-token-for-tests")
+            .json(&serde_json::json!({"input":"ping"}))
+            .send()
+            .await;
+        assert!(
+            proxy_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "system proxy mode should send the upstream request through HTTP_PROXY"
+        );
+        handle.shutdown().await.expect("shutdown");
     }
 }

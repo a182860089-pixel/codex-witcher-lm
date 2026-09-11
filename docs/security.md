@@ -9,9 +9,13 @@ provider ID and normalized base URL, so changing the endpoint cannot silently
 reuse an old bearer token through the Switcher UI. The stable helper verifies
 that the fingerprint still matches exactly one managed provider table, its own
 command/working-directory binding, and an official Codex parent
-process/package before returning a token. On Windows, accepted parents are the
-registered Store package or the canonical official npm package layout with a
-valid Authenticode signature whose signer is OpenAI. The API key is copied out
+process/package before returning a token. On Windows, accepted callers are a
+process inside the registered Store package, the canonical official npm
+package layout, or the official Desktop AppData sidecar
+(`%LOCALAPPDATA%\OpenAI\Codex\bin\[<hex>\]codex.exe`); the latter two also
+require a valid Authenticode signature whose signer is OpenAI. The helper
+walks a bounded parent-process chain so a Store-packaged ChatGPT.exe that
+launches that sidecar still qualifies. The API key is copied out
 of and then cleared from the setup field after discovery. When the current
 user explicitly opens a saved connection for editing, the backend resolves
 only that saved profile's endpoint-bound account and returns its Key to the
@@ -63,6 +67,14 @@ trusted workspace/config execution as able to use the configured provider.
 The command-backed auth helper writes only the secret to stdout. Errors are
 redacted and never contain the keyring backend's detailed payload.
 
+## Application update checks
+
+- Update metadata is fetched only from the GitHub Releases API for this
+  repository over HTTPS, with redirects disabled and a 512 KiB response cap.
+- Opening Update is limited to HTTPS GitHub release links for the owner/repo
+  configured in `src-tauri/update-source.json`. Skip records only the skipped
+  version in `~/.codex/provider-switcher/update-preference.json`.
+
 ## Model discovery threats
 
 - Remote endpoints must use HTTPS. Plain HTTP is permitted only for loopback
@@ -100,9 +112,14 @@ redacted and never contain the keyring backend's detailed payload.
 - The proxy overwrites the JSON `model` field with the active selection and
   bounds request bodies to 16 MiB. Non-object or malformed JSON is rejected.
 - Remote upstreams require HTTPS; plain HTTP is allowed only for loopback
-  providers. The client honors normal system proxy policy, follows no
-  redirects, and disables automatic request retries.
-- Response bodies are streamed without accumulating a full SSE response.
+  providers. The client honors normal system proxy policy, uses HTTP/1.1
+  only, follows no redirects, and disables automatic request retries.
+  Loopback destinations are excluded from that proxy. Starting the listener
+  also merges loopback hosts into the user `NO_PROXY` environment so Codex
+  itself does not send `127.0.0.1` through a local HTTP proxy.
+- Successful response bodies are streamed without accumulating a full SSE
+  response. 4xx/5xx bodies are bounded and rewritten into a JSON error so
+  Codex can display the provider failure instead of "Unknown error".
   Hop-by-hop response headers and `Set-Cookie` are removed.
 - The local model catalog and health body contain no bearer or upstream Base
   URL. Route and bearer debug output is redacted.

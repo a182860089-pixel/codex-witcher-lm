@@ -76,14 +76,19 @@ modify `app.asar`, the signed macOS app bundle, or the Windows Store package.
 - The local proxy binds only to `127.0.0.1` on its managed fixed port. Codex
   authenticates with a separate random entry bearer stored in the OS credential
   manager; this token is not an upstream provider key.
+- When the local proxy starts, persist a user-level `NO_PROXY` loopback bypass
+  (`127.0.0.1,localhost,::1,[::1]`) so Codex's HTTP client does not send
+  loopback traffic through a system proxy. A newly applied bypass requires a
+  full Codex restart.
 - Validate the entry bearer using a constant-time digest comparison. Strip the
   incoming authorization, credential-like, forwarding, and hop-by-hop headers,
   including names declared by `Connection`, before injecting the selected
   upstream bearer.
 - Proxy only `POST /responses`, `POST /responses/compact`, and their `/v1`
   aliases. Serve authenticated `/models`, `/v1/models`, and `/health`. Overwrite
-  the request model with the active route, forward response bodies as byte
-  streams, and do not follow redirects or automatically retry requests.
+  the request model with the active route, forward successful response bodies as
+  byte streams, normalize 4xx/5xx bodies to a JSON error, and do not follow
+  redirects or automatically retry requests.
 - Atomically swap immutable routes. Pin a route for each bounded
   `(thread_id, turn_id)` pair so a switch cannot split one turn across
   providers. Keep the pin table bounded.

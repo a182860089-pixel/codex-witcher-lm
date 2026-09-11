@@ -67,6 +67,22 @@ pub fn open_codex() -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn restart_codex() -> Result<String, String> {
+    let bundles = discover_signed_codex_bundles()?;
+    for bundle in &bundles {
+        let _ = std::process::Command::new("/usr/bin/pkill")
+            .args(["-f", &bundle.display().to_string()])
+            .status();
+    }
+    let _ = std::process::Command::new("/usr/bin/killall")
+        .args(["-9", "Codex"])
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let launch = open_codex()?;
+    Ok(format!("launch={launch}"))
+}
+
+#[cfg(target_os = "macos")]
 pub fn codex_cli_path() -> Result<PathBuf, String> {
     use std::collections::BTreeSet;
 
@@ -314,6 +330,148 @@ pub fn open_codex() -> Result<String, String> {
 }
 
 #[cfg(windows)]
+pub fn restart_codex() -> Result<String, String> {
+    with_windows_runtime(restart_codex_windows)
+}
+
+#[cfg(windows)]
+fn restart_codex_windows() -> Result<String, String> {
+    use std::collections::BTreeSet;
+    use std::thread;
+    use std::time::Duration;
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::OpenProcess;
+    use windows::Win32::System::Threading::PROCESS_TERMINATE;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    let targets = discover_codex_process_ids()?;
+    let mut killed = BTreeSet::new();
+    let mut soft_failures = 0_u32;
+
+    for pid in &targets {
+        match unsafe { OpenProcess(PROCESS_TERMINATE, false, *pid) } {
+            Ok(handle) => {
+                let ok = unsafe { TerminateProcess(handle, 1) }.is_ok();
+                let _ = unsafe { CloseHandle(handle) };
+                if ok {
+                    killed.insert(*pid);
+                } else {
+                    soft_failures += 1;
+                }
+            }
+            Err(_) => {
+                soft_failures += 1;
+            }
+        }
+    }
+
+    // Tree-kill leftovers that ignore a single TerminateProcess (hung UI / child trees).
+    for pid in &targets {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        killed.insert(*pid);
+    }
+
+    // Give Windows a moment to release package activation / file locks.
+    thread::sleep(Duration::from_millis(900));
+
+    // Second pass for stubborn leftovers.
+    let remaining = discover_codex_process_ids().unwrap_or_default();
+    for pid in remaining {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        killed.insert(pid);
+        soft_failures = soft_failures.saturating_add(1);
+    }
+    thread::sleep(Duration::from_millis(500));
+
+    let launch = open_codex_windows()?;
+    Ok(format!(
+        "terminated={} soft_failures={} launch={launch}",
+        killed.len(),
+        soft_failures
+    ))
+}
+
+#[cfg(windows)]
+fn discover_codex_process_ids() -> Result<Vec<u32>, String> {
+    use std::collections::BTreeSet;
+    use std::mem;
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::CreateToolhelp32Snapshot;
+    use windows::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W;
+    use windows::Win32::System::Diagnostics::ToolHelp::Process32FirstW;
+    use windows::Win32::System::Diagnostics::ToolHelp::Process32NextW;
+    use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPPROCESS;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    let self_pid = unsafe { GetCurrentProcessId() };
+    let store_roots = official_codex_store_roots().unwrap_or_default();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|_| "could not enumerate processes".to_string())?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut pids = BTreeSet::new();
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+        loop {
+            let pid = entry.th32ProcessID;
+            if pid != 0 && pid != self_pid {
+                if let Ok(path) = process_image_path(pid) {
+                    if is_restart_target_codex_path(&path, &store_roots) {
+                        pids.insert(pid);
+                    }
+                }
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    Ok(pids.into_iter().collect())
+}
+
+#[cfg(windows)]
+fn is_restart_target_codex_path(path: &str, store_roots: &[String]) -> bool {
+    if is_trusted_windows_codex_process(path, store_roots) {
+        return true;
+    }
+    let normalized = normalize_windows_path(path);
+    // Desktop install tree: codex.exe + runtime node helpers under Local\OpenAI\Codex\
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()));
+        if let Some(local_text) = local.to_str() {
+            let prefix = format!(
+                r"{}\openai\codex\",
+                normalize_windows_path(local_text).trim_end_matches('\\')
+            );
+            if normalized.starts_with(&prefix) {
+                // Only kill known helper binaries, not random files the user dropped in.
+                return normalized.ends_with(r"\codex.exe")
+                    || normalized.ends_with(r"\node.exe")
+                    || normalized.ends_with(r"\node_repl.exe")
+                    || normalized.contains(r"\runtimes\")
+                        && (normalized.ends_with(r"\node.exe")
+                            || normalized.ends_with(r"\node_repl.exe"));
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
 pub fn codex_cli_path() -> Result<PathBuf, String> {
     use std::collections::BTreeSet;
 
@@ -461,23 +619,64 @@ pub fn authorize_codex_parent() -> Result<(), String> {
 
 #[cfg(windows)]
 fn authorize_codex_parent_windows() -> Result<(), String> {
+    use std::collections::HashSet;
+
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    const MAX_PARENT_WALK: usize = 8;
+    let current_pid = unsafe { GetCurrentProcessId() };
+    let parents = process_parent_map()?;
+    let store_roots = official_codex_store_roots()?;
+    let mut pid = parents
+        .get(&current_pid)
+        .copied()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "credential helper caller identity is unavailable".to_string())?;
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_PARENT_WALK {
+        if !seen.insert(pid) {
+            break;
+        }
+        if let Ok(path) = process_image_path(pid)
+            && is_trusted_windows_codex_process(&path, &store_roots)
+        {
+            return Ok(());
+        }
+        pid = match parents
+            .get(&pid)
+            .copied()
+            .filter(|next| *next > 0 && *next != pid)
+        {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    Err("credential helper caller is not a trusted official Codex process".to_string())
+}
+
+#[cfg(windows)]
+fn is_trusted_windows_codex_process(path: &str, store_roots: &[String]) -> bool {
+    let matching_packages = store_roots
+        .iter()
+        .filter(|root| path_is_within_case_insensitive(path, root))
+        .count();
+    if matching_packages == 1 {
+        return true;
+    }
+    (is_official_windows_npm_codex_path(path) || is_official_windows_desktop_sidecar_path(path))
+        && authenticode_signer_is_openai(path)
+}
+
+#[cfg(windows)]
+fn process_parent_map() -> Result<std::collections::HashMap<u32, u32>, String> {
     use std::mem;
 
-    use windows::ApplicationModel::PackageSignatureKind;
-    use windows::Management::Deployment::PackageManager;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::CreateToolhelp32Snapshot;
     use windows::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W;
     use windows::Win32::System::Diagnostics::ToolHelp::Process32FirstW;
     use windows::Win32::System::Diagnostics::ToolHelp::Process32NextW;
     use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPPROCESS;
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::System::Threading::OpenProcess;
-    use windows::Win32::System::Threading::PROCESS_NAME_WIN32;
-    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
-    use windows::Win32::System::Threading::QueryFullProcessImageNameW;
-    use windows::core::HSTRING;
-    use windows::core::PWSTR;
 
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|_| "credential helper caller identity is unavailable".to_string())?;
@@ -485,25 +684,33 @@ fn authorize_codex_parent_windows() -> Result<(), String> {
         dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
-    let mut parent_pid = None;
-    let current_pid = unsafe { GetCurrentProcessId() };
+    let mut parents = std::collections::HashMap::new();
     let first = unsafe { Process32FirstW(snapshot, &mut entry) };
     if first.is_ok() {
         loop {
-            if entry.th32ProcessID == current_pid {
-                parent_pid = Some(entry.th32ParentProcessID);
-                break;
-            }
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
             if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                 break;
             }
         }
     }
     let _ = unsafe { CloseHandle(snapshot) };
-    let parent_pid = parent_pid
-        .filter(|pid| *pid > 0)
-        .ok_or_else(|| "credential helper caller identity is unavailable".to_string())?;
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) }
+    if parents.is_empty() {
+        return Err("credential helper caller identity is unavailable".to_string());
+    }
+    Ok(parents)
+}
+
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Result<String, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::OpenProcess;
+    use windows::Win32::System::Threading::PROCESS_NAME_WIN32;
+    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    use windows::Win32::System::Threading::QueryFullProcessImageNameW;
+    use windows::core::PWSTR;
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .map_err(|_| "credential helper caller identity is unavailable".to_string())?;
     let mut path_buffer = vec![0_u16; 32_768];
     let mut path_length = path_buffer.len() as u32;
@@ -518,21 +725,28 @@ fn authorize_codex_parent_windows() -> Result<(), String> {
     let _ = unsafe { CloseHandle(process) };
     path_result.map_err(|_| "credential helper caller path is unavailable".to_string())?;
     path_buffer.truncate(path_length as usize);
-    let parent_path = String::from_utf16(&path_buffer)
+    let path = String::from_utf16(&path_buffer)
         .map_err(|_| "credential helper caller path is unavailable".to_string())?;
-    let parent_path = std::path::PathBuf::from(parent_path)
+    let path_buf = PathBuf::from(&path);
+    Ok(path_buf
         .canonicalize()
-        .map_err(|_| "credential helper caller path is unavailable".to_string())?;
-    let parent_path = parent_path
-        .to_str()
-        .ok_or_else(|| "credential helper caller path is unavailable".to_string())?;
+        .ok()
+        .and_then(|canonical| canonical.to_str().map(str::to_string))
+        .unwrap_or(path))
+}
+
+#[cfg(windows)]
+fn official_codex_store_roots() -> Result<Vec<String>, String> {
+    use windows::ApplicationModel::PackageSignatureKind;
+    use windows::Management::Deployment::PackageManager;
+    use windows::core::HSTRING;
 
     let manager =
         PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
     let packages = manager
         .FindPackagesByUserSecurityId(&HSTRING::new())
         .map_err(|_| "Windows package discovery failed".to_string())?;
-    let mut matching_packages = 0_usize;
+    let mut roots = Vec::new();
     for package in packages {
         let is_official = package
             .Id()
@@ -553,18 +767,9 @@ fn authorize_codex_parent_windows() -> Result<(), String> {
         let Ok(installed_path) = package.InstalledPath() else {
             continue;
         };
-        if path_is_within_case_insensitive(parent_path, &installed_path.to_string()) {
-            matching_packages += 1;
-        }
+        roots.push(installed_path.to_string());
     }
-    if matching_packages == 1 {
-        return Ok(());
-    }
-    if is_official_windows_npm_codex_path(parent_path) && authenticode_signer_is_openai(parent_path)
-    {
-        return Ok(());
-    }
-    Err("credential helper caller is not a trusted official Codex process".to_string())
+    Ok(roots)
 }
 
 #[cfg(windows)]
@@ -709,13 +914,80 @@ fn path_is_within_case_insensitive(child: &str, parent: &str) -> bool {
 #[cfg(any(windows, test))]
 fn is_official_windows_npm_codex_path(path: &str) -> bool {
     const X64_SUFFIX: &str = "\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe";
-    let normalized = path
-        .strip_prefix(r"\\?\")
-        .unwrap_or(path)
-        .replace('/', "\\")
-        .to_ascii_lowercase();
+    let normalized = normalize_windows_path(path);
     normalized.ends_with(X64_SUFFIX)
 }
+
+#[cfg(windows)]
+fn is_official_windows_desktop_sidecar_path(path: &str) -> bool {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return false;
+    };
+    let canonical = PathBuf::from(&local)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(local));
+    canonical
+        .to_str()
+        .is_some_and(|local| is_official_windows_desktop_sidecar_path_in(path, local))
+}
+
+#[cfg(any(windows, test))]
+fn is_official_windows_desktop_sidecar_path_in(path: &str, local_app_data: &str) -> bool {
+    if local_app_data.is_empty() {
+        return false;
+    }
+    let path = normalize_windows_path(path);
+    let local = normalize_windows_path(local_app_data)
+        .trim_end_matches('\\')
+        .to_string();
+    if local.is_empty() {
+        return false;
+    }
+    let prefix = format!(r"{local}\openai\codex\bin\");
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        return false;
+    };
+    match rest.split_once('\\') {
+        None => rest == "codex.exe",
+        Some((dir, file)) => {
+            file == "codex.exe"
+                && !dir.contains('\\')
+                && dir.len() >= 8
+                && dir.len() <= 64
+                && dir.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_path(path: &str) -> String {
+    path.strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+#[cfg(windows)]
+pub fn notify_user_environment_changed() {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::Foundation::WPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::HWND_BROADCAST;
+    use windows::Win32::UI::WindowsAndMessaging::SendNotifyMessageW;
+    use windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE;
+    use windows::core::w;
+
+    unsafe {
+        let _ = SendNotifyMessageW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(w!("Environment").as_ptr() as isize),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn notify_user_environment_changed() {}
 
 #[cfg(windows)]
 fn valid_app_user_model_id(value: &str) -> bool {
@@ -730,6 +1002,11 @@ fn valid_app_user_model_id(value: &str) -> bool {
             .bytes()
             .chain(app.bytes())
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn restart_codex() -> Result<String, String> {
+    Err("restarting Codex is supported only on macOS and Windows".to_string())
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -796,6 +1073,51 @@ mod tests {
         ));
         assert!(!is_official_windows_npm_codex_path(
             r"C:\Users\Admin\node_modules\other\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe"
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_the_official_windows_desktop_sidecar_layout() {
+        let local = r"C:\Users\Admin\AppData\Local";
+        assert!(is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\OpenAI\Codex\bin\fd4c151a749f3ab4\codex.exe",
+            local
+        ));
+        assert!(is_official_windows_desktop_sidecar_path_in(
+            r"\\?\C:\Users\Admin\AppData\Local\OpenAI\Codex\bin\codex.exe",
+            local
+        ));
+        assert!(is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\openai\codex\bin\FD4C151A749F3AB4\CODEX.EXE",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\OpenAI\Codex\bin\not-hex\codex.exe",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\OpenAI\Codex\bin\abcd\codex.exe",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\OpenAI\Codex\bin\fd4c151a749f3ab4\node.exe",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\OpenAI\Codex\bin\fd4c151a749f3ab4\extra\codex.exe",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Roaming\OpenAI\Codex\bin\fd4c151a749f3ab4\codex.exe",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Temp\OpenAI\Codex\bin\fd4c151a749f3ab4\codex.exe",
+            local
+        ));
+        assert!(!is_official_windows_desktop_sidecar_path_in(
+            r"C:\Users\Admin\AppData\Local\OpenAI\Codex\codex.exe",
+            local
         ));
     }
 

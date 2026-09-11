@@ -40,7 +40,7 @@ pub struct ModelSpec {
     pub reasoning_levels: Vec<ReasoningEffort>,
     #[serde(default = "default_true")]
     pub supports_parallel_tool_calls: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub supports_images: bool,
 }
 
