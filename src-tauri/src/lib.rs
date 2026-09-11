@@ -15,6 +15,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -1293,6 +1294,17 @@ fn open_app_update(url: String) -> Result<(), String> {
     app_update::open_release_url(&url)
 }
 
+#[tauri::command]
+async fn install_app_update(
+    app: tauri::AppHandle,
+    url: String,
+    asset_name: Option<String>,
+) -> Result<(), String> {
+    app_update::download_and_launch_installer(&url, asset_name.as_deref()).await?;
+    app.exit(0);
+    Ok(())
+}
+
 pub fn run() {
     let background =
         std::env::args_os().any(|argument| argument == std::ffi::OsStr::new("--background"));
@@ -1349,6 +1361,7 @@ pub fn run() {
             check_app_update,
             skip_app_update,
             open_app_update,
+            install_app_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Codex Provider Switcher");
@@ -2017,16 +2030,11 @@ fn verify_managed_helper(paths: &AppPaths, helper: &Path) -> Result<(), String> 
     if helper_root != paths.state.join("helpers") {
         return Err("managed credential helper is outside the private helper root".to_string());
     }
-    let fingerprint = helper_dir
+    let dir_name = helper_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or_else(|| "managed credential helper has an invalid fingerprint".to_string())?;
-    let expected_name = if cfg!(windows) {
-        "codex-provider-switcher-helper.exe"
-    } else {
-        "codex-provider-switcher-helper"
-    };
+    let expected_name = helper_file_name();
     if helper.file_name().and_then(|name| name.to_str()) != Some(expected_name) {
         return Err("managed credential helper has an unexpected name".to_string());
     }
@@ -2037,7 +2045,25 @@ fn verify_managed_helper(paths: &AppPaths, helper: &Path) -> Result<(), String> 
         }
     }
     ensure_regular_source(helper)?;
-    if sha256_file(helper)? != fingerprint.to_ascii_lowercase() {
+    let digest = sha256_file(helper)?;
+    if dir_name == CURRENT_HELPER_DIR {
+        if digest == paths.helper_sha256 {
+            return Ok(());
+        }
+        let versioned = helper_root.join(&digest).join(expected_name);
+        if versioned != *helper
+            && versioned.exists()
+            && sha256_file(&versioned).ok().as_deref() == Some(digest.as_str())
+        {
+            return Ok(());
+        }
+        return Err("managed credential helper failed its integrity check".to_string());
+    }
+    let fingerprint = dir_name.to_ascii_lowercase();
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("managed credential helper has an invalid fingerprint".to_string());
+    }
+    if digest != fingerprint {
         return Err("managed credential helper failed its integrity check".to_string());
     }
     Ok(())
@@ -2512,12 +2538,10 @@ fn app_paths() -> Result<AppPaths, String> {
     let executable = std::env::current_exe()
         .map_err(|_| "could not resolve the switcher executable".to_string())?;
     let helper_sha256 = sha256_file(&executable)?;
-    let helper_name = if cfg!(windows) {
-        "codex-provider-switcher-helper.exe"
-    } else {
-        "codex-provider-switcher-helper"
-    };
-    let helper = state.join("helpers").join(&helper_sha256).join(helper_name);
+    let helper = state
+        .join("helpers")
+        .join(CURRENT_HELPER_DIR)
+        .join(helper_file_name());
     Ok(AppPaths {
         codex_home: codex_home.clone(),
         state: state.clone(),
@@ -2839,19 +2863,57 @@ fn map_missing_provider_credential(error: String) -> String {
     }
 }
 
+const CURRENT_HELPER_DIR: &str = "current";
+
+fn helper_file_name() -> &'static str {
+    if cfg!(windows) {
+        "codex-provider-switcher-helper.exe"
+    } else {
+        "codex-provider-switcher-helper"
+    }
+}
+
+fn versioned_helper_path(paths: &AppPaths) -> PathBuf {
+    paths
+        .state
+        .join("helpers")
+        .join(&paths.helper_sha256)
+        .join(helper_file_name())
+}
+
 fn ensure_stable_helper(paths: &AppPaths) -> Result<(), String> {
     ensure_state_root(paths)?;
     ensure_regular_source(&paths.executable)?;
-    if paths.helper.exists() {
-        ensure_regular_source(&paths.helper)?;
-        if sha256_file(&paths.helper)? == paths.helper_sha256 {
+    let versioned = versioned_helper_path(paths);
+    install_helper_copy(&paths.executable, &versioned, &paths.helper_sha256, false)?;
+    match install_helper_copy(&versioned, &paths.helper, &paths.helper_sha256, true) {
+        Ok(()) => Ok(()),
+        Err(_) if paths.helper.exists() => {
+            ensure_regular_source(&paths.helper)?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn install_helper_copy(
+    source: &Path,
+    destination: &Path,
+    expected_sha: &str,
+    replace: bool,
+) -> Result<(), String> {
+    ensure_regular_source(source)?;
+    if destination.exists() {
+        ensure_regular_source(destination)?;
+        if sha256_file(destination)? == expected_sha {
             return Ok(());
         }
-        return Err("the installed credential helper failed its integrity check".to_string());
+        if !replace {
+            return Err("the installed credential helper failed its integrity check".to_string());
+        }
     }
 
-    let helper_dir = paths
-        .helper
+    let helper_dir = destination
         .parent()
         .ok_or_else(|| "credential helper path has no parent".to_string())?;
     let helper_root = helper_dir
@@ -2869,30 +2931,62 @@ fn ensure_stable_helper(paths: &AppPaths) -> Result<(), String> {
     create_private_directory(helper_dir)
         .map_err(|_| "could not create a private credential helper directory".to_string())?;
 
-    let mut source = File::open(&paths.executable)
-        .map_err(|_| "could not read the app executable".to_string())?;
-    let mut temporary = NamedTempFile::new_in(helper_dir)
-        .map_err(|_| "could not stage the credential helper".to_string())?;
-    io::copy(&mut source, temporary.as_file_mut())
-        .map_err(|_| "could not copy the credential helper".to_string())?;
-    temporary
-        .as_file_mut()
-        .sync_all()
-        .map_err(|_| "could not sync the credential helper".to_string())?;
-    set_helper_permissions(temporary.as_file())
-        .map_err(|_| "could not secure the credential helper".to_string())?;
-    match temporary.persist_noclobber(&paths.helper) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure_regular_source(&paths.helper)?;
+    let mut last_error = "could not install the credential helper".to_string();
+    for _ in 0..5 {
+        if destination.exists() {
+            if fs::remove_file(destination).is_err() {
+                last_error = "could not replace the credential helper".to_string();
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
         }
-        Err(_) => return Err("could not install the credential helper".to_string()),
+        let mut reader =
+            File::open(source).map_err(|_| "could not read the app executable".to_string())?;
+        let mut temporary = match NamedTempFile::new_in(helper_dir) {
+            Ok(temporary) => temporary,
+            Err(_) => {
+                last_error = "could not stage the credential helper".to_string();
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        if io::copy(&mut reader, temporary.as_file_mut()).is_err() {
+            last_error = "could not copy the credential helper".to_string();
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        if temporary.as_file_mut().sync_all().is_err() {
+            last_error = "could not sync the credential helper".to_string();
+            continue;
+        }
+        if set_helper_permissions(temporary.as_file()).is_err() {
+            last_error = "could not secure the credential helper".to_string();
+            continue;
+        }
+        match temporary.persist_noclobber(destination) {
+            Ok(_) => {
+                if sha256_file(destination)? != expected_sha {
+                    return Err(
+                        "the installed credential helper failed its integrity check".to_string(),
+                    );
+                }
+                sync_helper_parent(destination)
+                    .map_err(|_| "could not finalize the credential helper".to_string())?;
+                return Ok(());
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if destination.exists()
+                    && sha256_file(destination).ok().as_deref() == Some(expected_sha)
+                {
+                    return Ok(());
+                }
+                last_error = "could not install the credential helper".to_string();
+            }
+            Err(_) => last_error = "could not install the credential helper".to_string(),
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    if sha256_file(&paths.helper)? != paths.helper_sha256 {
-        return Err("the installed credential helper failed its integrity check".to_string());
-    }
-    sync_helper_parent(&paths.helper)
-        .map_err(|_| "could not finalize the credential helper".to_string())
+    Err(last_error)
 }
 
 fn ensure_regular_source(path: &Path) -> Result<(), String> {
@@ -3510,3 +3604,4 @@ mod tests {
         assert!(parse_outbound_proxy_mode("clash").is_err());
     }
 }
+

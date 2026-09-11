@@ -301,13 +301,17 @@ strict loopback URL. The helper verifies that this account is bound to exactly
 one managed `cps-local` provider table before returning its token.
 
 On apply, the app installs a content-addressed copy of its command helper under
-`$CODEX_HOME/provider-switcher/helpers/<sha256>/`. Configuration points to that
-stable copy instead of an App Translocation or installer path. Old helper
-versions remain available so an exact backup can still authenticate or run
-`recovery restore-latest` after the main app is moved or removed.
+`$CODEX_HOME/provider-switcher/helpers/<sha256>/`, then exposes a stable
+`$CODEX_HOME/provider-switcher/helpers/current/` copy. Configuration points at
+`helpers/current/` so an app upgrade does not change the Codex command path.
+Old hashed helper versions remain available so an exact backup can still
+authenticate or run `recovery restore-latest` after the main app is moved or
+removed. Credential binding accepts sibling managed helpers under the same
+`helpers/` root, which covers a still-running Codex process that launched the
+previous hashed helper.
 When an enabled installation starts after an upgrade, a locked compare-and-swap
-write changes only the managed helper `command` and `cwd` to the current
-content-addressed copy. The original activation backup is not rewritten.
+write changes only the managed helper `command` and `cwd` if they still point
+at an older hashed copy. The original activation backup is not rewritten.
 
 On Windows, credential-helper caller verification accepts the registered
 Store Codex package or the canonical official npm Codex x64 layout when
