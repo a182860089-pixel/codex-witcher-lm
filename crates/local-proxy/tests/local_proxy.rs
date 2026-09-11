@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -319,7 +320,7 @@ async fn marker_server(marker: &'static str) -> (TestServer, Arc<MarkerState>) {
 }
 
 #[tokio::test]
-async fn hot_switches_new_turns_but_pins_responses_and_compact_for_the_same_turn() {
+async fn hot_switches_new_threads_but_keeps_existing_conversations_on_the_old_route() {
     let (upstream_a, state_a) = marker_server("a").await;
     let (upstream_b, state_b) = marker_server("b").await;
     let proxy = proxy_with_route(route(
@@ -331,18 +332,18 @@ async fn hot_switches_new_turns_but_pins_responses_and_compact_for_the_same_turn
     .await;
     let client = no_redirect_client();
 
-    let request = |path: &str, turn_id: &str| {
+    let request = |path: &str, thread_id: &str, turn_id: &str| {
         client
             .post(format!("{}{path}", proxy.base_url()))
             .bearer_auth(ENTRY_TOKEN)
-            .header("thread-id", "thread-one")
+            .header("thread-id", thread_id)
             .json(&json!({
                 "model": "ignored-client-model",
                 "client_metadata": {"turn_id": turn_id}
             }))
     };
 
-    let first: Value = request("/responses", "turn-one")
+    let first: Value = request("/responses", "thread-one", "turn-one")
         .send()
         .await
         .unwrap()
@@ -358,14 +359,21 @@ async fn hot_switches_new_turns_but_pins_responses_and_compact_for_the_same_turn
         vec![model("model-b")],
     ));
 
-    let same_turn: Value = request("/responses/compact", "turn-one")
+    let same_turn: Value = request("/responses/compact", "thread-one", "turn-one")
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let new_turn: Value = request("/responses", "turn-two")
+    let next_turn: Value = request("/responses", "thread-one", "turn-two")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let new_thread: Value = request("/responses", "thread-two", "turn-one")
         .send()
         .await
         .unwrap()
@@ -373,15 +381,16 @@ async fn hot_switches_new_turns_but_pins_responses_and_compact_for_the_same_turn
         .await
         .unwrap();
     assert_eq!(same_turn["provider"], "a");
-    assert_eq!(new_turn["provider"], "b");
-    assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
+    assert_eq!(next_turn["provider"], "a");
+    assert_eq!(new_thread["provider"], "b");
+    assert_eq!(state_a.requests.load(Ordering::Acquire), 3);
     assert_eq!(state_b.requests.load(Ordering::Acquire), 1);
     assert_eq!(
         *state_a
             .seen_models
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        vec!["model-a", "model-a"]
+        vec!["model-a", "model-a", "model-a"]
     );
     assert_eq!(
         *state_b
@@ -391,7 +400,116 @@ async fn hot_switches_new_turns_but_pins_responses_and_compact_for_the_same_turn
         vec!["model-b"]
     );
 
+    let catalog: CodexModelsResponse = client
+        .get(format!("{}/v1/models", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let slugs: Vec<_> = catalog.models.iter().map(|model| model.slug.as_str()).collect();
+    assert!(slugs.contains(&"model-a"));
+    assert!(slugs.contains(&"model-b"));
+
     proxy.shutdown().await.unwrap();
+}
+
+fn bindings_temp_path() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "codex-provider-switcher-bindings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp bindings directory");
+    dir.join("bindings.json")
+}
+
+#[tokio::test]
+async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
+    let (upstream_a, state_a) = marker_server("a").await;
+    let (upstream_b, state_b) = marker_server("b").await;
+    let bindings_path = bindings_temp_path();
+    let client = no_redirect_client();
+    let route_a = route(&upstream_a, "route-a", "model-a", vec![model("model-a")]);
+    let route_b = route(&upstream_b, "route-b", "model-b", vec![model("model-b")]);
+
+    let first = LocalProxy::start(
+        ProxyStartOptions {
+            bindings_path: Some(bindings_path.clone()),
+            ..ProxyStartOptions::default()
+        },
+        bearer(ENTRY_TOKEN),
+    )
+    .await
+    .expect("start first proxy");
+    first.set_active_route(route_a.clone());
+    let first_reply: Value = client
+        .post(format!("{}/responses", first.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "thread-one")
+        .json(&json!({
+            "model": "ignored",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_reply["provider"], "a");
+    first.shutdown().await.unwrap();
+
+    let second = LocalProxy::start(
+        ProxyStartOptions {
+            bindings_path: Some(bindings_path.clone()),
+            ..ProxyStartOptions::default()
+        },
+        bearer(ENTRY_TOKEN),
+    )
+    .await
+    .expect("start second proxy");
+    second.set_active_route(route_b);
+    second.remember_route(route_a);
+    let existing: Value = client
+        .post(format!("{}/responses", second.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "thread-one")
+        .json(&json!({
+            "model": "model-b",
+            "client_metadata": {"turn_id": "turn-two"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fresh: Value = client
+        .post(format!("{}/responses", second.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "thread-two")
+        .json(&json!({
+            "model": "model-b",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(existing["provider"], "a");
+    assert_eq!(fresh["provider"], "b");
+    assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
+    assert_eq!(state_b.requests.load(Ordering::Acquire), 1);
+    second.shutdown().await.unwrap();
+    let _ = std::fs::remove_dir_all(bindings_path.parent().expect("temp parent"));
 }
 
 async fn sse_provider() -> Response {

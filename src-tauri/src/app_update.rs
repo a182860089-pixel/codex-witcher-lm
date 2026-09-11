@@ -224,10 +224,10 @@ fn select_newer_release(
     let asset = release
         .assets
         .iter()
-        .find(|asset| !asset_marker.is_empty() && asset.name.contains(asset_marker));
+        .find(|asset| asset_name_matches(&asset.name, asset_marker));
     let release_url = validate_release_url(&release.html_url).ok()?;
     let download_url = asset
-        .and_then(|asset| validate_release_url(&asset.browser_download_url).ok())
+        .and_then(|asset| validate_download_url(&asset.browser_download_url).ok())
         .unwrap_or_else(|| release_url.clone());
     Some(AppUpdateStatus {
         current_version: format_semver(current_version),
@@ -251,6 +251,15 @@ fn current_asset_marker() -> &'static str {
     } else {
         ""
     }
+}
+
+fn asset_name_matches(name: &str, marker: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let marker = marker.trim().to_ascii_lowercase();
+    if !marker.is_empty() && name.contains(&marker) {
+        return true;
+    }
+    cfg!(windows) && (name.contains("windows-x64-setup.exe") || name.ends_with("x64-setup.exe"))
 }
 
 fn parse_semver(value: &str) -> Option<SemVer> {
@@ -543,11 +552,39 @@ fn verify_installer_bytes(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn current_install_paths() -> Result<(PathBuf, PathBuf), String> {
+    let relaunch = std::env::current_exe()
+        .map_err(|_| "could not resolve the current app path".to_string())?;
+    let install_dir = relaunch
+        .parent()
+        .ok_or_else(|| "could not resolve the install directory".to_string())?
+        .to_path_buf();
+    Ok((install_dir, relaunch))
+}
+
+#[cfg(windows)]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn launch_installer_after_exit(path: &Path) -> Result<(), String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "installer path is not valid UTF-8".to_string())?;
     let pid = std::process::id();
+    #[cfg(windows)]
+    let (install_dir, relaunch) = current_install_paths()?;
+    #[cfg(windows)]
+    let install_dir = install_dir
+        .to_str()
+        .ok_or_else(|| "install directory is not valid UTF-8".to_string())?
+        .to_string();
+    #[cfg(windows)]
+    let relaunch = relaunch
+        .to_str()
+        .ok_or_else(|| "app path is not valid UTF-8".to_string())?
+        .to_string();
     let result = {
         #[cfg(windows)]
         {
@@ -555,9 +592,11 @@ fn launch_installer_after_exit(path: &Path) -> Result<(), String> {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            let escaped = path_str.replace('\'', "''");
+            let installer = powershell_single_quoted(path_str);
+            let install_dir = powershell_single_quoted(&install_dir);
+            let relaunch = powershell_single_quoted(&relaunch);
             let script = format!(
-                "while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}; Start-Process -FilePath '{escaped}'"
+                "$ErrorActionPreference = 'Stop'; while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 250 }}; $installer = {installer}; $installDir = {install_dir}; $relaunch = {relaunch}; $info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $installer; $info.Arguments = '/S /UPDATE /D=' + $installDir; $info.UseShellExecute = $false; $proc = [System.Diagnostics.Process]::Start($info); if (-not $proc) {{ exit 1 }}; $proc.WaitForExit(); if ($proc.ExitCode -ne 0) {{ exit $proc.ExitCode }}; if (Test-Path -LiteralPath $relaunch) {{ Start-Process -FilePath $relaunch }} else {{ $exe = Get-ChildItem -LiteralPath $installDir -Filter *.exe -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -notmatch '(?i)uninstall' }} | Select-Object -First 1; if ($exe) {{ Start-Process -FilePath $exe.FullName }} }}"
             );
             std::process::Command::new("powershell")
                 .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
@@ -685,5 +724,14 @@ mod tests {
         assert!(sanitize_asset_name("../evil.exe").is_err());
         assert!(sanitize_asset_name("payload.dll").is_err());
         assert!(sanitize_asset_name("foo bar.exe").is_err());
+    }
+
+    #[test]
+    fn installer_assets_match_without_exact_case() {
+        assert!(asset_name_matches(
+            "Codex.Provider.Switcher_0.3.7_windows-x64-setup.exe",
+            "Windows-x64-Setup.exe"
+        ));
+        assert!(!asset_name_matches("notes.txt", "Windows-x64-Setup.exe"));
     }
 }

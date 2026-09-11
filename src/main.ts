@@ -639,7 +639,7 @@ app.innerHTML = `
   <dialog id="restart-notice" class="restart-dialog" aria-labelledby="restart-notice-title">
     <div class="restart-dialog-mark" aria-hidden="true">✓</div>
     <h2 id="restart-notice-title">快速切换已准备好</h2>
-    <p>重新打开一次 Codex 即可生效。之后保持本软件运行，模型切换会应用到下一轮对话。</p>
+    <p>重新打开一次 Codex 即可生效。之后保持本软件运行，新对话使用当前模型，已有对话仍走原来的模型。</p>
     <div class="restart-dialog-actions">
       <button id="restart-later" class="button button-secondary" type="button">稍后</button>
       <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
@@ -2578,7 +2578,7 @@ async function checkAppUpdate(manual: boolean): Promise<void> {
 function showUpdateDialog(status: AppUpdateStatus): void {
   pendingUpdate = status;
   required<HTMLElement>("#update-notice-copy").textContent =
-    `当前 Version ${status.currentVersion}，可更新到 ${status.latestVersion}。`;
+    `当前 Version ${status.currentVersion}，可更新到 ${status.latestVersion}。将在当前安装目录静默覆盖，无需卸载重装。`;
   const notes = required<HTMLElement>("#update-notice-notes");
   const body = status.releaseNotes.trim();
   notes.hidden = !body;
@@ -2604,14 +2604,27 @@ async function skipPendingUpdate(): Promise<void> {
 async function installPendingUpdate(): Promise<void> {
   const status = pendingUpdate;
   if (!status) return;
+  required<HTMLDialogElement>("#update-notice").close();
   const url = status.downloadUrl || status.releaseUrl;
   if (!nativeAvailable) {
     window.open(url, "_blank", "noopener");
     return;
   }
-  await run("正在打开更新发布页…", async () => {
-    await invoke("open_app_update", { url });
-    return `已打开 ${status.latestVersion} 的安装包下载。安装完成后重新打开本应用即可。`;
+  const canInstall =
+    Boolean(status.assetName) && status.downloadUrl.includes("/releases/download/");
+  if (!canInstall) {
+    await run("正在打开更新发布页…", async () => {
+      await invoke("open_app_update", { url: status.releaseUrl || url });
+      return `已打开 ${status.latestVersion} 的发布页。`;
+    });
+    return;
+  }
+  await run("正在下载并安装更新…", async () => {
+    await invoke("install_app_update", {
+      url: status.downloadUrl,
+      assetName: status.assetName,
+    });
+    return `正在安装 ${status.latestVersion}，完成后会自动重新打开。`;
   });
 }
 
@@ -2672,6 +2685,15 @@ function friendlyError(error: unknown): string {
   }
   if (message.includes("could not open the update page") || message.includes("update URL")) {
     return "无法打开更新链接。请稍后重试，或到 GitHub Release 页面手动下载。";
+  }
+  if (
+    message.includes("could not download the installer") ||
+    message.includes("could not launch the installer") ||
+    message.includes("could not stage the installer") ||
+    message.includes("update download") ||
+    message.includes("downloaded installer")
+  ) {
+    return "无法完成应用内更新。请检查网络后重试，或到 GitHub Release 页面手动下载。";
   }
   if (message.includes("HTTP 401") || message.includes("HTTP 403")) {
     return "API Key 无效，或没有读取模型的权限。";

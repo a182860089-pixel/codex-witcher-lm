@@ -1,7 +1,8 @@
 //! Loopback-only Responses API proxy for the focused Codex provider switcher.
 //!
 //! The proxy keeps entry and upstream bearer credentials in memory, atomically
-//! swaps immutable routes, and pins a route for a `(thread_id, turn_id)` pair.
+//! swaps immutable routes, and pins a route for a conversation `thread_id` so
+//! later model switches do not rewrite in-flight or already-started threads.
 //! It is intentionally a Rust API rather than a command-line program so Tauri
 //! can obtain secrets from the platform credential store before constructing a
 //! route.
@@ -12,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -40,6 +42,8 @@ use zeroize::Zeroizing;
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_PINNED_TURNS: usize = 4_096;
+const DEFAULT_MAX_PINNED_THREADS: usize = 4_096;
+const BINDINGS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -148,6 +152,41 @@ pub struct RouteSummary {
     pub id: String,
     pub selected_model: String,
     pub model_count: usize,
+}
+
+/// Credential-free binding of a Codex conversation to a saved route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBinding {
+    pub thread_id: String,
+    pub route_id: String,
+    pub selected_model: String,
+}
+
+/// Credential-free record of a recently used provider/model route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteBinding {
+    pub route_id: String,
+    pub selected_model: String,
+}
+
+/// On-disk conversation and recent-route bindings that survive app upgrades.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyBindings {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub threads: Vec<ThreadBinding>,
+    #[serde(default)]
+    pub recent: Vec<RouteBinding>,
+}
+
+/// Read credential-free proxy bindings from disk. Invalid files are ignored.
+pub fn read_proxy_bindings(path: &Path) -> Option<ProxyBindings> {
+    let bytes = std::fs::read(path).ok()?;
+    let parsed: ProxyBindings = serde_json::from_slice(&bytes).ok()?;
+    (parsed.schema_version == BINDINGS_SCHEMA_VERSION).then_some(parsed)
 }
 
 /// One Codex-compatible reasoning preset in [`CodexModelInfo`].
@@ -360,18 +399,15 @@ impl RouteConfig {
             .expect("a validated hierarchical base URL always joins a static path")
     }
 
-    fn catalog_etag(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.id.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.selected_model.as_bytes());
-        hasher.update([0]);
-        hasher.update(
-            serde_json::to_vec(&self.models_response())
-                .expect("Codex models response only contains serializable values"),
-        );
-        format!("\"{}\"", encode_hex(&hasher.finalize()))
-    }
+}
+
+fn catalog_etag_for(catalog: &CodexModelsResponse) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(
+        serde_json::to_vec(catalog)
+            .expect("Codex models response only contains serializable values"),
+    );
+    format!("\"{}\"", encode_hex(&hasher.finalize()))
 }
 
 impl fmt::Debug for RouteConfig {
@@ -394,9 +430,13 @@ pub struct ProxyStartOptions {
     pub port: u16,
     pub max_request_bytes: usize,
     pub max_pinned_turns: usize,
+    pub max_pinned_threads: usize,
     pub upstream_connect_timeout: Duration,
     /// When false (crate default), the upstream client ignores `HTTP_PROXY`.
     pub use_system_proxy: bool,
+    /// Optional credential-free JSON file used to keep conversation routes
+    /// across Switcher restarts and in-place upgrades.
+    pub bindings_path: Option<PathBuf>,
 }
 
 impl Default for ProxyStartOptions {
@@ -405,8 +445,10 @@ impl Default for ProxyStartOptions {
             port: 0,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_pinned_turns: DEFAULT_MAX_PINNED_TURNS,
+            max_pinned_threads: DEFAULT_MAX_PINNED_THREADS,
             upstream_connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             use_system_proxy: false,
+            bindings_path: None,
         }
     }
 }
@@ -418,6 +460,7 @@ pub struct ProxyHealth {
     pub listen_addr: SocketAddr,
     pub active_route: Option<RouteSummary>,
     pub pinned_turns: usize,
+    pub pinned_threads: usize,
     pub forwarded_requests: u64,
     pub in_flight_requests: usize,
     pub last_upstream_status: Option<u16>,
@@ -440,6 +483,11 @@ impl LocalProxy {
         if options.max_pinned_turns == 0 {
             return Err(ProxyError::InvalidStartOptions(
                 "max_pinned_turns must be greater than zero".to_string(),
+            ));
+        }
+        if options.max_pinned_threads == 0 {
+            return Err(ProxyError::InvalidStartOptions(
+                "max_pinned_threads must be greater than zero".to_string(),
             ));
         }
 
@@ -470,7 +518,7 @@ impl LocalProxy {
 
         let state = Arc::new(ProxyState {
             auth: EntryTokenVerifier::new(entry_bearer),
-            routes: RouteTable::new(options.max_pinned_turns),
+            routes: RouteTable::from_options(&options),
             client,
             listen_addr,
             max_request_bytes: options.max_request_bytes,
@@ -535,6 +583,18 @@ impl ProxyHandle {
             .map(|route| route.summary())
     }
 
+    pub fn remember_route(&self, route: RouteConfig) {
+        self.state.routes.remember(Arc::new(route));
+    }
+
+    pub fn pin_thread(&self, thread_id: &str, route: RouteConfig) -> Result<(), ProxyError> {
+        validate_turn_key_part("thread_id", thread_id)?;
+        self.state
+            .routes
+            .pin_thread(thread_id, Arc::new(route));
+        Ok(())
+    }
+
     pub fn clear_active_route(&self) -> Option<RouteSummary> {
         self.state
             .routes
@@ -547,10 +607,7 @@ impl ProxyHandle {
     }
 
     pub fn models_response(&self) -> Option<CodexModelsResponse> {
-        self.state
-            .routes
-            .active()
-            .map(|route| route.models_response())
+        self.state.routes.catalog_response()
     }
 
     pub fn release_turn(&self, thread_id: &str, turn_id: &str) -> bool {
@@ -614,6 +671,7 @@ impl ProxyState {
             listen_addr,
             active_route: self.routes.active().map(|route| route.summary()),
             pinned_turns: self.routes.pin_count(),
+            pinned_threads: self.routes.thread_pin_count(),
             forwarded_requests: self.metrics.forwarded_requests.load(Ordering::Acquire),
             in_flight_requests: self.metrics.in_flight_requests.load(Ordering::Acquire),
             last_upstream_status: (last_status != 0).then_some(last_status),
@@ -685,16 +743,51 @@ impl EntryTokenVerifier {
 
 struct RouteTable {
     active: ArcSwapOption<RouteConfig>,
+    recent: Mutex<LruRoutes>,
+    thread_pins: Mutex<LruThreads>,
     pins: Mutex<PinnedRoutes>,
+    pending_threads: Mutex<Vec<ThreadBinding>>,
+    pending_recent: Mutex<Vec<RouteBinding>>,
     max_pinned_turns: usize,
+    max_pinned_threads: usize,
+    bindings_path: Option<PathBuf>,
 }
 
 impl RouteTable {
     fn new(max_pinned_turns: usize) -> Self {
+        Self::with_options(max_pinned_turns, max_pinned_turns, None)
+    }
+
+    fn from_options(options: &ProxyStartOptions) -> Self {
+        Self::with_options(
+            options.max_pinned_turns,
+            options.max_pinned_threads,
+            options.bindings_path.clone(),
+        )
+    }
+
+    fn with_options(
+        max_pinned_turns: usize,
+        max_pinned_threads: usize,
+        bindings_path: Option<PathBuf>,
+    ) -> Self {
+        let bindings = bindings_path
+            .as_ref()
+            .and_then(|path| read_proxy_bindings(path));
+        let (pending_threads, pending_recent) = match bindings {
+            Some(bindings) => (bindings.threads, bindings.recent),
+            None => (Vec::new(), Vec::new()),
+        };
         Self {
             active: ArcSwapOption::empty(),
+            recent: Mutex::new(LruRoutes::default()),
+            thread_pins: Mutex::new(LruThreads::default()),
             pins: Mutex::new(PinnedRoutes::default()),
+            pending_threads: Mutex::new(pending_threads),
+            pending_recent: Mutex::new(pending_recent),
             max_pinned_turns,
+            max_pinned_threads,
+            bindings_path,
         }
     }
 
@@ -703,24 +796,102 @@ impl RouteTable {
     }
 
     fn set_active(&self, route: RouteConfig) -> Option<Arc<RouteConfig>> {
-        self.active.swap(Some(Arc::new(route)))
+        let next = Arc::new(route);
+        self.remember(Arc::clone(&next));
+        let previous = self.active.swap(Some(Arc::clone(&next)));
+        if let Some(previous) = &previous {
+            self.remember(Arc::clone(previous));
+        }
+        self.persist();
+        previous
+    }
+
+    fn remember(&self, route: Arc<RouteConfig>) {
+        lock_unpoisoned(&self.recent).insert(Arc::clone(&route), self.max_pinned_threads);
+        self.hydrate_pending(route);
+        self.persist();
+    }
+
+    fn hydrate_pending(&self, route: Arc<RouteConfig>) {
+        lock_unpoisoned(&self.pending_recent).retain(|binding| {
+            binding.route_id != route.id || binding.selected_model != route.selected_model
+        });
+        let matched: Vec<String> = {
+            let mut pending = lock_unpoisoned(&self.pending_threads);
+            let mut matched = Vec::new();
+            pending.retain(|binding| {
+                if binding.route_id == route.id && binding.selected_model == route.selected_model {
+                    matched.push(binding.thread_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            matched
+        };
+        if matched.is_empty() {
+            return;
+        }
+        let mut pins = lock_unpoisoned(&self.thread_pins);
+        for thread_id in matched {
+            pins.insert(thread_id, Arc::clone(&route), self.max_pinned_threads);
+        }
+    }
+
+    fn pin_thread(&self, thread_id: &str, route: Arc<RouteConfig>) {
+        lock_unpoisoned(&self.pending_threads)
+            .retain(|binding| binding.thread_id != thread_id);
+        self.remember(Arc::clone(&route));
+        lock_unpoisoned(&self.thread_pins).insert(
+            thread_id.to_string(),
+            route,
+            self.max_pinned_threads,
+        );
+        self.persist();
     }
 
     fn clear_active(&self) -> Option<Arc<RouteConfig>> {
         self.active.swap(None)
     }
 
-    fn resolve(&self, turn_key: Option<TurnKey>) -> Option<Arc<RouteConfig>> {
-        let Some(turn_key) = turn_key else {
-            return self.active();
-        };
-
-        let mut pins = lock_unpoisoned(&self.pins);
-        if let Some(route) = pins.routes.get(&turn_key) {
-            return Some(Arc::clone(route));
+    fn resolve(
+        &self,
+        thread_id: Option<&str>,
+        turn_key: Option<TurnKey>,
+    ) -> Option<Arc<RouteConfig>> {
+        if let Some(ref key) = turn_key {
+            let pins = lock_unpoisoned(&self.pins);
+            if let Some(route) = pins.routes.get(key) {
+                return Some(Arc::clone(route));
+            }
+        }
+        if let Some(thread_id) = thread_id {
+            let pins = lock_unpoisoned(&self.thread_pins);
+            if let Some(route) = pins.routes.get(thread_id) {
+                let route = Arc::clone(route);
+                drop(pins);
+                if let Some(key) = turn_key {
+                    self.pin_turn(key, Arc::clone(&route));
+                }
+                return Some(route);
+            }
         }
 
         let active = self.active()?;
+        if let Some(thread_id) = thread_id {
+            self.pin_thread(thread_id, Arc::clone(&active));
+        }
+        if let Some(key) = turn_key {
+            self.pin_turn(key, Arc::clone(&active));
+        }
+        Some(active)
+    }
+
+    fn pin_turn(&self, turn_key: TurnKey, route: Arc<RouteConfig>) {
+        let mut pins = lock_unpoisoned(&self.pins);
+        if pins.routes.contains_key(&turn_key) {
+            return;
+        }
         while pins.routes.len() >= self.max_pinned_turns {
             let Some(stale_key) = pins.insertion_order.pop_front() else {
                 break;
@@ -728,8 +899,7 @@ impl RouteTable {
             pins.routes.remove(&stale_key);
         }
         pins.insertion_order.push_back(turn_key.clone());
-        pins.routes.insert(turn_key, Arc::clone(&active));
-        Some(active)
+        pins.routes.insert(turn_key, route);
     }
 
     fn release(&self, turn_key: &TurnKey) -> bool {
@@ -748,12 +918,154 @@ impl RouteTable {
     fn pin_count(&self) -> usize {
         lock_unpoisoned(&self.pins).routes.len()
     }
+
+    fn thread_pin_count(&self) -> usize {
+        lock_unpoisoned(&self.thread_pins).routes.len()
+    }
+
+    fn catalog_response(&self) -> Option<CodexModelsResponse> {
+        let mut models = Vec::new();
+        let mut seen = HashSet::new();
+        let mut ingest = |route: &RouteConfig| {
+            for model in route.models_response().models {
+                if seen.insert(model.slug.clone()) {
+                    models.push(model);
+                }
+            }
+        };
+        for route in lock_unpoisoned(&self.thread_pins).routes.values() {
+            ingest(route);
+        }
+        for route in lock_unpoisoned(&self.recent).routes.values() {
+            ingest(route);
+        }
+        if let Some(active) = self.active() {
+            ingest(&active);
+        }
+        if models.is_empty() {
+            None
+        } else {
+            Some(CodexModelsResponse { models })
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.bindings_path else {
+            return;
+        };
+        let mut threads = {
+            let pins = lock_unpoisoned(&self.thread_pins);
+            pins.insertion_order
+                .iter()
+                .filter_map(|thread_id| {
+                    let route = pins.routes.get(thread_id)?;
+                    Some(ThreadBinding {
+                        thread_id: thread_id.clone(),
+                        route_id: route.id.clone(),
+                        selected_model: route.selected_model.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut seen_threads: HashSet<String> =
+            threads.iter().map(|binding| binding.thread_id.clone()).collect();
+        for binding in lock_unpoisoned(&self.pending_threads).iter() {
+            if seen_threads.insert(binding.thread_id.clone()) {
+                threads.push(binding.clone());
+            }
+        }
+        let mut recent = {
+            let recent = lock_unpoisoned(&self.recent);
+            recent
+                .insertion_order
+                .iter()
+                .filter_map(|key| {
+                    let route = recent.routes.get(key)?;
+                    Some(RouteBinding {
+                        route_id: route.id.clone(),
+                        selected_model: route.selected_model.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut seen_recent: HashSet<(String, String)> = recent
+            .iter()
+            .map(|binding| (binding.route_id.clone(), binding.selected_model.clone()))
+            .collect();
+        for binding in lock_unpoisoned(&self.pending_recent).iter() {
+            if seen_recent.insert((binding.route_id.clone(), binding.selected_model.clone())) {
+                recent.push(binding.clone());
+            }
+        }
+        let payload = ProxyBindings {
+            schema_version: BINDINGS_SCHEMA_VERSION,
+            threads,
+            recent,
+        };
+        let Ok(bytes) = serde_json::to_vec_pretty(&payload) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
 }
 
 #[derive(Default)]
 struct PinnedRoutes {
     routes: HashMap<TurnKey, Arc<RouteConfig>>,
     insertion_order: VecDeque<TurnKey>,
+}
+
+#[derive(Default)]
+struct LruRoutes {
+    routes: HashMap<(String, String), Arc<RouteConfig>>,
+    insertion_order: VecDeque<(String, String)>,
+}
+
+impl LruRoutes {
+    fn insert(&mut self, route: Arc<RouteConfig>, max: usize) {
+        let key = (route.id.clone(), route.selected_model.clone());
+        if self.routes.insert(key.clone(), Arc::clone(&route)).is_some() {
+            self.insertion_order.retain(|item| item != &key);
+        }
+        self.insertion_order.push_back(key);
+        while self.routes.len() > max {
+            let Some(stale) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.routes.remove(&stale);
+        }
+    }
+}
+
+#[derive(Default)]
+struct LruThreads {
+    routes: HashMap<String, Arc<RouteConfig>>,
+    insertion_order: VecDeque<String>,
+}
+
+impl LruThreads {
+    fn insert(&mut self, thread_id: String, route: Arc<RouteConfig>, max: usize) {
+        if self
+            .routes
+            .insert(thread_id.clone(), route)
+            .is_some()
+        {
+            self.insertion_order.retain(|item| item != &thread_id);
+        }
+        self.insertion_order.push_back(thread_id);
+        while self.routes.len() > max {
+            let Some(stale) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.routes.remove(&stale);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -777,12 +1089,7 @@ impl TurnKey {
     }
 
     fn from_request(headers: &HeaderMap, body: &Value) -> Result<Option<Self>, ProxyError> {
-        let thread_id = first_header_value(
-            headers,
-            &["thread-id", "x-codex-thread-id", "x-client-request-id"],
-        )
-        .or_else(|| string_at(body, "/client_metadata/thread_id"))
-        .or_else(|| string_at(body, "/thread_id"));
+        let thread_id = extract_thread_id(headers, body);
         let turn_id = first_header_value(headers, &["turn-id", "x-codex-turn-id"])
             .or_else(|| string_at(body, "/client_metadata/turn_id"))
             .or_else(|| string_at(body, "/turn_id"));
@@ -792,6 +1099,15 @@ impl TurnKey {
             _ => Ok(None),
         }
     }
+}
+
+fn extract_thread_id<'a>(headers: &'a HeaderMap, body: &'a Value) -> Option<&'a str> {
+    first_header_value(
+        headers,
+        &["thread-id", "x-codex-thread-id", "x-client-request-id"],
+    )
+    .or_else(|| string_at(body, "/client_metadata/thread_id"))
+    .or_else(|| string_at(body, "/thread_id"))
 }
 
 #[derive(Clone, Copy)]
@@ -820,11 +1136,11 @@ async fn models_handler(State(state): State<Arc<ProxyState>>, headers: HeaderMap
     if !state.auth.authorize(&headers) {
         return unauthorized_response();
     }
-    let Some(route) = state.routes.active() else {
+    let Some(catalog) = state.routes.catalog_response() else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no active provider route");
     };
 
-    let etag = route.catalog_etag();
+    let etag = catalog_etag_for(&catalog);
     if headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -839,7 +1155,7 @@ async fn models_handler(State(state): State<Arc<ProxyState>>, headers: HeaderMap
         return response;
     }
 
-    let body = serde_json::to_vec(&route.models_response())
+    let body = serde_json::to_vec(&catalog)
         .expect("Codex models response only contains serializable values");
     let mut response = Response::new(Body::from(body));
     response
@@ -907,7 +1223,8 @@ async fn proxy_request(
             );
         }
     };
-    let Some(route) = state.routes.resolve(turn_key) else {
+    let thread_id = extract_thread_id(&parts.headers, &body);
+    let Some(route) = state.routes.resolve(thread_id, turn_key) else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no active provider route");
     };
 
@@ -967,10 +1284,10 @@ async fn proxy_request(
         return normalize_upstream_error(status, upstream).await;
     }
     let mut headers = sanitize_response_headers(upstream.headers());
-    if let Some(active_route) = state.routes.active() {
+    if let Some(catalog) = state.routes.catalog_response() {
         headers.insert(
             X_MODELS_ETAG,
-            HeaderValue::from_str(&active_route.catalog_etag())
+            HeaderValue::from_str(&catalog_etag_for(&catalog))
                 .expect("catalog ETag is always valid ASCII"),
         );
     }
@@ -1401,23 +1718,64 @@ mod tests {
     }
 
     #[test]
-    fn active_route_swap_preserves_a_turn_pin() {
+    fn active_route_swap_keeps_existing_threads_on_the_previous_route() {
         let table = RouteTable::new(8);
         table.set_active(route("route-a", "model-a"));
         let key = TurnKey::new("thread-1", "turn-1").unwrap();
-        let first = table.resolve(Some(key.clone())).unwrap();
+        let first = table
+            .resolve(Some("thread-1"), Some(key.clone()), Some("model-a"))
+            .unwrap();
         assert_eq!(first.summary().id, "route-a");
 
         table.set_active(route("route-b", "model-b"));
-        let pinned = table.resolve(Some(key.clone())).unwrap();
+        let pinned = table
+            .resolve(Some("thread-1"), Some(key.clone()), Some("model-b"))
+            .unwrap();
         let next_turn = table
-            .resolve(Some(TurnKey::new("thread-1", "turn-2").unwrap()))
+            .resolve(
+                Some("thread-1"),
+                Some(TurnKey::new("thread-1", "turn-2").unwrap()),
+                Some("model-b"),
+            )
+            .unwrap();
+        let new_thread = table
+            .resolve(
+                Some("thread-2"),
+                Some(TurnKey::new("thread-2", "turn-1").unwrap()),
+                None,
+            )
+            .unwrap();
+        let requested_old = table
+            .resolve(
+                Some("thread-3"),
+                Some(TurnKey::new("thread-3", "turn-1").unwrap()),
+                Some("model-a"),
+            )
             .unwrap();
         assert_eq!(pinned.summary().id, "route-a");
-        assert_eq!(next_turn.summary().id, "route-b");
+        assert_eq!(next_turn.summary().id, "route-a");
+        assert_eq!(new_thread.summary().id, "route-b");
+        assert_eq!(requested_old.summary().id, "route-a");
+
+        let slugs: Vec<_> = table
+            .catalog_response()
+            .unwrap()
+            .models
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect();
+        assert!(slugs.contains(&"model-a"));
+        assert!(slugs.contains(&"model-b"));
 
         assert!(table.release(&key));
-        assert_eq!(table.resolve(Some(key)).unwrap().summary().id, "route-b");
+        assert_eq!(
+            table
+                .resolve(Some("thread-1"), Some(key), Some("model-b"))
+                .unwrap()
+                .summary()
+                .id,
+            "route-a"
+        );
     }
 
     #[test]
