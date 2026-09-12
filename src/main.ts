@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { animateDialogIn, animateDialogOut, animatePage } from "./motion";
 import "./styles.css";
 import "./styles-polish.css";
@@ -309,6 +310,12 @@ let editingCredentialDirty = false;
 let restartNoticeShown = false;
 let busy = false;
 let pendingUpdate: AppUpdateStatus | null = null;
+const AUTO_UPDATE_FIRST_DELAY_MS = 5000;
+const AUTO_UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const AUTO_UPDATE_RETRY_DELAYS_MS = [30_000, 120_000, 600_000];
+let autoUpdateTimer: number | null = null;
+let autoUpdateInFlight = false;
+let autoUpdateRetryIndex = 0;
 
 app.innerHTML = `
   <div class="app-shell">
@@ -1088,8 +1095,8 @@ setInterval(() => {
 
 void refreshDashboard().then(() => {
   showRequestedBrowserPreview();
-  void checkAppUpdate(false);
 });
+startAutomaticUpdateChecks();
 
 function showRequestedBrowserPreview(): void {
   if (nativeAvailable) return;
@@ -3074,6 +3081,36 @@ function toggleKeyVisibility(): void {
   button.textContent = key.type === "password" ? "显示" : "隐藏";
 }
 
+function startAutomaticUpdateChecks(): void {
+  scheduleAutoUpdateCheck(AUTO_UPDATE_FIRST_DELAY_MS);
+  window.addEventListener("focus", presentPendingUpdateIfNeeded);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) presentPendingUpdateIfNeeded();
+  });
+  if (!nativeAvailable) return;
+  void listen("main-window-shown", () => {
+    window.setTimeout(presentPendingUpdateIfNeeded, 200);
+  }).catch(() => undefined);
+}
+
+function scheduleAutoUpdateCheck(delayMs: number): void {
+  if (autoUpdateTimer !== null) window.clearTimeout(autoUpdateTimer);
+  autoUpdateTimer = window.setTimeout(() => {
+    autoUpdateTimer = null;
+    void checkAppUpdate(false);
+  }, delayMs);
+}
+
+function presentPendingUpdateIfNeeded(): void {
+  if (busy) return;
+  const status = pendingUpdate;
+  if (!status?.updateAvailable || status.skipped) return;
+  const dialog = document.querySelector<HTMLDialogElement>("#update-notice");
+  if (!dialog || dialog.open) return;
+  if (document.hidden) return;
+  showUpdateDialog(status);
+}
+
 async function checkAppUpdate(manual: boolean): Promise<void> {
   if (!nativeAvailable) {
     if (manual) {
@@ -3081,28 +3118,51 @@ async function checkAppUpdate(manual: boolean): Promise<void> {
     }
     return;
   }
+  if (!manual && autoUpdateInFlight) return;
+  if (!manual) autoUpdateInFlight = true;
   if (manual) {
     setBusy(true);
     setStatus("正在检查更新…", "working");
   }
   try {
     const status = await invoke<AppUpdateStatus>("check_app_update");
+    autoUpdateRetryIndex = 0;
     required<HTMLElement>("#app-version").textContent = `Version ${status.currentVersion}`;
     if (!status.updateAvailable) {
+      pendingUpdate = null;
       if (manual) {
         setStatus(`当前已是最新版本 ${status.currentVersion}`, "success");
       }
+      scheduleAutoUpdateCheck(AUTO_UPDATE_INTERVAL_MS);
       return;
     }
-    if (!manual && status.skipped) return;
-    showUpdateDialog(status);
+    pendingUpdate = status;
+    if (!manual && status.skipped) {
+      scheduleAutoUpdateCheck(AUTO_UPDATE_INTERVAL_MS);
+      return;
+    }
+    if (manual || (!busy && !document.hidden)) {
+      showUpdateDialog(status);
+    }
     if (manual) {
       setStatus(`发现新版本 ${status.latestVersion}`, "success");
     }
+    scheduleAutoUpdateCheck(AUTO_UPDATE_INTERVAL_MS);
   } catch (error) {
     if (manual) setStatus(friendlyError(error), "error");
+    else {
+      const retryIndex = Math.min(
+        autoUpdateRetryIndex,
+        AUTO_UPDATE_RETRY_DELAYS_MS.length - 1,
+      );
+      autoUpdateRetryIndex += 1;
+      scheduleAutoUpdateCheck(
+        AUTO_UPDATE_RETRY_DELAYS_MS[retryIndex] ?? AUTO_UPDATE_INTERVAL_MS,
+      );
+    }
   } finally {
     if (manual) setBusy(false);
+    if (!manual) autoUpdateInFlight = false;
   }
 }
 
@@ -3120,6 +3180,7 @@ function showUpdateDialog(status: AppUpdateStatus): void {
 
 async function skipPendingUpdate(): Promise<void> {
   const status = pendingUpdate;
+  pendingUpdate = status ? { ...status, skipped: true } : null;
   required<HTMLDialogElement>("#update-notice").close();
   if (!status) return;
   if (!nativeAvailable) {
@@ -3179,11 +3240,13 @@ async function run(
 function setBusy(value: boolean): void {
   busy = value;
   document.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
+    if (button.closest("dialog")?.open) return;
     button.disabled = value;
   });
   document
     .querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")
     .forEach((control) => {
+      if (control.closest("dialog")?.open) return;
       control.disabled = value;
     });
   if (!value) {
@@ -3196,6 +3259,7 @@ function setBusy(value: boolean): void {
     renderOfficialProfile();
     renderProfiles();
     updateSelectionSummary();
+    presentPendingUpdateIfNeeded();
   }
 }
 

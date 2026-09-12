@@ -188,6 +188,21 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-12 GitHub 0.3.11
+
+[LM Codex Switch v0.3.11](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.11)
+is a Windows-only overlay release. The desktop app now checks GitHub for a
+newer installer after launch, retries if the check fails, and shows the update
+dialog without a manual button click. Existing Codex threads still keep the
+catalog model they already selected.
+
+Published installer:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.11_Windows-x64-Setup.exe`,
+  SHA-256
+  `2596044ea527aa4498515860617019fcd23067ea856ea0bf5389f6e5ceac7e8e`.
+
 ## 2026-09-11 GitHub 0.3.10
 
 [LM Codex Switch v0.3.10](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.10)

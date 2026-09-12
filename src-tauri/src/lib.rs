@@ -1485,12 +1485,14 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Emitter as _;
     use tauri::Manager as _;
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        let _ = window.emit("main-window-shown", ());
     }
 }
 
