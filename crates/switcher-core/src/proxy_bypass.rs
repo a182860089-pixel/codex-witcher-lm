@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn sanitize_truncates_oversized_input_to_loopback() {
-        let huge = "example.com,".repeat(80_000);
+        let huge = "example.com,".repeat(140_000);
         assert!(huge.len() > 1_500_000);
         let sanitized = sanitize_no_proxy(Some(&huge));
         assert!(sanitized.truncated);

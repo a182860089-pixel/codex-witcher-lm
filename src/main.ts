@@ -109,11 +109,33 @@ interface LocalProxyStatus {
   lastError: string | null;
   ccSwitchDetected: boolean;
   outboundProxyMode: OutboundProxyMode;
+  upstreamMaxRetries: number;
+  upstreamRetryMaxElapsedSeconds: number;
 }
 
 interface RepairFastSwitchReport {
   steps: string[];
   status: LocalProxyStatus;
+}
+
+interface ToolChannelDiagnosis {
+  healthy: boolean;
+  platformSupported: boolean;
+  setupErrorCode: string | null;
+  setupErrorMessage: string | null;
+  agentMode: string | null;
+  guardianModeActive: boolean;
+  sandboxAclFailures: string[];
+  issues: string[];
+  recommendations: string[];
+}
+
+interface ToolChannelRepairReport {
+  steps: string[];
+  diagnosis: ToolChannelDiagnosis;
+  requiresCodexRestart: boolean;
+  elevationAttempted: boolean;
+  elevationNeeded: boolean;
 }
 
 interface OutboundProxyStatus {
@@ -231,6 +253,8 @@ const stoppedProxy: LocalProxyStatus = {
   lastError: null,
   ccSwitchDetected: false,
   outboundProxyMode: "auto",
+  upstreamMaxRetries: 8,
+  upstreamRetryMaxElapsedSeconds: 90,
 };
 
 const browserAccountPreview: CodexAccountStatus = {
@@ -252,6 +276,7 @@ const unavailableAccountStatus: CodexAccountStatus = {
 let dashboard = browserPreview;
 let nativeAvailable = "__TAURI_INTERNALS__" in window;
 let proxyApiAvailable = true;
+let toolChannel: ToolChannelDiagnosis | null = null;
 let localProxy = stoppedProxy;
 let outboundProxy: OutboundProxyStatus | null = null;
 let outboundReport: OutboundNetworkReport | null = null;
@@ -270,6 +295,12 @@ interface RequestLogItem {
   threadId?: string;
   error?: string;
   details?: string;
+  retryCount?: number;
+  firstByteMs?: number;
+  responseBytes?: number;
+  streamDurationMs?: number;
+  streamCompleted?: boolean;
+  streamError?: string;
 }
 
 let requestLogs: RequestLogItem[] = [
@@ -688,6 +719,26 @@ app.innerHTML = `
             </div>
           </section>
 
+          <section class="settings-group" aria-labelledby="retry-heading">
+            <div class="settings-group-heading">
+              <h3 id="retry-heading">上游失败重试</h3>
+              <p>只重试连接失败、超时、429、502、503、504；一旦收到上游响应并开始流式输出，断流不会盲目重放请求。</p>
+            </div>
+            <div class="mode-summary">
+              <div>
+                <strong id="retry-summary-title">最多重试 8 次</strong>
+                <p id="retry-summary-copy">单个请求的重试总等待时间上限为 90 秒。</p>
+              </div>
+              <div class="mode-summary-actions retry-settings-actions">
+                <label class="outbound-mode-field">
+                  <span>最大重试次数</span>
+                  <input id="upstream-max-retries" type="number" min="0" max="20" step="1" value="8" />
+                </label>
+                <button id="save-retry-settings" class="button button-primary" type="button">应用重试设置</button>
+              </div>
+            </div>
+          </section>
+
           <section class="settings-group" aria-labelledby="service-heading">
             <div class="settings-group-heading">
               <h3 id="service-heading">服务状态</h3>
@@ -702,6 +753,24 @@ app.innerHTML = `
                 <button id="restore" class="button button-quiet" type="button">撤销上次更改</button>
                 <button id="open-codex" class="button button-secondary" type="button" hidden>重新打开 Codex</button>
                 <button id="stop-proxy" class="button button-secondary danger-text" type="button" hidden>关闭快速切换</button>
+              </div>
+            </div>
+          </section>
+
+                    <section class="settings-group" aria-labelledby="tool-channel-heading">
+            <div class="settings-group-heading">
+              <h3 id="tool-channel-heading">Codex 工具通道</h3>
+              <p>修复 Windows 沙箱 ACL / Guardian 模式导致的 shell、Node、MCP 全挂。升级后可在此一键处理。</p>
+            </div>
+            <div class="mode-summary">
+              <div>
+                <strong id="tool-channel-title">尚未检测</strong>
+                <p id="tool-channel-copy">打开高级设置后会自动检测本机 Codex 沙箱与权限模式。</p>
+                <ul id="tool-channel-issues" class="tool-channel-issues" hidden></ul>
+              </div>
+              <div class="mode-summary-actions">
+                <button id="diagnose-tool-channel" class="button button-secondary" type="button">重新检测</button>
+                <button id="repair-tool-channel" class="button button-primary" type="button">一键修复工具通道</button>
               </div>
             </div>
           </section>
@@ -1000,10 +1069,20 @@ required<HTMLButtonElement>("#stop-proxy-main").addEventListener("click", disabl
 required<HTMLButtonElement>("#repair-proxy").addEventListener("click", () => {
   void repairFastSwitch();
 });
+required<HTMLButtonElement>("#diagnose-tool-channel").addEventListener("click", () => {
+  void diagnoseToolChannel(true);
+});
+required<HTMLButtonElement>("#repair-tool-channel").addEventListener("click", () => {
+  void repairToolChannel();
+});
+
 required<HTMLSelectElement>("#outbound-proxy-mode").addEventListener("change", (event) => {
   const target = event.currentTarget;
   if (!(target instanceof HTMLSelectElement)) return;
   void setOutboundProxyMode(target.value);
+});
+required<HTMLButtonElement>("#save-retry-settings").addEventListener("click", () => {
+  void setUpstreamRetrySettings();
 });
 required<HTMLButtonElement>("#restore").addEventListener("click", restoreLatest);
 required<HTMLButtonElement>("#open-codex").addEventListener("click", () => openCodex());
@@ -1102,6 +1181,7 @@ function showRequestedBrowserPreview(): void {
   if (nativeAvailable) return;
   const preview = new URLSearchParams(window.location.search).get("preview");
   if (preview === "advanced") {
+    void diagnoseToolChannel(false);
     setAdvancedSettingsVisible(true);
     return;
   }
@@ -1393,6 +1473,12 @@ function renderInspectorDetail(): void {
     "<div class=\"meta-row\"><span>接入供应商</span><strong>" + escapeHtml(item.provider) + "</strong></div>" +
     "<div class=\"meta-row\"><span>请求模型</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
     "<div class=\"meta-row\"><span>往返耗时</span><strong>" + item.durationMs + " ms</strong></div>" +
+    "<div class=\"meta-row\"><span>重试次数</span><strong>" + (item.retryCount ?? 0) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>首字节延时</span><strong>" + (item.firstByteMs != null ? item.firstByteMs + " ms" : "未收到") + "</strong></div>" +
+    "<div class=\"meta-row\"><span>响应字节</span><strong>" + (item.responseBytes ?? 0) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>流状态</span><strong class=\"" + (item.streamCompleted ? "text-success" : item.streamError ? "text-danger" : "") + "\">" +
+      (item.streamCompleted ? "完整结束" : item.streamError ? "中途断流" : "未开始/非流式") + "</strong></div>" +
+    (item.streamError ? "<div class=\"meta-row\"><span>断流原因</span><strong class=\"text-danger\">" + escapeHtml(item.streamError) + "</strong></div>" : "") +
     "<div class=\"meta-row\"><span>请求端点</span><code>" + escapeHtml(item.endpoint) + "</code></div>" +
     "</div>" +
     "<div class=\"detail-payload-box\">" +
@@ -1439,6 +1525,7 @@ async function refreshDashboard(): Promise<void> {
 
 function renderDashboard(): void {
   renderDashboardPage();
+  renderRetrySettings();
   const proxyProfile = dashboard.profiles.find(
     (profile) => profile.id === localProxy.currentProfileId,
   );
@@ -1525,6 +1612,21 @@ function renderDashboard(): void {
     localProxy.recoveryRequired ||
     busy;
   maybeShowRestartNotice();
+}
+
+function renderRetrySettings(): void {
+  const input = document.querySelector<HTMLInputElement>("#upstream-max-retries");
+  const title = document.querySelector<HTMLElement>("#retry-summary-title");
+  const copy = document.querySelector<HTMLElement>("#retry-summary-copy");
+  const value = Number.isFinite(localProxy.upstreamMaxRetries)
+    ? localProxy.upstreamMaxRetries
+    : 8;
+  if (input && document.activeElement !== input) input.value = String(value);
+  if (title) title.textContent = `最多重试 ${value} 次`;
+  if (copy) {
+    const seconds = localProxy.upstreamRetryMaxElapsedSeconds || 90;
+    copy.textContent = `单个请求的重试总等待时间上限为 ${seconds} 秒。`;
+  }
 }
 
 function renderOfficialProfile(): void {
@@ -2695,7 +2797,91 @@ async function invokeProxyCommand(
   }
 }
 
+async function diagnoseToolChannel(showStatus = false): Promise<void> {
+  try {
+    toolChannel = await invoke<ToolChannelDiagnosis>("diagnose_codex_tool_channel");
+    renderToolChannel();
+    if (showStatus) {
+      const issue = toolChannel.healthy
+        ? "本机 Codex 工具通道未见已知沙箱故障。"
+        : `检测到工具通道问题：${toolChannel.issues[0] || "未知"}`;
+      setStatus(issue, toolChannel.healthy ? "info" : "error");
+    }
+  } catch (error) {
+    toolChannel = null;
+    renderToolChannel();
+    if (showStatus) {
+      setStatus(String(error) || "工具通道检测失败。", "error");
+    }
+  }
+}
+
+function renderToolChannel(): void {
+  const title = document.querySelector<HTMLElement>("#tool-channel-title");
+  const copy = document.querySelector<HTMLElement>("#tool-channel-copy");
+  const list = document.querySelector<HTMLElement>("#tool-channel-issues");
+  if (!title || !copy || !list) return;
+  if (!toolChannel) {
+    title.textContent = "尚未检测";
+    copy.textContent = "打开高级设置后会自动检测本机 Codex 沙箱与权限模式。";
+    list.hidden = true;
+    list.innerHTML = "";
+    return;
+  }
+  if (!toolChannel.platformSupported) {
+    title.textContent = "当前系统无需此项";
+    copy.textContent = toolChannel.recommendations[0] || "仅 Windows 需要沙箱修复。";
+    list.hidden = true;
+    list.innerHTML = "";
+    return;
+  }
+  if (toolChannel.healthy) {
+    title.textContent = "工具通道正常";
+    copy.textContent = toolChannel.agentMode
+      ? `当前 Agent 模式：${toolChannel.agentMode}`
+      : "未发现 setup_error 或 Guardian 卡死。";
+    list.hidden = true;
+    list.innerHTML = "";
+    return;
+  }
+  title.textContent = "工具通道异常";
+  copy.textContent =
+    toolChannel.recommendations[0] ||
+    "建议一键修复：切到 Full access 并清理沙箱错误。";
+  list.hidden = false;
+  list.innerHTML = toolChannel.issues
+    .slice(0, 6)
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join("");
+}
+
+async function repairToolChannel(): Promise<void> {
+  await run("正在修复 Codex 工具通道…", async () => {
+    const report = await invoke<ToolChannelRepairReport>("repair_codex_tool_channel");
+    toolChannel = report.diagnosis;
+    renderToolChannel();
+    const steps = report.steps.filter(Boolean).join("；");
+    if (report.requiresCodexRestart) {
+      try {
+        await invoke("restart_codex");
+      } catch {
+        // User can restart manually if launch fails.
+      }
+    }
+    if (!report.diagnosis.healthy && report.elevationNeeded && !report.elevationAttempted) {
+      throw new Error(
+        `${steps}。仍需管理员权限修复部分目录 ACL，请右键以管理员运行本应用后再点修复。`,
+      );
+    }
+    if (!report.diagnosis.healthy) {
+      return `${steps}。部分问题可能仍在，请完全退出 Codex 后重试工具。`;
+    }
+    return steps || "工具通道修复已完成。请完全退出并重开 Codex 后验证。";
+  });
+}
+
 async function repairFastSwitch(): Promise<void> {
+
   await run("\u6b63\u5728\u4e00\u952e\u4fee\u590d\u2026", async () => {
     const report = await invoke<RepairFastSwitchReport>("repair_fast_switch");
     localProxy = report.status;
@@ -2733,6 +2919,24 @@ async function setOutboundProxyMode(mode: string): Promise<void> {
     await refreshProxyStatus();
     renderDashboard();
     return `\u51fa\u7ad9\u65b9\u5f0f\u5df2\u8bbe\u4e3a${outboundProxyModeLabel(normalized)}\u3002`;
+  });
+}
+
+async function setUpstreamRetrySettings(): Promise<void> {
+  const input = required<HTMLInputElement>("#upstream-max-retries");
+  const value = Number(input.value);
+  if (!Number.isInteger(value) || value < 0 || value > 20) {
+    setStatus("重试次数必须是 0 到 20 之间的整数。", "error");
+    return;
+  }
+  await run("正在应用上游重试设置…", async () => {
+    localProxy = await invoke<LocalProxyStatus>("set_upstream_retry_settings", {
+      maxRetries: value,
+    });
+    proxyApiAvailable = true;
+    await refreshProxyStatus();
+    renderDashboard();
+    return `上游最大重试次数已设为 ${value} 次；单请求最长等待 90 秒。`;
   });
 }
 

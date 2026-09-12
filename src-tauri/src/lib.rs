@@ -1,6 +1,7 @@
 mod app_update;
 mod codex_account;
 mod outbound_proxy;
+mod tool_channel;
 
 use std::collections::HashMap;
 use std::fs;
@@ -95,6 +96,10 @@ use sha2::Digest;
 use sha2::Sha256;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex as AsyncMutex;
+use tool_channel::ToolChannelDiagnosis;
+use tool_channel::ToolChannelRepairReport;
+use tool_channel::diagnose_tool_channel as diagnose_tool_channel_impl;
+use tool_channel::repair_tool_channel as repair_tool_channel_impl;
 use uuid::Uuid;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
@@ -171,6 +176,33 @@ struct LocalProxyStatus {
     last_error: Option<String>,
     cc_switch_detected: bool,
     outbound_proxy_mode: OutboundProxyMode,
+    upstream_max_retries: usize,
+    upstream_retry_max_elapsed_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetrySettings {
+    max_retries: usize,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_UPSTREAM_MAX_RETRIES,
+        }
+    }
+}
+
+impl RetrySettings {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_retries > MAX_CONFIGURED_UPSTREAM_RETRIES {
+            return Err(format!(
+                "maximum upstream retries must be between 0 and {MAX_CONFIGURED_UPSTREAM_RETRIES}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +248,7 @@ struct ProxyRuntimeState {
     handle: Option<ProxyHandle>,
     last_error: Option<String>,
     use_system_proxy: Option<bool>,
+    retry_settings: RetrySettings,
 }
 
 #[derive(Default)]
@@ -251,6 +284,9 @@ const MAX_DISCOVERY_SESSIONS: usize = 8;
 const PROXY_STATE_SCHEMA_VERSION: u32 = 2;
 const LOCAL_PROXY_PORT: u16 = 15_722;
 const LOCAL_PROXY_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_UPSTREAM_MAX_RETRIES: usize = 8;
+const MAX_CONFIGURED_UPSTREAM_RETRIES: usize = 20;
+const UPSTREAM_RETRY_MAX_ELAPSED: Duration = Duration::from_secs(90);
 const AUTOSTART_NAME: &str = "Codex Provider Switcher";
 const MISSING_SAVED_PROVIDER_CREDENTIAL: &str =
     "saved provider credential is missing; edit the connection and enter the API Key again";
@@ -623,7 +659,9 @@ fn require_builtin_openai_route(paths: &AppPaths) -> Result<CurrentCodexConfig, 
 }
 
 #[tauri::command]
-async fn get_proxy_request_logs(runtime: tauri::State<'_, ProxyRuntime>) -> Result<Vec<ProxyRequestLog>, String> {
+async fn get_proxy_request_logs(
+    runtime: tauri::State<'_, ProxyRuntime>,
+) -> Result<Vec<ProxyRequestLog>, String> {
     let runtime = runtime.inner.lock().await;
     if let Some(handle) = runtime.handle.as_ref() {
         Ok(handle.request_logs())
@@ -673,6 +711,8 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
                     ),
                     cc_switch_detected: cc_switch_process_running(),
                     outbound_proxy_mode: OutboundProxyMode::Auto,
+                    upstream_max_retries: runtime.retry_settings.max_retries,
+                    upstream_retry_max_elapsed_seconds: UPSTREAM_RETRY_MAX_ELAPSED.as_secs(),
                 }),
             };
         }
@@ -697,6 +737,8 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
                 last_error: Some(error),
                 cc_switch_detected: cc_switch_process_running(),
                 outbound_proxy_mode: fallback_state.outbound_proxy_mode,
+                upstream_max_retries: runtime.retry_settings.max_retries,
+                upstream_retry_max_elapsed_seconds: UPSTREAM_RETRY_MAX_ELAPSED.as_secs(),
             });
         }
     };
@@ -1007,6 +1049,15 @@ async fn disable_proxy(
 }
 
 #[tauri::command]
+fn diagnose_codex_tool_channel() -> ToolChannelDiagnosis {
+    diagnose_tool_channel_impl()
+}
+
+#[tauri::command]
+fn repair_codex_tool_channel() -> Result<ToolChannelRepairReport, String> {
+    repair_tool_channel_impl()
+}
+#[tauri::command]
 async fn repair_fast_switch(
     runtime: tauri::State<'_, ProxyRuntime>,
 ) -> Result<RepairFastSwitchReport, String> {
@@ -1183,6 +1234,40 @@ async fn set_outbound_proxy_mode(
             Err(error) => runtime.last_error = Some(error),
         }
     }
+    Ok(proxy_status_from(&state, &runtime))
+}
+
+#[tauri::command]
+async fn set_upstream_retry_settings(
+    max_retries: u32,
+    runtime: tauri::State<'_, ProxyRuntime>,
+) -> Result<LocalProxyStatus, String> {
+    let max_retries = usize::try_from(max_retries)
+        .map_err(|_| "maximum upstream retries is invalid".to_string())?;
+    let paths = app_paths()?;
+    let next_settings = RetrySettings { max_retries };
+    next_settings.validate()?;
+    let mut runtime = runtime.inner.lock().await;
+    let previous_settings = load_retry_settings(&paths)?;
+    write_retry_settings(&paths, &next_settings)?;
+
+    let state = load_proxy_state(&paths)?;
+    if state.enabled {
+        if let Ok((_, route)) = load_proxy_route(&paths, &state) {
+            if let Err(error) = start_proxy_handle(&paths, &state, &mut runtime, route, false).await
+            {
+                let _ = write_retry_settings(&paths, &previous_settings);
+                if let Ok((_, route)) = load_proxy_route(&paths, &state) {
+                    let _ = start_proxy_handle(&paths, &state, &mut runtime, route, false).await;
+                }
+                runtime.last_error = Some(error.clone());
+                return Err(error);
+            }
+        }
+    } else {
+        runtime.retry_settings = next_settings;
+    }
+    runtime.last_error = None;
     Ok(proxy_status_from(&state, &runtime))
 }
 
@@ -1365,10 +1450,13 @@ pub fn run() {
             proxy_status,
             get_proxy_request_logs,
             clear_proxy_request_logs,
+            set_upstream_retry_settings,
             enable_proxy,
             switch_proxy_route,
             disable_proxy,
             repair_fast_switch,
+            diagnose_codex_tool_channel,
+            repair_codex_tool_channel,
             set_outbound_proxy_mode,
             delete_saved_profile,
             restore_latest,
@@ -1694,6 +1782,8 @@ fn proxy_status_from(state: &StoredProxyState, runtime: &ProxyRuntimeState) -> L
         last_error: runtime.last_error.clone(),
         cc_switch_detected: cc_switch_process_running(),
         outbound_proxy_mode: state.outbound_proxy_mode,
+        upstream_max_retries: runtime.retry_settings.max_retries,
+        upstream_retry_max_elapsed_seconds: UPSTREAM_RETRY_MAX_ELAPSED.as_secs(),
     }
 }
 
@@ -2106,6 +2196,34 @@ fn write_proxy_state(paths: &AppPaths, state: &StoredProxyState) -> Result<(), S
         .map_err(|_| "could not save fast-switch state".to_string())
 }
 
+fn load_retry_settings(paths: &AppPaths) -> Result<RetrySettings, String> {
+    match fs::symlink_metadata(&paths.retry_settings) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("retry settings path is not a safe regular file".to_string())
+        }
+        Ok(_) => {
+            let contents = fs::read_to_string(&paths.retry_settings)
+                .map_err(|_| "could not read retry settings".to_string())?;
+            let settings: RetrySettings = serde_json::from_str(strip_utf8_bom(&contents))
+                .map_err(|_| "retry settings file is invalid".to_string())?;
+            settings.validate()?;
+            Ok(settings)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RetrySettings::default()),
+        Err(_) => Err("could not inspect retry settings".to_string()),
+    }
+}
+
+fn write_retry_settings(paths: &AppPaths, settings: &RetrySettings) -> Result<(), String> {
+    settings.validate()?;
+    ensure_state_root(paths)?;
+    let mut rendered = serde_json::to_vec_pretty(settings)
+        .map_err(|_| "could not encode retry settings".to_string())?;
+    rendered.push(b'\n');
+    write_private_file(&paths.retry_settings, &rendered)
+        .map_err(|_| "could not save retry settings".to_string())
+}
+
 fn load_proxy_route(
     paths: &AppPaths,
     state: &StoredProxyState,
@@ -2392,11 +2510,13 @@ async fn start_proxy_handle(
 ) -> Result<bool, String> {
     let persistent_changed = ensure_loopback_proxy_bypass(paths);
     let use_system_proxy = resolve_use_system_proxy(state);
+    let retry_settings = load_retry_settings(paths)?;
     let running_same_proxy = runtime
         .handle
         .as_ref()
         .is_some_and(|handle| handle.health().running)
-        && runtime.use_system_proxy == Some(use_system_proxy);
+        && runtime.use_system_proxy == Some(use_system_proxy)
+        && runtime.retry_settings.max_retries == retry_settings.max_retries;
     if running_same_proxy {
         let handle = runtime
             .handle
@@ -2428,6 +2548,8 @@ async fn start_proxy_handle(
     let options = ProxyStartOptions {
         port: state.port,
         max_request_bytes: LOCAL_PROXY_MAX_REQUEST_BYTES,
+        upstream_max_retries: retry_settings.max_retries,
+        upstream_retry_max_elapsed: UPSTREAM_RETRY_MAX_ELAPSED,
         use_system_proxy,
         bindings_path: Some(proxy_bindings_path(paths)),
         ..ProxyStartOptions::default()
@@ -2447,6 +2569,7 @@ async fn start_proxy_handle(
     }
     runtime.handle = Some(handle);
     runtime.use_system_proxy = Some(use_system_proxy);
+    runtime.retry_settings = retry_settings;
     runtime.last_error = None;
     Ok(persistent_changed)
 }
@@ -2526,6 +2649,7 @@ struct AppPaths {
     profiles: PathBuf,
     official_profile: PathBuf,
     proxy_state: PathBuf,
+    retry_settings: PathBuf,
     update_preference: PathBuf,
     backups: PathBuf,
     executable: PathBuf,
@@ -2559,6 +2683,7 @@ fn app_paths() -> Result<AppPaths, String> {
         profiles: state.join("profiles.json"),
         official_profile: state.join("official-profile.json"),
         proxy_state: state.join("proxy.json"),
+        retry_settings: state.join("retry-settings.json"),
         update_preference: state.join("update-preference.json"),
         backups: state.join("backups"),
         executable,

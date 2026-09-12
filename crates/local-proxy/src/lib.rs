@@ -24,13 +24,13 @@ use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH,
-    USER_AGENT,
+    RETRY_AFTER, USER_AGENT,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -46,6 +46,10 @@ const DEFAULT_MAX_PINNED_TURNS: usize = 4_096;
 const DEFAULT_MAX_PINNED_THREADS: usize = 4_096;
 const BINDINGS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_UPSTREAM_MAX_RETRIES: usize = 8;
+const DEFAULT_UPSTREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const DEFAULT_UPSTREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+const DEFAULT_UPSTREAM_RETRY_MAX_ELAPSED: Duration = Duration::from_secs(90);
 const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 300;
@@ -456,6 +460,12 @@ pub struct ProxyStartOptions {
     pub max_pinned_turns: usize,
     pub max_pinned_threads: usize,
     pub upstream_connect_timeout: Duration,
+    /// Number of retries for failures that happen before any successful
+    /// response body has been received. This is deliberately finite.
+    pub upstream_max_retries: usize,
+    pub upstream_retry_base_delay: Duration,
+    pub upstream_retry_max_delay: Duration,
+    pub upstream_retry_max_elapsed: Duration,
     /// When false (crate default), the upstream client ignores `HTTP_PROXY`.
     pub use_system_proxy: bool,
     /// Optional credential-free JSON file used to keep conversation routes
@@ -471,6 +481,10 @@ impl Default for ProxyStartOptions {
             max_pinned_turns: DEFAULT_MAX_PINNED_TURNS,
             max_pinned_threads: DEFAULT_MAX_PINNED_THREADS,
             upstream_connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            upstream_max_retries: DEFAULT_UPSTREAM_MAX_RETRIES,
+            upstream_retry_base_delay: DEFAULT_UPSTREAM_RETRY_BASE_DELAY,
+            upstream_retry_max_delay: DEFAULT_UPSTREAM_RETRY_MAX_DELAY,
+            upstream_retry_max_elapsed: DEFAULT_UPSTREAM_RETRY_MAX_ELAPSED,
             use_system_proxy: false,
             bindings_path: None,
         }
@@ -503,8 +517,19 @@ pub struct ProxyRequestLog {
     pub thread_id: Option<String>,
     pub error: Option<String>,
     pub details: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub first_byte_ms: Option<u64>,
+    #[serde(default)]
+    pub response_bytes: u64,
+    #[serde(default)]
+    pub stream_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub stream_completed: bool,
+    #[serde(default)]
+    pub stream_error: Option<String>,
 }
-
 
 /// Starts proxy instances for Tauri without exposing a command-line surface.
 #[derive(Debug)]
@@ -528,6 +553,19 @@ impl LocalProxy {
         if options.max_pinned_threads == 0 {
             return Err(ProxyError::InvalidStartOptions(
                 "max_pinned_threads must be greater than zero".to_string(),
+            ));
+        }
+        if options.upstream_retry_base_delay.is_zero()
+            || options.upstream_retry_max_delay.is_zero()
+            || options.upstream_retry_max_elapsed.is_zero()
+        {
+            return Err(ProxyError::InvalidStartOptions(
+                "upstream retry durations must be greater than zero".to_string(),
+            ));
+        }
+        if options.upstream_retry_base_delay > options.upstream_retry_max_delay {
+            return Err(ProxyError::InvalidStartOptions(
+                "upstream_retry_base_delay must not exceed upstream_retry_max_delay".to_string(),
             ));
         }
 
@@ -562,6 +600,10 @@ impl LocalProxy {
             client,
             listen_addr,
             max_request_bytes: options.max_request_bytes,
+            upstream_max_retries: options.upstream_max_retries,
+            upstream_retry_base_delay: options.upstream_retry_base_delay,
+            upstream_retry_max_delay: options.upstream_retry_max_delay,
+            upstream_retry_max_elapsed: options.upstream_retry_max_elapsed,
             metrics: Arc::new(ProxyMetrics::default()),
             request_logs: Mutex::new(VecDeque::with_capacity(128)),
         });
@@ -671,7 +713,6 @@ impl ProxyHandle {
         self.state.clear_request_logs();
     }
 
-
     pub async fn shutdown(&self) -> Result<(), ProxyError> {
         if let Some(sender) = lock_unpoisoned(&self.lifecycle.shutdown_sender).take() {
             let _ = sender.send(());
@@ -708,6 +749,10 @@ struct ProxyState {
     client: reqwest::Client,
     listen_addr: SocketAddr,
     max_request_bytes: usize,
+    upstream_max_retries: usize,
+    upstream_retry_base_delay: Duration,
+    upstream_retry_max_delay: Duration,
+    upstream_retry_max_elapsed: Duration,
     metrics: Arc<ProxyMetrics>,
     request_logs: Mutex<VecDeque<ProxyRequestLog>>,
 }
@@ -727,6 +772,17 @@ impl ProxyState {
             logs.iter().cloned().collect()
         } else {
             Vec::new()
+        }
+    }
+
+    fn update_request_log<F>(&self, id: &str, update: F)
+    where
+        F: FnOnce(&mut ProxyRequestLog),
+    {
+        if let Ok(mut logs) = self.request_logs.lock()
+            && let Some(log) = logs.iter_mut().find(|log| log.id == id)
+        {
+            update(log);
         }
     }
 
@@ -1604,32 +1660,107 @@ async fn proxy_request(
     let log_thread_id = thread_id.clone();
 
     let lease = RequestLease::begin(Arc::clone(&state.metrics));
-    let upstream = match state
-        .client
-        .post(route.endpoint_url(endpoint))
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            drop(lease);
-            let duration_ms = request_start_time.elapsed().as_millis() as u64;
-            let err_msg = classify_upstream_error(&error);
-            state.record_request_log(ProxyRequestLog {
-                id: log_id,
-                time: log_time,
-                provider: log_provider,
-                model: log_model,
-                endpoint: log_endpoint,
-                status: StatusCode::BAD_GATEWAY.as_u16(),
-                duration_ms,
-                thread_id: log_thread_id,
-                error: Some(err_msg.to_string()),
-                details: Some(format!("Gateway error: {}", err_msg)),
-            });
-            return error_response(StatusCode::BAD_GATEWAY, err_msg);
+    let mut retry_count = 0_u32;
+    let upstream = loop {
+        let attempt = state
+            .client
+            .post(route.endpoint_url(endpoint))
+            .headers(headers.clone())
+            .body(body.clone())
+            .send()
+            .await;
+        match attempt {
+            Ok(response) if response.status().is_success() => break response,
+            Ok(response) if is_retryable_status(response.status()) => {
+                let status = response.status();
+                let retry_after = retry_after_duration(response.headers());
+                let error_body = response.bytes().await.ok();
+                if retry_count as usize >= state.upstream_max_retries
+                    || !wait_before_retry(
+                        request_start_time,
+                        state.upstream_retry_max_elapsed,
+                        state.upstream_retry_base_delay,
+                        state.upstream_retry_max_delay,
+                        retry_count as usize,
+                        retry_after,
+                    )
+                    .await
+                {
+                    let duration_ms = request_start_time.elapsed().as_millis() as u64;
+                    let message = error_body
+                        .as_deref()
+                        .and_then(json_error_message)
+                        .or_else(|| {
+                            error_body
+                                .as_deref()
+                                .and_then(|body| html_error_message(status, body))
+                        })
+                        .unwrap_or_else(|| format!("upstream provider returned {status}"));
+                    drop(lease);
+                    state.record_request_log(ProxyRequestLog {
+                        id: log_id,
+                        time: log_time,
+                        provider: log_provider,
+                        model: log_model,
+                        endpoint: log_endpoint,
+                        status: status.as_u16(),
+                        duration_ms,
+                        thread_id: log_thread_id,
+                        error: Some(message.clone()),
+                        details: Some(format!(
+                            "Upstream returned retryable status {status} after {retry_count} retries"
+                        )),
+                        retry_count,
+                        first_byte_ms: None,
+                        response_bytes: 0,
+                        stream_duration_ms: None,
+                        stream_completed: false,
+                        stream_error: None,
+                    });
+                    return error_response(status, message);
+                }
+                retry_count += 1;
+            }
+            Ok(response) => break response,
+            Err(error) => {
+                if retry_count as usize >= state.upstream_max_retries
+                    || !wait_before_retry(
+                        request_start_time,
+                        state.upstream_retry_max_elapsed,
+                        state.upstream_retry_base_delay,
+                        state.upstream_retry_max_delay,
+                        retry_count as usize,
+                        None,
+                    )
+                    .await
+                {
+                    drop(lease);
+                    let duration_ms = request_start_time.elapsed().as_millis() as u64;
+                    let err_msg = classify_upstream_error(&error);
+                    state.record_request_log(ProxyRequestLog {
+                        id: log_id,
+                        time: log_time,
+                        provider: log_provider,
+                        model: log_model,
+                        endpoint: log_endpoint,
+                        status: StatusCode::BAD_GATEWAY.as_u16(),
+                        duration_ms,
+                        thread_id: log_thread_id,
+                        error: Some(err_msg.to_string()),
+                        details: Some(format!(
+                            "Gateway error: {err_msg} after {retry_count} retries"
+                        )),
+                        retry_count,
+                        first_byte_ms: None,
+                        response_bytes: 0,
+                        stream_duration_ms: None,
+                        stream_completed: false,
+                        stream_error: None,
+                    });
+                    return error_response(StatusCode::BAD_GATEWAY, err_msg);
+                }
+                retry_count += 1;
+            }
         }
     };
 
@@ -1640,7 +1771,7 @@ async fn proxy_request(
         .store(status.as_u16(), Ordering::Release);
     let duration_ms = request_start_time.elapsed().as_millis() as u64;
     state.record_request_log(ProxyRequestLog {
-        id: log_id,
+        id: log_id.clone(),
         time: log_time,
         provider: log_provider,
         model: log_model,
@@ -1648,8 +1779,23 @@ async fn proxy_request(
         status: status.as_u16(),
         duration_ms,
         thread_id: log_thread_id,
-        error: if status.is_client_error() || status.is_server_error() { Some(format!("HTTP {}", status.as_u16())) } else { None },
-        details: Some(format!("Upstream returned status {} in {} ms", status.as_u16(), duration_ms)),
+        error: if status.is_client_error() || status.is_server_error() {
+            Some(format!("HTTP {}", status.as_u16()))
+        } else {
+            None
+        },
+        details: Some(format!(
+            "Upstream returned status {} in {} ms after {} retries",
+            status.as_u16(),
+            duration_ms,
+            retry_count
+        )),
+        retry_count,
+        first_byte_ms: None,
+        response_bytes: 0,
+        stream_duration_ms: None,
+        stream_completed: false,
+        stream_error: None,
     });
     if status.is_client_error() || status.is_server_error() {
         drop(lease);
@@ -1675,20 +1821,105 @@ async fn proxy_request(
     let scanner = RefCell::new(ResponseIdScanner::default());
     let pin_state = Arc::clone(&state);
     let pin_route = Arc::clone(&pin_route);
-    let stream = upstream.bytes_stream().map(move |item| {
-        let _keep_request_active_until_stream_drop = &lease;
-        match item {
-            Ok(bytes) => {
-                for id in scanner.borrow_mut().push(&bytes) {
-                    pin_state
-                        .routes
-                        .pin_conversation(&id, Arc::clone(&pin_route));
-                }
-                Ok(bytes)
+    let log_state = Arc::clone(&state);
+    let stream_log_id = log_id.clone();
+    let stream_start = request_start_time;
+    let stream = stream::unfold(
+        (
+            upstream.bytes_stream(),
+            scanner,
+            pin_state,
+            pin_route,
+            log_state,
+            stream_log_id,
+            stream_start,
+            lease,
+            0_u64,
+            false,
+            false,
+        ),
+        |(
+            mut upstream_stream,
+            scanner,
+            pin_state,
+            pin_route,
+            log_state,
+            stream_log_id,
+            stream_start,
+            lease,
+            mut response_bytes,
+            mut first_byte_seen,
+            finished,
+        )| async move {
+            if finished {
+                return None;
             }
-            Err(_) => Err(io::Error::other("upstream response stream failed")),
-        }
-    });
+            match upstream_stream.next().await {
+                Some(Ok(bytes)) => {
+                    if !first_byte_seen {
+                        first_byte_seen = true;
+                        log_state.update_request_log(&stream_log_id, |log| {
+                            log.first_byte_ms = Some(stream_start.elapsed().as_millis() as u64);
+                        });
+                    }
+                    response_bytes = response_bytes.saturating_add(bytes.len() as u64);
+                    for id in scanner.borrow_mut().push(&bytes) {
+                        pin_state
+                            .routes
+                            .pin_conversation(&id, Arc::clone(&pin_route));
+                    }
+                    log_state.update_request_log(&stream_log_id, |log| {
+                        log.response_bytes = response_bytes;
+                    });
+                    Some((
+                        Ok(bytes),
+                        (
+                            upstream_stream,
+                            scanner,
+                            pin_state,
+                            pin_route,
+                            log_state,
+                            stream_log_id,
+                            stream_start,
+                            lease,
+                            response_bytes,
+                            first_byte_seen,
+                            false,
+                        ),
+                    ))
+                }
+                Some(Err(_)) => {
+                    log_state.update_request_log(&stream_log_id, |log| {
+                        log.stream_duration_ms = Some(stream_start.elapsed().as_millis() as u64);
+                        log.stream_error = Some("upstream response stream failed".to_string());
+                    });
+                    Some((
+                        Err(io::Error::other("upstream response stream failed")),
+                        (
+                            upstream_stream,
+                            scanner,
+                            pin_state,
+                            pin_route,
+                            log_state,
+                            stream_log_id,
+                            stream_start,
+                            lease,
+                            response_bytes,
+                            first_byte_seen,
+                            true,
+                        ),
+                    ))
+                }
+                None => {
+                    log_state.update_request_log(&stream_log_id, |log| {
+                        log.stream_duration_ms = Some(stream_start.elapsed().as_millis() as u64);
+                        log.stream_completed = true;
+                    });
+                    None
+                }
+            }
+        },
+    );
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -1698,6 +1929,54 @@ async fn proxy_request(
 
 fn unauthorized_response() -> Response {
     error_response(StatusCode::UNAUTHORIZED, "invalid local proxy bearer token")
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+async fn wait_before_retry(
+    request_start: std::time::Instant,
+    max_elapsed: Duration,
+    base_delay: Duration,
+    max_delay: Duration,
+    retry_index: usize,
+    retry_after: Option<Duration>,
+) -> bool {
+    let elapsed = request_start.elapsed();
+    let Some(remaining) = max_elapsed.checked_sub(elapsed) else {
+        return false;
+    };
+    let exponential = base_delay
+        .checked_mul(
+            1_u32
+                .checked_shl(retry_index.min(31) as u32)
+                .unwrap_or(u32::MAX),
+        )
+        .unwrap_or(max_delay);
+    let delay = retry_after.unwrap_or(exponential).min(max_delay);
+    if delay > remaining {
+        return false;
+    }
+    tokio::time::sleep(delay).await;
+    true
 }
 
 fn error_response(status: StatusCode, message: impl AsRef<str>) -> Response {

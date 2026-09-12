@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -130,6 +131,17 @@ fn route(
 
 async fn proxy_with_route(route: RouteConfig) -> ProxyHandle {
     let proxy = LocalProxy::start(ProxyStartOptions::default(), bearer(ENTRY_TOKEN))
+        .await
+        .expect("start local proxy");
+    proxy.set_active_route(route);
+    proxy
+}
+
+async fn proxy_with_route_and_options(
+    route: RouteConfig,
+    options: ProxyStartOptions,
+) -> ProxyHandle {
+    let proxy = LocalProxy::start(options, bearer(ENTRY_TOKEN))
         .await
         .expect("start local proxy");
     proxy.set_active_route(route);
@@ -729,12 +741,13 @@ async fn a_failed_turn_does_not_pin_the_thread_to_the_failing_route() {
     let failing =
         TestServer::spawn(Router::new().route("/v1/responses", post(json_unavailable))).await;
     let (ok, state_ok) = marker_server("ok").await;
-    let proxy = proxy_with_route(route(
-        &failing,
-        "route-fail",
-        "model-a",
-        vec![model("model-a")],
-    ))
+    let proxy = proxy_with_route_and_options(
+        route(&failing, "route-fail", "model-a", vec![model("model-a")]),
+        ProxyStartOptions {
+            upstream_max_retries: 0,
+            ..ProxyStartOptions::default()
+        },
+    )
     .await;
     let client = no_redirect_client();
 
@@ -870,6 +883,84 @@ async fn forwards_sse_as_an_unbuffered_byte_stream() {
         all.extend_from_slice(&chunk.expect("remaining SSE bytes"));
     }
     assert_eq!(all, b"data: first\n\ndata: second\n\n");
+    let log = &proxy.request_logs()[0];
+    assert_eq!(log.retry_count, 0);
+    assert_eq!(log.response_bytes, all.len() as u64);
+    assert!(log.first_byte_ms.is_some());
+    assert!(log.stream_duration_ms.is_some());
+    assert!(log.stream_completed);
+    assert!(log.stream_error.is_none());
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct MidStreamFailureState {
+    hits: AtomicUsize,
+}
+
+async fn mid_stream_failure_provider(State(state): State<Arc<MidStreamFailureState>>) -> Response {
+    state.hits.fetch_add(1, Ordering::AcqRel);
+    let chunks = stream::unfold(0_u8, |index| async move {
+        match index {
+            0 => Some((
+                Ok::<Bytes, io::Error>(Bytes::from_static(b"data: partial\n\n")),
+                1,
+            )),
+            1 => {
+                sleep(Duration::from_millis(50)).await;
+                Some((Err(io::Error::other("simulated upstream reset")), 2))
+            }
+            _ => None,
+        }
+    });
+    let mut response = Response::new(Body::from_stream(chunks));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("SSE content type"),
+    );
+    response
+}
+
+#[tokio::test]
+async fn records_mid_stream_failure_without_replaying_request() {
+    let state = Arc::new(MidStreamFailureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(mid_stream_failure_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-stream-failure",
+        "model-stream-failure",
+        vec![model("model-stream-failure")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored", "stream": true}))
+        .send()
+        .await
+        .expect("stream failure response");
+    let mut body = response.bytes_stream();
+    let first = body
+        .next()
+        .await
+        .expect("partial stream item")
+        .expect("partial stream bytes");
+    assert_eq!(first.as_ref(), b"data: partial\n\n");
+    assert!(body.next().await.expect("stream error item").is_err());
+    assert_eq!(state.hits.load(Ordering::Acquire), 1);
+
+    let log = &proxy.request_logs()[0];
+    assert!(!log.stream_completed);
+    assert!(log.stream_error.is_some());
+    assert_eq!(log.response_bytes, first.len() as u64);
+    assert!(log.stream_duration_ms.is_some());
 
     proxy.shutdown().await.unwrap();
 }
@@ -934,7 +1025,7 @@ async fn failing_provider(State(state): State<Arc<FailureState>>) -> StatusCode 
 }
 
 #[tokio::test]
-async fn never_retries_an_upstream_request() {
+async fn does_not_retry_non_transient_upstream_statuses() {
     let state = Arc::new(FailureState::default());
     let upstream = TestServer::spawn(
         Router::new()
@@ -942,12 +1033,21 @@ async fn never_retries_an_upstream_request() {
             .with_state(Arc::clone(&state)),
     )
     .await;
-    let proxy = proxy_with_route(route(
-        &upstream,
-        "route-failure",
-        "model-failure",
-        vec![model("model-failure")],
-    ))
+    let proxy = proxy_with_route_and_options(
+        route(
+            &upstream,
+            "route-failure",
+            "model-failure",
+            vec![model("model-failure")],
+        ),
+        ProxyStartOptions {
+            upstream_max_retries: 2,
+            upstream_retry_base_delay: Duration::from_millis(1),
+            upstream_retry_max_delay: Duration::from_millis(1),
+            upstream_retry_max_elapsed: Duration::from_secs(1),
+            ..ProxyStartOptions::default()
+        },
+    )
     .await;
 
     let response = no_redirect_client()
@@ -959,6 +1059,63 @@ async fn never_retries_an_upstream_request() {
         .expect("failure response");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(state.hits.load(Ordering::Acquire), 1);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct TransientState {
+    hits: AtomicUsize,
+}
+
+async fn transient_then_ok(State(state): State<Arc<TransientState>>) -> Response {
+    let hit = state.hits.fetch_add(1, Ordering::AcqRel);
+    if hit < 2 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"message": "temporary outage"}})),
+        )
+            .into_response();
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+#[tokio::test]
+async fn retries_transient_upstream_statuses_until_success() {
+    let state = Arc::new(TransientState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(transient_then_ok))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route_and_options(
+        route(
+            &upstream,
+            "route-transient",
+            "model-transient",
+            vec![model("model-transient")],
+        ),
+        ProxyStartOptions {
+            upstream_max_retries: 3,
+            upstream_retry_base_delay: Duration::from_millis(1),
+            upstream_retry_max_delay: Duration::from_millis(1),
+            upstream_retry_max_elapsed: Duration::from_secs(1),
+            ..ProxyStartOptions::default()
+        },
+    )
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("eventual success response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.hits.load(Ordering::Acquire), 3);
+    assert_eq!(proxy.request_logs()[0].retry_count, 2);
 
     proxy.shutdown().await.unwrap();
 }

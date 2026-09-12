@@ -8,6 +8,12 @@ desktop packages.
 
 ## What's new
 
+- Adds bounded upstream retries for connection failures, timeouts, HTTP 429,
+  502, 503, and 504 responses, with exponential backoff and a configurable
+  retry limit in Advanced Settings.
+- Adds request diagnostics for retry count, time to first byte, response
+  bytes, stream completion, and mid-stream failure reasons. Requests are not
+  replayed after SSE output has started.
 - Distinguishes the configured provider route from the active Codex
   authentication mode through App Server `account/read`.
 - Adds Codex-owned ChatGPT browser login, explicit logout, and optional
