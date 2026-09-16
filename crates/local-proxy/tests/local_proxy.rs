@@ -262,7 +262,7 @@ async fn authenticates_sanitizes_overwrites_and_exposes_health_and_models() {
             .iter()
             .map(|item| item.slug.as_str())
             .collect::<Vec<_>>(),
-        vec!["model-a", "model-b"]
+        vec!["gpt-5.6-sol", "model-a", "model-b"]
     );
 
     let not_modified = client
@@ -821,6 +821,118 @@ async fn strips_continuation_ids_when_outbound_model_would_change() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body["model"], "grok-4.6");
     assert!(requests[0].body.get("previous_response_id").is_none());
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn gpt_client_facade_requests_are_rewritten_to_the_selected_model() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "luming",
+        "grok-4.6",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let response = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "fresh-thread")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("facade chat response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["model"], "grok-4.6");
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn switching_away_from_a_pinned_gpt_route_keeps_the_old_thread() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "luming",
+        "gpt-5.6-sol",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let first = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("first gpt turn");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    proxy.set_active_route(route(
+        &upstream,
+        "luming-grok",
+        "grok-4.6",
+        vec![model("grok-4.6"), model("gpt-5.6-sol")],
+    ));
+
+    let continued = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "hello-thread")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "client_metadata": {"turn_id": "turn-two"}
+        }))
+        .send()
+        .await
+        .expect("continued gpt turn");
+    assert_eq!(continued.status(), StatusCode::OK);
+
+    let fresh = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "other-thread")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "client_metadata": {"turn_id": "turn-one"}
+        }))
+        .send()
+        .await
+        .expect("fresh grok turn");
+    assert_eq!(fresh.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].body["model"], "gpt-5.6-sol");
+    assert_eq!(requests[1].body["model"], "gpt-5.6-sol");
+    assert_eq!(requests[2].body["model"], "grok-4.6");
 
     proxy.shutdown().await.unwrap();
 }

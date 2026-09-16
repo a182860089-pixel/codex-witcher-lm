@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { animateDialogIn, animateDialogOut, animatePage } from "./motion";
@@ -409,7 +410,7 @@ app.innerHTML = `
           </div>
         </div>
         <div class="sidebar-footer-row">
-          <span id="app-version" class="version-label">Version 0.3.5</span>
+          <span id="app-version" class="version-label">Version</span>
           <button id="theme-toggle-btn" class="theme-toggle-btn" type="button" aria-label="切换浅色/深色主题" title="切换浅色/深色外观">
             <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
@@ -1181,6 +1182,17 @@ void refreshDashboard().then(() => {
   showRequestedBrowserPreview();
 });
 startAutomaticUpdateChecks();
+void loadAppVersion();
+
+async function loadAppVersion(): Promise<void> {
+  if (!nativeAvailable) return;
+  try {
+    const version = await getVersion();
+    required<HTMLElement>("#app-version").textContent = `Version ${version}`;
+  } catch {
+    // Keep the generic placeholder until the update check fills it in.
+  }
+}
 
 function showRequestedBrowserPreview(): void {
   if (nativeAvailable) return;

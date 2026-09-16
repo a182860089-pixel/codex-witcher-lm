@@ -24,8 +24,9 @@ pub use codex_account::{
     parse_codex_account_updated, read_codex_json_line,
 };
 pub use config::{
-    ConfigPlan, LOCAL_PROXY_PROVIDER_ID, LOCAL_PROXY_PROVIDER_NAME, credential_account_for,
-    plan_config, plan_official_config, plan_proxy_config, proxy_credential_account_for,
+    CODEX_CLIENT_MODEL, CODEX_CLIENT_MODEL_DISPLAY_NAME, ConfigPlan, LOCAL_PROXY_PROVIDER_ID,
+    LOCAL_PROXY_PROVIDER_NAME, credential_account_for, is_codex_client_model, plan_config,
+    plan_official_config, plan_proxy_config, proxy_credential_account_for,
     retarget_local_proxy_base_url, verify_credential_binding, verify_proxy_config_binding,
 };
 pub use discovery::{

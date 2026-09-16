@@ -26,6 +26,7 @@ use codex_account::read_account;
 use codex_provider_switcher_core::AuthKind;
 use codex_provider_switcher_core::BackupManifest;
 use codex_provider_switcher_core::BackupStatus;
+use codex_provider_switcher_core::CODEX_CLIENT_MODEL;
 use codex_provider_switcher_core::ConfigPlan;
 use codex_provider_switcher_core::CurrentCodexConfig;
 use codex_provider_switcher_core::FetchedModel;
@@ -59,6 +60,7 @@ use codex_provider_switcher_core::plan_user_no_proxy_persist;
 use codex_provider_switcher_core::proxy_credential_account_for;
 use codex_provider_switcher_core::recover_prepared_backup;
 use codex_provider_switcher_core::refresh_proxy_credential_helper_file;
+use codex_provider_switcher_core::refresh_proxy_selected_model_file;
 use codex_provider_switcher_core::remove_profile;
 use codex_provider_switcher_core::render_profile_store;
 use codex_provider_switcher_core::restore_backup;
@@ -743,16 +745,20 @@ async fn proxy_status(runtime: tauri::State<'_, ProxyRuntime>) -> Result<LocalPr
         }
     };
     if state.enabled && config_selected {
-        if let Err(error) = prepare_active_proxy_configuration(&paths, &state) {
-            if let Some(handle) = runtime.handle.take() {
-                let _ = handle.shutdown().await;
+        match prepare_active_proxy_configuration(&paths, &state) {
+            Err(error) => {
+                if let Some(handle) = runtime.handle.take() {
+                    let _ = handle.shutdown().await;
+                }
+                runtime.last_error = Some(error);
+                let mut status = proxy_status_from(&state, &runtime);
+                status.recovery_required = true;
+                status.manual_recovery_required =
+                    !proxy_activation_can_restore_automatically(&paths, &state);
+                return Ok(status);
             }
-            runtime.last_error = Some(error);
-            let mut status = proxy_status_from(&state, &runtime);
-            status.recovery_required = true;
-            status.manual_recovery_required =
-                !proxy_activation_can_restore_automatically(&paths, &state);
-            return Ok(status);
+            Ok(true) => remember_codex_restart_for_loopback_bypass(&paths, &mut state),
+            Ok(false) => {}
         }
         let bypass_changed = match load_proxy_route(&paths, &state) {
             Ok((_, route)) => {
@@ -876,8 +882,8 @@ async fn enable_proxy(
                 .to_string(),
         );
     }
-    if !config_needs_write {
-        prepare_active_proxy_configuration(&paths, &next)?;
+    if !config_needs_write && prepare_active_proxy_configuration(&paths, &next)? {
+        next.requires_codex_restart = true;
     }
     let bypass_changed = start_proxy_handle(&paths, &next, &mut runtime, route, true).await?;
     next.requires_codex_restart |= bypass_changed;
@@ -968,11 +974,11 @@ async fn switch_proxy_route(
             "fast-switch setup is incomplete; enable it again before switching models".to_string(),
         );
     }
-    prepare_active_proxy_configuration(&paths, &previous)?;
+    let model_changed = prepare_active_proxy_configuration(&paths, &previous)?;
     let mut next = proxy_state_for_selection(&previous, &profile_id, &selected_model);
     let (_, route) = load_proxy_route(&paths, &next)?;
     let bypass_changed = start_proxy_handle(&paths, &next, &mut runtime, route, false).await?;
-    next.requires_codex_restart |= bypass_changed;
+    next.requires_codex_restart |= bypass_changed || model_changed;
     if let Err(error) = write_proxy_state(&paths, &next) {
         rollback_proxy_runtime(&paths, &previous, &mut runtime).await;
         return Err(error);
@@ -1519,7 +1525,9 @@ fn start_proxy_on_launch(app: tauri::AppHandle, background: bool) {
                 state.revision = state.revision.saturating_add(1);
                 let _ = write_proxy_state(&paths, &state);
             }
-            prepare_active_proxy_configuration(&paths, &state)?;
+            if prepare_active_proxy_configuration(&paths, &state)? {
+                remember_codex_restart_for_loopback_bypass(&paths, &mut state);
+            }
             let (_, route) = load_proxy_route(&paths, &state)?;
             let bypass_changed =
                 start_proxy_handle(&paths, &state, &mut runtime, route, false).await?;
@@ -2005,11 +2013,18 @@ fn verify_active_proxy_configuration(
 fn prepare_active_proxy_configuration(
     paths: &AppPaths,
     state: &StoredProxyState,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     ensure_stable_helper(paths)?;
     refresh_proxy_credential_helper_file(&paths.config, &proxy_base_url(state.port), &paths.helper)
         .map_err(redacted_core_error)?;
-    verify_active_proxy_configuration(paths, state)
+    let model_changed = refresh_proxy_selected_model_file(
+        &paths.config,
+        &proxy_base_url(state.port),
+        CODEX_CLIENT_MODEL,
+    )
+    .map_err(redacted_core_error)?;
+    verify_active_proxy_configuration(paths, state)?;
+    Ok(model_changed)
 }
 
 fn adopted_proxy_model(

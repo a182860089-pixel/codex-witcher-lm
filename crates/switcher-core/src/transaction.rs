@@ -1663,7 +1663,7 @@ wire_api = "responses"
         let applied = apply_config_plan(&config_path, &root.path().join("backups"), &plan).unwrap();
         let edited = fs::read_to_string(&config_path)
             .unwrap()
-            .replace("model = \"acme-code\"", "model = \"gpt-5.6-sol\"");
+            .replace("model = \"gpt-5.6-sol\"", "model = \"gpt-5.4\"");
         fs::write(&config_path, &edited).unwrap();
 
         let detached = restore_proxy_config_preserving_unrelated_changes(
@@ -1677,7 +1677,7 @@ wire_api = "responses"
         assert!(detached.manifest_finalized);
         let restored = fs::read_to_string(&config_path).unwrap();
         assert!(restored.contains("model_provider = \"openai\""));
-        assert!(restored.contains("model = \"gpt-5.6-sol\""));
+        assert!(restored.contains("model = \"gpt-5.4\""));
         assert!(!restored.contains("model_providers.cps-local"));
         let manifest: BackupManifest =
             serde_json::from_slice(&fs::read(&applied.manifest_path).unwrap()).unwrap();
@@ -1721,7 +1721,7 @@ wire_api = "responses"
 
         let user_edit = String::from_utf8(before)
             .unwrap()
-            .replace("model = \"acme-code\"", "model = \"user\"");
+            .replace("model = \"gpt-5.6-sol\"", "model = \"user\"");
         fs::write(&config_path, &user_edit).unwrap();
 
         assert!(

@@ -12,6 +12,7 @@ use toml_edit::Table;
 use toml_edit::value;
 
 use crate::catalog::render_model_catalog;
+use crate::domain::ModelSpec;
 use crate::domain::OfficialProfile;
 use crate::domain::ProviderProfile;
 use crate::error::Result;
@@ -24,6 +25,12 @@ use crate::validation::validate_provider_id;
 
 pub const LOCAL_PROXY_PROVIDER_ID: &str = "cps-local";
 pub const LOCAL_PROXY_PROVIDER_NAME: &str = "Codex Provider Switcher";
+pub const CODEX_CLIENT_MODEL: &str = "gpt-5.6-sol";
+pub const CODEX_CLIENT_MODEL_DISPLAY_NAME: &str = "5.6 Sol";
+
+pub fn is_codex_client_model(model: &str) -> bool {
+    model == CODEX_CLIENT_MODEL
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigPlan {
@@ -68,11 +75,21 @@ pub fn plan_proxy_config(
 ) -> Result<ConfigPlan> {
     validate_profile(upstream_profile)?;
     validate_proxy_base_url(proxy_base_url)?;
+    if !upstream_profile
+        .models
+        .iter()
+        .any(|model| model.id == selected_model)
+    {
+        return Err(SwitcherError::Validation(format!(
+            "selected model {selected_model} does not belong to provider {}",
+            upstream_profile.id
+        )));
+    }
     let proxy_profile = ProviderProfile {
         id: LOCAL_PROXY_PROVIDER_ID.to_string(),
         display_name: LOCAL_PROXY_PROVIDER_NAME.to_string(),
         base_url: proxy_base_url.trim_end_matches('/').to_string(),
-        models: upstream_profile.models.clone(),
+        models: with_codex_client_facade(&upstream_profile.models, selected_model),
         supports_websockets: false,
         credential_required: true,
     };
@@ -80,7 +97,7 @@ pub fn plan_proxy_config(
     plan_config_with_account(
         existing_config,
         &proxy_profile,
-        selected_model,
+        CODEX_CLIENT_MODEL,
         catalog_path,
         Some(credential_helper),
         Some(&account),
@@ -543,6 +560,44 @@ fn validate_proxy_base_url(base_url: &str) -> Result<()> {
     Ok(())
 }
 
+fn with_codex_client_facade(models: &[ModelSpec], selected_model: &str) -> Vec<ModelSpec> {
+    let mut models = models.to_vec();
+    if let Some(index) = models
+        .iter()
+        .position(|model| model.id == CODEX_CLIENT_MODEL)
+    {
+        models[index].supports_images = true;
+        models[index].supports_parallel_tool_calls = true;
+        if index != 0 {
+            let facade = models.remove(index);
+            models.insert(0, facade);
+        }
+        return models;
+    }
+    let source = models
+        .iter()
+        .find(|model| model.id == selected_model)
+        .or_else(|| models.first())
+        .cloned();
+    if let Some(source) = source {
+        models.insert(0, codex_client_facade_model(&source));
+    }
+    models
+}
+
+fn codex_client_facade_model(source: &ModelSpec) -> ModelSpec {
+    ModelSpec {
+        id: CODEX_CLIENT_MODEL.to_string(),
+        display_name: CODEX_CLIENT_MODEL_DISPLAY_NAME.to_string(),
+        description: source.description.clone(),
+        context_window: source.context_window,
+        default_reasoning: source.default_reasoning.clone(),
+        reasoning_levels: source.reasoning_levels.clone(),
+        supports_parallel_tool_calls: true,
+        supports_images: true,
+    }
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(digest.len() * 2);
@@ -837,6 +892,9 @@ base_url = "https://vendor.example/v1"
         let account = proxy_credential_account_for("http://127.0.0.1:15722/v1").unwrap();
 
         assert!(plan.rendered_config.contains("# preserved"));
+        assert!(plan.rendered_config.contains("model = \"gpt-5.6-sol\""));
+        assert_eq!(plan.model_id.as_deref(), Some(CODEX_CLIENT_MODEL));
+        assert!(plan.rendered_catalog.contains("\"slug\": \"gpt-5.6-sol\""));
         assert!(
             plan.rendered_config
                 .contains("model_provider = \"cps-local\"")
@@ -849,6 +907,43 @@ base_url = "https://vendor.example/v1"
         assert!(plan.rendered_config.contains(&account));
         assert!(!plan.rendered_config.contains("https://api.acme.test"));
         verify_credential_binding(&plan.rendered_config, &account, &helper).unwrap();
+    }
+
+    #[test]
+    fn proxy_catalog_inserts_the_codex_client_facade_ahead_of_upstream_models() {
+        let models = profile().models;
+        let catalog = with_codex_client_facade(&models, "acme/code");
+        assert_eq!(catalog[0].id, CODEX_CLIENT_MODEL);
+        assert_eq!(catalog[0].display_name, CODEX_CLIENT_MODEL_DISPLAY_NAME);
+        assert!(catalog[0].supports_images);
+        assert!(catalog[0].supports_parallel_tool_calls);
+        assert_eq!(catalog[1].id, "acme/code");
+
+        let already = with_codex_client_facade(&catalog, "acme/code");
+        assert_eq!(already[0].id, CODEX_CLIENT_MODEL);
+        assert_eq!(
+            already
+                .iter()
+                .filter(|model| model.id == CODEX_CLIENT_MODEL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn proxy_plan_rejects_a_selected_model_outside_the_upstream_catalog() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let error = plan_proxy_config(
+            "",
+            &profile(),
+            "missing-model",
+            &catalog,
+            &helper,
+            "http://127.0.0.1:15722/v1",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing-model"));
     }
 
     #[test]
@@ -949,10 +1044,18 @@ base_url = "https://vendor.example/v1"
         )
         .unwrap();
 
-        let refreshed =
-            refresh_proxy_selected_model(&plan.rendered_config, base_url, "gpt-5.6-sol")
+        assert!(
+            refresh_proxy_selected_model(&plan.rendered_config, base_url, CODEX_CLIENT_MODEL)
                 .unwrap()
-                .unwrap();
+                .is_none()
+        );
+
+        let reverted = plan
+            .rendered_config
+            .replace("model = \"gpt-5.6-sol\"", "model = \"acme/code\"");
+        let refreshed = refresh_proxy_selected_model(&reverted, base_url, CODEX_CLIENT_MODEL)
+            .unwrap()
+            .unwrap();
         assert!(refreshed.contains("approval_policy = \"never\""));
         assert!(refreshed.contains("model = \"gpt-5.6-sol\""));
         assert!(!refreshed.contains("model = \"acme/code\""));
@@ -961,7 +1064,7 @@ base_url = "https://vendor.example/v1"
             helper
         );
         assert!(
-            refresh_proxy_selected_model(&refreshed, base_url, "gpt-5.6-sol")
+            refresh_proxy_selected_model(&refreshed, base_url, CODEX_CLIENT_MODEL)
                 .unwrap()
                 .is_none()
         );

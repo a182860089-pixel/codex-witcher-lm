@@ -56,6 +56,8 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 300;
 const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.4");
 const MAX_ROUTE_ID_BYTES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 256;
+const CODEX_CLIENT_MODEL: &str = "gpt-5.6-sol";
+const CODEX_CLIENT_MODEL_DISPLAY_NAME: &str = "5.6 Sol";
 const MAX_TURN_KEY_BYTES: usize = 512;
 const X_MODELS_ETAG: HeaderName = HeaderName::from_static("x-models-etag");
 const BASE_INSTRUCTIONS: &str = "You are a coding agent working with the user in the current repository. Follow developer and user instructions, inspect relevant context before editing, keep changes scoped, use the available tools carefully, and verify completed work.";
@@ -354,7 +356,7 @@ impl RouteConfig {
     }
 
     pub fn models_response(&self) -> CodexModelsResponse {
-        let models = self
+        let mut models: Vec<CodexModelInfo> = self
             .models
             .iter()
             .enumerate()
@@ -406,6 +408,10 @@ impl RouteConfig {
                 auto_review_model_override: None,
             })
             .collect();
+        models = with_codex_client_facade_models(models, &self.selected_model);
+        for (index, model) in models.iter_mut().enumerate() {
+            model.priority = index as i32 + 1;
+        }
         CodexModelsResponse { models }
     }
 
@@ -1046,10 +1052,14 @@ impl RouteTable {
         let existing = self.lookup_existing(thread_id, turn_key.as_ref(), conversation_ids);
         let route = match existing {
             Some(route) => route,
-            None => match requested_model.and_then(|model| self.route_for_model(model)) {
-                Some(route) => route,
-                None => self.active()?,
-            },
+            None => {
+                let requested_catalog_model =
+                    requested_model.filter(|model| !should_rewrite_client_model(model));
+                match requested_catalog_model.and_then(|model| self.route_for_model(model)) {
+                    Some(route) => route,
+                    None => self.active()?,
+                }
+            }
         };
         if let Some(key) = turn_key {
             self.pin_turn(key, Arc::clone(&route));
@@ -1395,8 +1405,53 @@ fn extract_conversation_ids(headers: &HeaderMap, body: &Value) -> Vec<String> {
     ids
 }
 
+fn should_rewrite_client_model(model: &str) -> bool {
+    model == CODEX_CLIENT_MODEL || model.starts_with("gpt-5") || model.starts_with("gpt-4")
+}
+
+fn with_codex_client_facade_models(
+    mut models: Vec<CodexModelInfo>,
+    selected_model: &str,
+) -> Vec<CodexModelInfo> {
+    if let Some(index) = models
+        .iter()
+        .position(|model| model.slug == CODEX_CLIENT_MODEL)
+    {
+        models[index].supports_parallel_tool_calls = true;
+        models[index].supports_image_detail_original = true;
+        if !models[index]
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "image")
+        {
+            models[index].input_modalities.push("image".to_string());
+        }
+        if index != 0 {
+            let facade = models.remove(index);
+            models.insert(0, facade);
+        }
+        return models;
+    }
+
+    let source = models
+        .iter()
+        .find(|model| model.slug == selected_model)
+        .or_else(|| models.first())
+        .cloned();
+    if let Some(mut source) = source {
+        source.slug = CODEX_CLIENT_MODEL.to_string();
+        source.display_name = CODEX_CLIENT_MODEL_DISPLAY_NAME.to_string();
+        source.supports_parallel_tool_calls = true;
+        source.supports_image_detail_original = true;
+        source.input_modalities = vec!["text".to_string(), "image".to_string()];
+        models.insert(0, source);
+    }
+    models
+}
+
 fn outbound_model(route: &RouteConfig, requested: Option<&str>) -> String {
     match requested {
+        Some(model) if should_rewrite_client_model(model) => route.selected_model.clone(),
         Some(model) if route.contains_model(model) => model.to_string(),
         _ => route.selected_model.clone(),
     }
@@ -2481,6 +2536,73 @@ mod tests {
     }
 
     #[test]
+    fn gpt_client_models_are_rewritten_to_the_selected_upstream_model() {
+        let route = RouteConfig::new(
+            "route-mixed",
+            "https://provider.example/v1",
+            "grok-4.6",
+            vec![
+                ModelDescriptor::new("grok-4.6", "Grok 4.6"),
+                ModelDescriptor::new("gpt-5.6-sol", "5.6 Sol"),
+                ModelDescriptor::new("model-a", "A"),
+            ],
+            token("upstream-token-for-tests"),
+        )
+        .unwrap();
+        assert_eq!(outbound_model(&route, Some("gpt-5.6-sol")), "grok-4.6");
+        assert_eq!(outbound_model(&route, Some("gpt-5.4")), "grok-4.6");
+        assert_eq!(outbound_model(&route, Some("model-a")), "model-a");
+        assert_eq!(outbound_model(&route, Some("unknown")), "grok-4.6");
+        assert_eq!(outbound_model(&route, None), "grok-4.6");
+    }
+
+    #[test]
+    fn client_facade_requests_use_the_active_route_instead_of_a_historical_gpt_pin() {
+        let table = RouteTable::new(8);
+        table.set_active(
+            RouteConfig::new(
+                "route-gpt",
+                "https://provider.example/v1",
+                "gpt-5.6-sol",
+                vec![
+                    ModelDescriptor::new("grok-4.6", "Grok 4.6"),
+                    ModelDescriptor::new("gpt-5.6-sol", "5.6 Sol"),
+                ],
+                token("upstream-token-for-tests"),
+            )
+            .unwrap(),
+        );
+        let pinned = table
+            .resolve(
+                Some("old-thread"),
+                Some(TurnKey::new("old-thread", "turn-1").unwrap()),
+                Some("gpt-5.6-sol"),
+            )
+            .unwrap();
+        assert_eq!(pinned.summary().selected_model, "gpt-5.6-sol");
+
+        table.set_active(
+            RouteConfig::new(
+                "route-grok",
+                "https://provider.example/v1",
+                "grok-4.6",
+                vec![
+                    ModelDescriptor::new("grok-4.6", "Grok 4.6"),
+                    ModelDescriptor::new("gpt-5.6-sol", "5.6 Sol"),
+                ],
+                token("upstream-token-for-tests"),
+            )
+            .unwrap(),
+        );
+        let fresh = table
+            .resolve(Some("new-thread"), None, Some("gpt-5.6-sol"))
+            .unwrap();
+        assert_eq!(fresh.summary().id, "route-grok");
+        assert_eq!(fresh.summary().selected_model, "grok-4.6");
+        assert_eq!(outbound_model(&fresh, Some("gpt-5.6-sol")), "grok-4.6");
+    }
+
+    #[test]
     fn catalog_sibling_is_passed_through_instead_of_selecting_the_active_model() {
         let mixed = RouteConfig::new(
             "route-mixed",
@@ -2574,12 +2696,19 @@ mod tests {
         .unwrap();
 
         let value = serde_json::to_value(route.models_response()).unwrap();
-        assert_eq!(value["models"][0]["slug"], "model-a");
+        assert_eq!(value["models"][0]["slug"], "gpt-5.6-sol");
+        assert_eq!(value["models"][0]["display_name"], "5.6 Sol");
         assert_eq!(
             value["models"][0]["input_modalities"],
             json!(["text", "image"])
         );
         assert_eq!(value["models"][0]["supports_image_detail_original"], true);
+        assert_eq!(value["models"][1]["slug"], "model-a");
+        assert_eq!(
+            value["models"][1]["input_modalities"],
+            json!(["text", "image"])
+        );
+        assert_eq!(value["models"][1]["supports_image_detail_original"], true);
         assert_eq!(value["models"][0]["truncation_policy"]["mode"], "tokens");
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(!serialized.contains("upstream-token-for-tests"));

@@ -188,6 +188,22 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-16 GitHub 0.3.15
+
+[LM Codex Switch v0.3.15](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.15)
+is a Windows-only overlay release. Codex always sees the `gpt-5.6-sol` /
+`5.6 Sol` facade; the local proxy rewrites that client model to the Switcher's
+selected upstream model. Choosing grok-4.6 no longer pins Codex onto a weak
+Grok tool loop, and leftover 5.6 thread pins no longer forward GPT requests
+unchanged. The in-app version label now reads the packaged version on launch.
+
+Published installer:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.15_Windows-x64-Setup.exe`,
+  SHA-256
+  `0ca14ad0fe64de316f9ff03871cbb83de461df7c89755bb077123edd34cca377`.
+
 ## 2026-09-16 GitHub 0.3.14
 
 [LM Codex Switch v0.3.14](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.14)
