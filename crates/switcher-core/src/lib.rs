@@ -25,8 +25,9 @@ pub use codex_account::{
 };
 pub use config::{
     CODEX_CLIENT_MODEL, CODEX_CLIENT_MODEL_DISPLAY_NAME, ConfigPlan, LOCAL_PROXY_PROVIDER_ID,
-    LOCAL_PROXY_PROVIDER_NAME, credential_account_for, is_codex_client_model, plan_config,
-    plan_official_config, plan_proxy_config, proxy_credential_account_for,
+    LOCAL_PROXY_PROVIDER_NAME, LOCAL_PROXY_STREAM_IDLE_TIMEOUT_MS, LOCAL_PROXY_STREAM_MAX_RETRIES,
+    credential_account_for, is_codex_client_model, plan_config, plan_official_config,
+    plan_proxy_config, proxy_credential_account_for, refresh_proxy_stream_settings,
     retarget_local_proxy_base_url, verify_credential_binding, verify_proxy_config_binding,
 };
 pub use discovery::{
@@ -55,7 +56,8 @@ pub use transaction::{
     ApplyResult, BackupManifest, BackupStatus, ProxyDetachJournal, RecoveryOutcome, RestoreResult,
     apply_config_plan, apply_config_plan_with_transaction_id, backup_matches_applied,
     create_private_directory, leftover_backup_requires_manual_review, recover_prepared_backup,
-    refresh_proxy_credential_helper_file, refresh_proxy_selected_model_file, restore_backup,
+    refresh_proxy_credential_helper_file, refresh_proxy_selected_model_file,
+    refresh_proxy_stream_settings_file, restore_backup,
     restore_proxy_config_preserving_unrelated_changes, retarget_local_proxy_base_url_file,
     verify_backup_integrity, verify_proxy_detach_recoverable, write_private_file,
 };

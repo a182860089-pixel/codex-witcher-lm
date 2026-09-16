@@ -188,6 +188,27 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-17 GitHub 0.3.18
+
+[LM Codex Switch v0.3.18](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.18)
+is a Windows-only overlay release. Codex Desktop no longer ends a grok-4.6
+turn after a one-line status: the loopback proxy holds that assistant text,
+keeps the original `input` and `previous_response_id`, and retries once with
+`tool_choice=required`. A Grok HTTP 400 does not swap in the just-completed
+response id; the second retry uses a compact Continue body and restores the
+cached thread tool list. This build also ships the unpublished 0.3.17 SSE
+work: comment heartbeats every 15 seconds at event boundaries, 10-second
+upstream TCP keepalive, and `stream_idle_timeout_ms = 600000` plus
+`stream_max_retries = 2` on the managed `cps-local` provider. Model discovery
+hides vendor-prefixed aliases such as `x-ai/grok-4.6` when the short id is
+present.
+
+Installer filename:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.18_Windows-x64-Setup.exe`.
+  SHA-256 `849e7a581ae0de4838406c22633e98f6bdf3460e4fc1b816e2b901474ba33355`.
+
 ## 2026-09-16 GitHub 0.3.16
 
 [LM Codex Switch v0.3.16](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.16)

@@ -41,7 +41,7 @@ pub fn render_model_catalog(profile: &ProviderProfile) -> Result<String> {
                 "priority": index as i32 + 1,
                 "availability_nux": null,
                 "upgrade": null,
-                "base_instructions": "You are a coding agent working with the user in the current repository. Follow developer and user instructions, inspect relevant context before editing, keep changes scoped, use the available tools carefully, and verify completed work.",
+                "base_instructions": "You are a coding agent working with the user in the current repository. Follow developer and user instructions, inspect relevant context before editing, keep changes scoped, use the available tools carefully, and verify completed work. Codex ends the turn when you output only assistant text. If inspection, a command, or an edit remains, emit a function_call in the same response; a one-line status or promise is not completion.",
                 "include_skills_usage_instructions": true,
                 "supports_reasoning_summary_parameter": false,
                 "support_verbosity": false,
@@ -103,6 +103,12 @@ mod tests {
         assert_eq!(parsed["models"][0]["slug"], "acme-code");
         assert_eq!(parsed["models"][0]["input_modalities"], json!(["text"]));
         assert_eq!(parsed["models"][0]["supports_image_detail_original"], false);
+        assert!(
+            parsed["models"][0]["base_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("function_call")
+        );
         assert!(!rendered.to_ascii_lowercase().contains("api_key"));
     }
 

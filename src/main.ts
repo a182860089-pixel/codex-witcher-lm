@@ -83,6 +83,7 @@ interface DiscoverySummary {
   sessionId: string;
   baseUrl: string;
   models: FetchedModel[];
+  hiddenAliasCount?: number;
 }
 
 interface CredentialSessionSummary {
@@ -302,6 +303,10 @@ interface RequestLogItem {
   streamDurationMs?: number;
   streamCompleted?: boolean;
   streamError?: string;
+  requestedModel?: string;
+  agentGuard?: string;
+  completedWithoutTools?: boolean;
+  agentNudged?: boolean;
 }
 
 let requestLogs: RequestLogItem[] = [
@@ -335,6 +340,7 @@ let logFilterStatus: "all" | "success" | "error" = "all";
 let activePage: AppPage = "switcher";
 let discoveryId: string | null = null;
 let discoveredModels: FetchedModel[] = [];
+let hiddenAliasCount = 0;
 let selectedModels = new Set<string>();
 let editingProfileId: string | null = null;
 let editingCredentialLoaded = false;
@@ -879,10 +885,13 @@ app.innerHTML = `
           <div class="model-toolbar">
             <div>
               <h3>选择要保留的模型</h3>
-              <p>以后快速切换时，只显示这些模型。</p>
+              <p>以后快速切换时，只显示这些模型。优先勾选 grok-4.6 这种短 ID。</p>
             </div>
             <strong id="selected-count">已选择 0 个</strong>
           </div>
+          <p id="model-alias-hint" class="model-alias-hint" hidden>
+            已自动隐藏带供应商前缀的别名。请选择 grok-4.6，不要选 x-ai/grok-4.6。
+          </p>
           <div class="model-controls">
             <div class="search-field">
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1495,6 +1504,12 @@ function renderInspectorPage(): void {
   renderInspectorDetail();
 }
 
+function agentGuardLabel(guard?: string): string {
+  if (guard === "force_tools") return "强制工具";
+  if (guard === "instructions") return "已附加指令";
+  return "未启用";
+}
+
 function renderInspectorDetail(): void {
   const idEl = document.querySelector<HTMLElement>("#detail-panel-id");
   const contentEl = document.querySelector<HTMLElement>("#detail-panel-content");
@@ -1516,7 +1531,11 @@ function renderInspectorDetail(): void {
     "<div class=\"meta-row\"><span>时间</span><strong>" + escapeHtml(item.time) + "</strong></div>" +
     "<div class=\"meta-row\"><span>状态</span><strong class=\"" + statusClass + "\">HTTP " + item.status + "</strong></div>" +
     "<div class=\"meta-row\"><span>接入供应商</span><strong>" + escapeHtml(item.provider) + "</strong></div>" +
-    "<div class=\"meta-row\"><span>请求模型</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>客户端模型</span><strong>" + escapeHtml(item.requestedModel || item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>实际上游</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>工具循环</span><strong>" + escapeHtml(agentGuardLabel(item.agentGuard)) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>无工具结束</span><strong>" + (item.completedWithoutTools ? "是" : "否") + "</strong></div>" +
+    "<div class=\"meta-row\"><span>已自动续跑</span><strong>" + (item.agentNudged ? "是" : "否") + "</strong></div>" +
     "<div class=\"meta-row\"><span>往返耗时</span><strong>" + item.durationMs + " ms</strong></div>" +
     "<div class=\"meta-row\"><span>重试次数</span><strong>" + (item.retryCount ?? 0) + "</strong></div>" +
     "<div class=\"meta-row\"><span>首字节延时</span><strong>" + (item.firstByteMs != null ? item.firstByteMs + " ms" : "未收到") + "</strong></div>" +
@@ -2260,6 +2279,8 @@ function openEditor(): void {
   }
   discoveryId = null;
   discoveredModels = [];
+  hiddenAliasCount = 0;
+  setHiddenAliasHint(0);
   selectedModels.clear();
   editingProfileId = null;
   editingCredentialLoaded = false;
@@ -2321,6 +2342,8 @@ async function openProfileEditor(
   editingCredentialDirty = false;
   discoveryId = null;
   discoveredModels = profile.models.map((model) => ({ id: model.id, ownedBy: null }));
+  hiddenAliasCount = 0;
+  setHiddenAliasHint(0);
   selectedModels = new Set(profile.models.map((model) => model.id));
   required<HTMLElement>("#editor-kicker").textContent = "编辑配置";
   required<HTMLElement>("#editor-title").textContent = profile.display_name;
@@ -2404,6 +2427,8 @@ async function closeEditor(): Promise<void> {
     await invoke("cancel_discovery", { sessionId }).catch(() => undefined);
   }
   discoveredModels = [];
+  hiddenAliasCount = 0;
+  setHiddenAliasHint(0);
   selectedModels.clear();
   editingProfileId = null;
   editingCredentialLoaded = false;
@@ -2448,10 +2473,12 @@ async function fetchAvailableModels(): Promise<void> {
       });
     } catch (error) {
       discoveredModels = [];
+      hiddenAliasCount = 0;
       selectedModels.clear();
       required<HTMLElement>("#model-step").hidden = false;
       setEditorStep(2);
       renderModelChoices();
+      setHiddenAliasHint(0);
       throw error;
     }
     if (!editingProfileId) {
@@ -2460,14 +2487,34 @@ async function fetchAvailableModels(): Promise<void> {
     discoveryId = result.sessionId;
     input("#base-url").value = result.baseUrl;
     discoveredModels = result.models;
+    hiddenAliasCount = result.hiddenAliasCount ?? 0;
     selectedModels.clear();
     required<HTMLElement>("#model-step").hidden = false;
     setEditorStep(2);
     renderModelChoices();
-    return result.models.length > 0
-      ? `已获取 ${result.models.length} 个模型，请勾选需要保留的模型。`
-      : "服务已连接，但没有返回模型。你可以手动填写模型 ID。";
+    setHiddenAliasHint(hiddenAliasCount);
+    if (result.models.length === 0) {
+      return "服务已连接，但没有返回模型。你可以手动填写模型 ID。";
+    }
+    return hiddenAliasCount > 0
+      ? `已获取 ${result.models.length} 个模型，并隐藏 ${hiddenAliasCount} 个 x-ai/、grok/ 这类前缀别名。请勾选 grok-4.6 这种短 ID。`
+      : `已获取 ${result.models.length} 个模型，请勾选需要保留的模型。`;
   });
+}
+
+
+function setHiddenAliasHint(count: number): void {
+  const hint = document.querySelector<HTMLElement>("#model-alias-hint");
+  if (!hint) return;
+  if (count > 0) {
+    hint.hidden = false;
+    hint.textContent =
+      "已自动隐藏 " +
+      count +
+      " 个带供应商前缀的别名（例如 x-ai/grok-4.6、grok/grok-imagine-video）。请勾选 grok-4.6 这种短 ID。";
+  } else {
+    hint.hidden = true;
+  }
 }
 
 function renderModelChoices(): void {
@@ -3827,8 +3874,10 @@ function invalidateDiscovery(): void {
   const sessionId = discoveryId;
   discoveryId = null;
   discoveredModels = [];
+  hiddenAliasCount = 0;
   selectedModels.clear();
   required<HTMLElement>("#model-step").hidden = true;
+  setHiddenAliasHint(0);
   setEditorStep(1);
   if (nativeAvailable) {
     void invoke("cancel_discovery", { sessionId }).catch(() => undefined);

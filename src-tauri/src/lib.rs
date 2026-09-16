@@ -61,6 +61,7 @@ use codex_provider_switcher_core::proxy_credential_account_for;
 use codex_provider_switcher_core::recover_prepared_backup;
 use codex_provider_switcher_core::refresh_proxy_credential_helper_file;
 use codex_provider_switcher_core::refresh_proxy_selected_model_file;
+use codex_provider_switcher_core::refresh_proxy_stream_settings_file;
 use codex_provider_switcher_core::remove_profile;
 use codex_provider_switcher_core::render_profile_store;
 use codex_provider_switcher_core::restore_backup;
@@ -147,6 +148,7 @@ struct DiscoverySummary {
     session_id: String,
     base_url: String,
     models: Vec<FetchedModel>,
+    hidden_alias_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -432,6 +434,7 @@ async fn discover_models(
         session_id: session_id.to_string(),
         base_url,
         models: discovery.models,
+        hidden_alias_count: discovery.hidden_alias_count,
     })
 }
 
@@ -2015,6 +2018,9 @@ fn prepare_active_proxy_configuration(
     state: &StoredProxyState,
 ) -> Result<bool, String> {
     ensure_stable_helper(paths)?;
+    let stream_changed =
+        refresh_proxy_stream_settings_file(&paths.config, &proxy_base_url(state.port))
+            .map_err(redacted_core_error)?;
     refresh_proxy_credential_helper_file(&paths.config, &proxy_base_url(state.port), &paths.helper)
         .map_err(redacted_core_error)?;
     let model_changed = refresh_proxy_selected_model_file(
@@ -2024,7 +2030,7 @@ fn prepare_active_proxy_configuration(
     )
     .map_err(redacted_core_error)?;
     verify_active_proxy_configuration(paths, state)?;
-    Ok(model_changed)
+    Ok(model_changed || stream_changed)
 }
 
 fn adopted_proxy_model(

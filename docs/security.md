@@ -118,7 +118,9 @@ redacted and never contain the keyring backend's detailed payload.
   also merges loopback hosts into the user `NO_PROXY` environment so Codex
   itself does not send `127.0.0.1` through a local HTTP proxy.
 - Successful response bodies are streamed without accumulating a full SSE
-  response. 4xx/5xx bodies are bounded and rewritten into a JSON error so
+  response. SSE comment heartbeats are inserted only between complete events
+  and are not counted as upstream payload. Upstream TCP keepalive is 10
+  seconds. 4xx/5xx bodies are bounded and rewritten into a JSON error so
   Codex can display the provider failure instead of "Unknown error".
   Hop-by-hop response headers and `Set-Cookie` are removed.
 - The local model catalog and health body contain no bearer or upstream Base

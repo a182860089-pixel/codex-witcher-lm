@@ -9,18 +9,21 @@
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+mod agent_loop;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
 use axum::http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH,
@@ -50,7 +53,9 @@ const DEFAULT_UPSTREAM_MAX_RETRIES: usize = 8;
 const DEFAULT_UPSTREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_UPSTREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 const DEFAULT_UPSTREAM_RETRY_MAX_ELAPSED: Duration = Duration::from_secs(90);
-const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(10);
+const DEFAULT_SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const SSE_COMMENT_HEARTBEAT: &[u8] = b":\n\n";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 300;
 const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.4");
@@ -59,8 +64,9 @@ const MAX_MODEL_ID_BYTES: usize = 256;
 const CODEX_CLIENT_MODEL: &str = "gpt-5.6-sol";
 const CODEX_CLIENT_MODEL_DISPLAY_NAME: &str = "5.6 Sol";
 const MAX_TURN_KEY_BYTES: usize = 512;
+const MAX_CACHED_THREAD_TOOLS: usize = 64;
 const X_MODELS_ETAG: HeaderName = HeaderName::from_static("x-models-etag");
-const BASE_INSTRUCTIONS: &str = "You are a coding agent working with the user in the current repository. Follow developer and user instructions, inspect relevant context before editing, keep changes scoped, use the available tools carefully, and verify completed work.";
+const BASE_INSTRUCTIONS: &str = "You are a coding agent working with the user in the current repository. Follow developer and user instructions, inspect relevant context before editing, keep changes scoped, use the available tools carefully, and verify completed work. Codex ends the turn when you output only assistant text. If inspection, a command, or an edit remains, emit a function_call in the same response; a one-line status or promise is not completion.";
 
 /// A bearer credential whose debug representation never contains its value.
 ///
@@ -477,6 +483,9 @@ pub struct ProxyStartOptions {
     /// Optional credential-free JSON file used to keep conversation routes
     /// across Switcher restarts and in-place upgrades.
     pub bindings_path: Option<PathBuf>,
+    /// Interval for SSE comment heartbeats (`:\n\n`) inserted only at event
+    /// boundaries. `Duration::ZERO` disables heartbeats.
+    pub sse_heartbeat_interval: Duration,
 }
 
 impl Default for ProxyStartOptions {
@@ -493,6 +502,7 @@ impl Default for ProxyStartOptions {
             upstream_retry_max_elapsed: DEFAULT_UPSTREAM_RETRY_MAX_ELAPSED,
             use_system_proxy: false,
             bindings_path: None,
+            sse_heartbeat_interval: DEFAULT_SSE_HEARTBEAT_INTERVAL,
         }
     }
 }
@@ -535,6 +545,14 @@ pub struct ProxyRequestLog {
     pub stream_completed: bool,
     #[serde(default)]
     pub stream_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_guard: Option<String>,
+    #[serde(default)]
+    pub completed_without_tools: bool,
+    #[serde(default)]
+    pub agent_nudged: bool,
 }
 
 /// Starts proxy instances for Tauri without exposing a command-line surface.
@@ -610,8 +628,10 @@ impl LocalProxy {
             upstream_retry_base_delay: options.upstream_retry_base_delay,
             upstream_retry_max_delay: options.upstream_retry_max_delay,
             upstream_retry_max_elapsed: options.upstream_retry_max_elapsed,
+            sse_heartbeat_interval: options.sse_heartbeat_interval,
             metrics: Arc::new(ProxyMetrics::default()),
             request_logs: Mutex::new(VecDeque::with_capacity(128)),
+            cached_thread_tools: Mutex::new(HashMap::new()),
         });
         state.metrics.running.store(true, Ordering::Release);
 
@@ -759,8 +779,10 @@ struct ProxyState {
     upstream_retry_base_delay: Duration,
     upstream_retry_max_delay: Duration,
     upstream_retry_max_elapsed: Duration,
+    sse_heartbeat_interval: Duration,
     metrics: Arc<ProxyMetrics>,
     request_logs: Mutex<VecDeque<ProxyRequestLog>>,
+    cached_thread_tools: Mutex<HashMap<String, Value>>,
 }
 
 impl ProxyState {
@@ -796,6 +818,26 @@ impl ProxyState {
         if let Ok(mut logs) = self.request_logs.lock() {
             logs.clear();
         }
+    }
+
+    fn remember_thread_tools(&self, thread_id: &str, tools: Value) {
+        let Ok(mut cache) = self.cached_thread_tools.lock() else {
+            return;
+        };
+        if cache.len() >= MAX_CACHED_THREAD_TOOLS && !cache.contains_key(thread_id) {
+            if let Some(oldest) = cache.keys().next().cloned() {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(thread_id.to_string(), tools);
+    }
+
+    fn cached_tools_for(&self, thread_id: &str) -> Option<Value> {
+        self.cached_thread_tools
+            .lock()
+            .ok()?
+            .get(thread_id)
+            .cloned()
     }
 
     fn health(&self, listen_addr: SocketAddr) -> ProxyHealth {
@@ -1672,6 +1714,35 @@ async fn proxy_request(
     body.as_object_mut()
         .expect("object shape checked above")
         .insert("model".to_string(), Value::String(outbound_model.clone()));
+    let restored_tools = if matches!(endpoint, UpstreamEndpoint::Responses) {
+        if let Some(tools) = agent_loop::tools_snapshot(&body) {
+            if let Some(id) = thread_id.as_deref() {
+                state.remember_thread_tools(id, tools);
+            }
+            false
+        } else if let Some(id) = thread_id.as_deref() {
+            agent_loop::restore_tools_if_missing(&mut body, state.cached_tools_for(id).as_ref())
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let agent_guard = match endpoint {
+        UpstreamEndpoint::Responses => agent_loop::apply_agent_loop_guard(&mut body),
+        UpstreamEndpoint::Compact => agent_loop::AgentLoopGuard::None,
+    };
+    let allow_nudge =
+        matches!(endpoint, UpstreamEndpoint::Responses) && agent_loop::request_has_tools(&body);
+    let tools_count = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let continue_nudge = agent_loop::continue_nudge_in_request(&body);
+    let original_previous_response_id =
+        string_at(&body, "/previous_response_id").map(str::to_string);
+    let nudge_template = body.clone();
     let body = match serde_json::to_vec(&body) {
         Ok(body) => body,
         Err(_) => {
@@ -1695,6 +1766,8 @@ async fn proxy_request(
     if !headers.contains_key(USER_AGENT) {
         headers.insert(USER_AGENT, UPSTREAM_USER_AGENT);
     }
+    let upstream_request_headers = headers.clone();
+    let nudge_url = route.endpoint_url(endpoint);
 
     let request_start_time = std::time::Instant::now();
     let local_timestamp = std::time::SystemTime::now()
@@ -1771,6 +1844,10 @@ async fn proxy_request(
                         stream_duration_ms: None,
                         stream_completed: false,
                         stream_error: None,
+                        requested_model,
+                        agent_guard: agent_guard.as_log_value().map(str::to_string),
+                        completed_without_tools: false,
+                        agent_nudged: false,
                     });
                     return error_response(status, message);
                 }
@@ -1811,6 +1888,10 @@ async fn proxy_request(
                         stream_duration_ms: None,
                         stream_completed: false,
                         stream_error: None,
+                        requested_model,
+                        agent_guard: agent_guard.as_log_value().map(str::to_string),
+                        completed_without_tools: false,
+                        agent_nudged: false,
                     });
                     return error_response(StatusCode::BAD_GATEWAY, err_msg);
                 }
@@ -1827,23 +1908,25 @@ async fn proxy_request(
     let duration_ms = request_start_time.elapsed().as_millis() as u64;
     state.record_request_log(ProxyRequestLog {
         id: log_id.clone(),
-        time: log_time,
+        time: log_time.clone(),
         provider: log_provider,
-        model: log_model,
+        model: log_model.clone(),
         endpoint: log_endpoint,
         status: status.as_u16(),
         duration_ms,
-        thread_id: log_thread_id,
+        thread_id: log_thread_id.clone(),
         error: if status.is_client_error() || status.is_server_error() {
             Some(format!("HTTP {}", status.as_u16()))
         } else {
             None
         },
         details: Some(format!(
-            "Upstream returned status {} in {} ms after {} retries",
+            "Upstream returned status {} in {} ms after {} retries; tools={tools_count} restored_tools={restored_tools} continue={continue_nudge} prev={} guard={}",
             status.as_u16(),
             duration_ms,
-            retry_count
+            retry_count,
+            original_previous_response_id.as_deref().unwrap_or("-"),
+            agent_guard.as_log_value().unwrap_or("none"),
         )),
         retry_count,
         first_byte_ms: None,
@@ -1851,7 +1934,18 @@ async fn proxy_request(
         stream_duration_ms: None,
         stream_completed: false,
         stream_error: None,
+        requested_model: requested_model.clone(),
+        agent_guard: agent_guard.as_log_value().map(str::to_string),
+        completed_without_tools: false,
+        agent_nudged: false,
     });
+    append_agent_loop_log(&format!(
+        "{log_time} {log_id} thread={} model={log_model} tools={tools_count} restored={restored_tools} continue={continue_nudge} prev={} guard={} allow_nudge={allow_nudge} status={}",
+        log_thread_id.as_deref().unwrap_or("-"),
+        original_previous_response_id.as_deref().unwrap_or("-"),
+        agent_guard.as_log_value().unwrap_or("none"),
+        status.as_u16(),
+    ));
     if status.is_client_error() || status.is_server_error() {
         drop(lease);
         return normalize_upstream_error(status, upstream).await;
@@ -1873,104 +1967,111 @@ async fn proxy_request(
                 .expect("catalog ETag is always valid ASCII"),
         );
     }
-    let scanner = RefCell::new(ResponseIdScanner::default());
-    let pin_state = Arc::clone(&state);
-    let pin_route = Arc::clone(&pin_route);
-    let log_state = Arc::clone(&state);
-    let stream_log_id = log_id.clone();
-    let stream_start = request_start_time;
+    let emit_sse_heartbeats = is_text_event_stream(&headers);
+    let heartbeat_interval = state.sse_heartbeat_interval;
+    let forward = SseForward {
+        scanner: ResponseIdScanner::default(),
+        agent: agent_loop::SseAgentState::default(),
+        pending: VecDeque::new(),
+        sse_tail: Vec::new(),
+        pin_state: Arc::clone(&state),
+        pin_route: Arc::clone(&pin_route),
+        log_id: log_id.clone(),
+        stream_start: request_start_time,
+        lease,
+        response_bytes: 0,
+        first_byte_seen: false,
+        last_event_complete: true,
+        last_byte_was_lf: true,
+        parse_sse: emit_sse_heartbeats,
+        allow_nudge: allow_nudge && emit_sse_heartbeats,
+        force_nudge: agent_loop::should_force_nudge(&nudge_template),
+        nudge_used: false,
+        nudge_attempts: 0,
+        in_continuation: false,
+        continuation_id: None,
+        held_messages: Vec::new(),
+        nudge_template,
+        nudge_headers: upstream_request_headers,
+        nudge_url,
+    };
     let stream = stream::unfold(
         (
-            upstream.bytes_stream(),
-            scanner,
-            pin_state,
-            pin_route,
-            log_state,
-            stream_log_id,
-            stream_start,
-            lease,
-            0_u64,
-            false,
+            Box::pin(upstream.bytes_stream()) as UpstreamByteStream,
+            forward,
             false,
         ),
-        |(
-            mut upstream_stream,
-            scanner,
-            pin_state,
-            pin_route,
-            log_state,
-            stream_log_id,
-            stream_start,
-            lease,
-            mut response_bytes,
-            mut first_byte_seen,
-            finished,
-        )| async move {
+        move |(mut upstream_stream, mut forward, finished)| async move {
             if finished {
                 return None;
             }
-            match upstream_stream.next().await {
-                Some(Ok(bytes)) => {
-                    if !first_byte_seen {
-                        first_byte_seen = true;
-                        log_state.update_request_log(&stream_log_id, |log| {
-                            log.first_byte_ms = Some(stream_start.elapsed().as_millis() as u64);
-                        });
-                    }
-                    response_bytes = response_bytes.saturating_add(bytes.len() as u64);
-                    for id in scanner.borrow_mut().push(&bytes) {
-                        pin_state
-                            .routes
-                            .pin_conversation(&id, Arc::clone(&pin_route));
-                    }
-                    log_state.update_request_log(&stream_log_id, |log| {
-                        log.response_bytes = response_bytes;
-                    });
-                    Some((
-                        Ok(bytes),
-                        (
-                            upstream_stream,
-                            scanner,
-                            pin_state,
-                            pin_route,
-                            log_state,
-                            stream_log_id,
-                            stream_start,
-                            lease,
-                            response_bytes,
-                            first_byte_seen,
-                            false,
-                        ),
-                    ))
+            loop {
+                if let Some(bytes) = forward.pending.pop_front() {
+                    (forward.last_event_complete, forward.last_byte_was_lf) =
+                        sse_boundary_after(true, true, &bytes);
+                    return Some((Ok(bytes), (upstream_stream, forward, false)));
                 }
-                Some(Err(_)) => {
-                    log_state.update_request_log(&stream_log_id, |log| {
-                        log.stream_duration_ms = Some(stream_start.elapsed().as_millis() as u64);
-                        log.stream_error = Some("upstream response stream failed".to_string());
-                    });
-                    Some((
-                        Err(io::Error::other("upstream response stream failed")),
-                        (
-                            upstream_stream,
-                            scanner,
-                            pin_state,
-                            pin_route,
-                            log_state,
-                            stream_log_id,
-                            stream_start,
-                            lease,
-                            response_bytes,
-                            first_byte_seen,
-                            true,
-                        ),
-                    ))
-                }
-                None => {
-                    log_state.update_request_log(&stream_log_id, |log| {
-                        log.stream_duration_ms = Some(stream_start.elapsed().as_millis() as u64);
-                        log.stream_completed = true;
-                    });
-                    None
+                let emit_heartbeat = emit_sse_heartbeats
+                    && forward.sse_tail.is_empty()
+                    && forward.last_event_complete;
+                match next_upstream_or_heartbeat(
+                    &mut upstream_stream,
+                    heartbeat_interval,
+                    emit_heartbeat,
+                )
+                .await
+                {
+                    HeartbeatPoll::Heartbeat => {
+                        return Some((
+                            Ok(Bytes::from_static(SSE_COMMENT_HEARTBEAT)),
+                            (upstream_stream, forward, false),
+                        ));
+                    }
+                    HeartbeatPoll::Upstream(Ok(bytes)) => {
+                        if !forward.first_byte_seen {
+                            forward.first_byte_seen = true;
+                            forward
+                                .pin_state
+                                .update_request_log(&forward.log_id, |log| {
+                                    log.first_byte_ms =
+                                        Some(forward.stream_start.elapsed().as_millis() as u64);
+                                });
+                        }
+                        forward.push_upstream_bytes(&bytes);
+                        if let Some(bytes) = forward.pending.pop_front() {
+                            (forward.last_event_complete, forward.last_byte_was_lf) =
+                                sse_boundary_after(true, true, &bytes);
+                            return Some((Ok(bytes), (upstream_stream, forward, false)));
+                        }
+                    }
+                    HeartbeatPoll::Upstream(Err(_)) => {
+                        forward
+                            .pin_state
+                            .update_request_log(&forward.log_id, |log| {
+                                log.stream_duration_ms =
+                                    Some(forward.stream_start.elapsed().as_millis() as u64);
+                                log.response_bytes = forward.response_bytes;
+                                log.stream_error =
+                                    Some("upstream response stream failed".to_string());
+                            });
+                        return Some((
+                            Err(io::Error::other("upstream response stream failed")),
+                            (upstream_stream, forward, true),
+                        ));
+                    }
+                    HeartbeatPoll::Ended => {
+                        if forward.try_start_nudge(&mut upstream_stream).await {
+                            continue;
+                        }
+                        forward.flush_held_completed();
+                        if let Some(bytes) = forward.pending.pop_front() {
+                            (forward.last_event_complete, forward.last_byte_was_lf) =
+                                sse_boundary_after(true, true, &bytes);
+                            return Some((Ok(bytes), (upstream_stream, forward, false)));
+                        }
+                        forward.finish_log();
+                        return None;
+                    }
                 }
             }
         },
@@ -1984,6 +2085,309 @@ async fn proxy_request(
 
 fn unauthorized_response() -> Response {
     error_response(StatusCode::UNAUTHORIZED, "invalid local proxy bearer token")
+}
+
+enum HeartbeatPoll<T> {
+    Upstream(T),
+    Heartbeat,
+    Ended,
+}
+
+async fn next_upstream_or_heartbeat<S>(
+    upstream_stream: &mut S,
+    heartbeat_interval: Duration,
+    emit_heartbeat: bool,
+) -> HeartbeatPoll<S::Item>
+where
+    S: stream::Stream + Unpin,
+{
+    if !emit_heartbeat || heartbeat_interval.is_zero() {
+        return match upstream_stream.next().await {
+            Some(item) => HeartbeatPoll::Upstream(item),
+            None => HeartbeatPoll::Ended,
+        };
+    }
+    match tokio::time::timeout(heartbeat_interval, upstream_stream.next()).await {
+        Ok(Some(item)) => HeartbeatPoll::Upstream(item),
+        Ok(None) => HeartbeatPoll::Ended,
+        Err(_) => HeartbeatPoll::Heartbeat,
+    }
+}
+
+fn is_text_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|mime| mime.eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+fn sse_boundary_after(complete: bool, last_was_lf: bool, bytes: &[u8]) -> (bool, bool) {
+    if bytes.is_empty() {
+        return (complete, last_was_lf);
+    }
+    let last_was_lf_now = bytes.last() == Some(&b'\n');
+    let complete_now =
+        bytes.ends_with(b"\n\n") || (bytes.len() == 1 && last_was_lf && bytes[0] == b'\n');
+    (complete_now, last_was_lf_now)
+}
+
+type UpstreamByteStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+struct SseForward {
+    scanner: ResponseIdScanner,
+    agent: agent_loop::SseAgentState,
+    pending: VecDeque<Bytes>,
+    sse_tail: Vec<u8>,
+    pin_state: Arc<ProxyState>,
+    pin_route: Arc<RouteConfig>,
+    log_id: String,
+    stream_start: std::time::Instant,
+    #[allow(dead_code)]
+    lease: RequestLease,
+    response_bytes: u64,
+    first_byte_seen: bool,
+    last_event_complete: bool,
+    last_byte_was_lf: bool,
+    parse_sse: bool,
+    allow_nudge: bool,
+    force_nudge: bool,
+    nudge_used: bool,
+    nudge_attempts: u8,
+    in_continuation: bool,
+    continuation_id: Option<String>,
+    held_messages: Vec<Vec<u8>>,
+    nudge_template: Value,
+    nudge_headers: HeaderMap,
+    nudge_url: Url,
+}
+
+impl SseForward {
+    fn push_upstream_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        for id in self.scanner.push(bytes) {
+            self.pin_state
+                .routes
+                .pin_conversation(&id, Arc::clone(&self.pin_route));
+        }
+        if !self.parse_sse {
+            self.queue_forward(bytes.to_vec());
+            return;
+        }
+        self.sse_tail.extend_from_slice(bytes);
+        for event in agent_loop::drain_sse_events(&mut self.sse_tail) {
+            self.ingest_sse_event(event);
+        }
+    }
+
+    fn ingest_sse_event(&mut self, mut event: Vec<u8>) {
+        agent_loop::note_sse_event(&mut self.agent, &event);
+        if self.in_continuation {
+            if let Some(id) = agent_loop::sse_response_id(&event)
+                && self.agent.response_id.as_deref() != Some(id.as_str())
+            {
+                self.continuation_id.get_or_insert(id);
+            }
+            if agent_loop::is_response_created_event(&event) {
+                return;
+            }
+            if let (Some(from), Some(to)) = (
+                self.continuation_id.as_deref(),
+                self.agent.response_id.as_deref(),
+            ) {
+                event = agent_loop::rewrite_response_id(&event, from, to);
+            }
+        }
+        if agent_loop::is_completed_event(&event) {
+            self.agent.held_completed = Some(event);
+            return;
+        }
+        if self.allow_nudge
+            && !self.agent.saw_function_call
+            && agent_loop::is_assistant_text_event(&event)
+        {
+            self.held_messages.push(event);
+            return;
+        }
+        if self.allow_nudge && self.agent.saw_function_call {
+            self.flush_held_messages();
+        }
+        self.queue_forward(event);
+    }
+
+    fn queue_forward(&mut self, event: Vec<u8>) {
+        if event.is_empty() {
+            return;
+        }
+        self.response_bytes += event.len() as u64;
+        self.pending.push_back(Bytes::from(event));
+    }
+
+    async fn try_start_nudge(&mut self, upstream_stream: &mut UpstreamByteStream) -> bool {
+        const MAX_NUDGE_ATTEMPTS: u8 = 2;
+        if !self.allow_nudge
+            || self.nudge_attempts >= MAX_NUDGE_ATTEMPTS
+            || !self.agent.should_nudge(self.force_nudge)
+        {
+            return false;
+        }
+        let status_text = self.agent.status_text();
+        let mut body = if self.nudge_attempts == 0 {
+            agent_loop::build_nudge_request(
+                &self.nudge_template,
+                (!status_text.is_empty()).then_some(status_text),
+            )
+        } else {
+            agent_loop::build_compact_nudge_request(&self.nudge_template)
+        };
+        let compact = self.nudge_attempts > 0;
+        match self.post_nudge(&body).await {
+            Ok(response) => {
+                return self.adopt_nudge_stream(upstream_stream, response, compact, None);
+            }
+            Err(error) if body.get("previous_response_id").is_some() => {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("previous_response_id");
+                }
+                match self.post_nudge(&body).await {
+                    Ok(response) => {
+                        return self.adopt_nudge_stream(
+                            upstream_stream,
+                            response,
+                            compact,
+                            Some(&error),
+                        );
+                    }
+                    Err(fallback_error) => {
+                        self.note_nudge_failure(&format!("{error}; fallback {fallback_error}"));
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                self.note_nudge_failure(&error);
+                false
+            }
+        }
+    }
+
+    async fn post_nudge(&self, body: &Value) -> Result<reqwest::Response, String> {
+        let encoded =
+            serde_json::to_vec(body).map_err(|_| "nudge body could not be encoded".to_string())?;
+        match self
+            .pin_state
+            .client
+            .post(self.nudge_url.clone())
+            .headers(self.nudge_headers.clone())
+            .body(encoded)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                if is_text_event_stream(response.headers()) {
+                    Ok(response)
+                } else {
+                    Err(format!(
+                        "nudge HTTP {} was not an event stream",
+                        response.status()
+                    ))
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.bytes().await.unwrap_or_default();
+                let message =
+                    json_error_message(&bytes).unwrap_or_else(|| format!("HTTP {status}"));
+                Err(format!("nudge {status}: {message}"))
+            }
+            Err(error) => Err(format!(
+                "nudge transport: {}",
+                classify_upstream_error(&error)
+            )),
+        }
+    }
+
+    fn adopt_nudge_stream(
+        &mut self,
+        upstream_stream: &mut UpstreamByteStream,
+        response: reqwest::Response,
+        compact: bool,
+        recovered_from: Option<&str>,
+    ) -> bool {
+        self.nudge_attempts = self.nudge_attempts.saturating_add(1);
+        self.nudge_used = true;
+        self.in_continuation = true;
+        self.held_messages.clear();
+        self.agent.reset_output();
+        self.sse_tail.clear();
+        let detail = match recovered_from {
+            Some(error) => format!(
+                "agent nudge {} after retrying without previous_response_id ({error})",
+                if compact { "compact" } else { "retry" }
+            ),
+            None => format!("agent nudge {}", if compact { "compact" } else { "retry" }),
+        };
+        self.pin_state.update_request_log(&self.log_id, |log| {
+            log.agent_nudged = true;
+            log.completed_without_tools = true;
+            log.details = Some(match log.details.take() {
+                Some(existing) => format!("{existing}; {detail}"),
+                None => detail.clone(),
+            });
+        });
+        append_agent_loop_log(&format!("{} {}", self.log_id, detail));
+        *upstream_stream = Box::pin(response.bytes_stream());
+        true
+    }
+
+    fn note_nudge_failure(&self, error: &str) {
+        self.pin_state.update_request_log(&self.log_id, |log| {
+            log.details = Some(match log.details.take() {
+                Some(existing) => format!("{existing}; {error}"),
+                None => error.to_string(),
+            });
+            log.stream_error = Some(error.to_string());
+        });
+        append_agent_loop_log(&format!("{} {error}", self.log_id));
+    }
+
+    fn flush_held_messages(&mut self) {
+        let messages = std::mem::take(&mut self.held_messages);
+        for event in messages {
+            self.queue_forward(event);
+        }
+    }
+
+    fn flush_held_completed(&mut self) {
+        self.flush_held_messages();
+        if let Some(event) = self.agent.held_completed.take() {
+            self.queue_forward(event);
+        }
+        if !self.sse_tail.is_empty() {
+            let rest = std::mem::take(&mut self.sse_tail);
+            self.queue_forward(rest);
+        }
+    }
+
+    fn finish_log(&mut self) {
+        let completed_without_tools =
+            self.nudge_used || (self.allow_nudge && !self.agent.saw_function_call);
+        self.pin_state.update_request_log(&self.log_id, |log| {
+            log.stream_duration_ms = Some(self.stream_start.elapsed().as_millis() as u64);
+            log.response_bytes = self.response_bytes;
+            log.stream_completed = true;
+            log.completed_without_tools = completed_without_tools;
+            log.agent_nudged = self.nudge_used;
+        });
+    }
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
@@ -2078,6 +2482,27 @@ fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
         "the active provider could not be reached"
     } else {
         "the active provider request failed"
+    }
+}
+
+fn append_agent_loop_log(line: &str) {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return;
+    };
+    let path = PathBuf::from(home)
+        .join(".codex")
+        .join("provider-switcher")
+        .join("agent-loop.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -2403,6 +2828,40 @@ mod tests {
 
     fn token(value: &str) -> BearerToken {
         BearerToken::new(value).expect("valid test token")
+    }
+
+    #[test]
+    fn sse_boundary_tracks_split_event_terminators() {
+        assert_eq!(sse_boundary_after(true, true, b""), (true, true));
+        assert_eq!(
+            sse_boundary_after(true, true, b"data: hello"),
+            (false, false)
+        );
+        assert_eq!(
+            sse_boundary_after(false, false, b"data: hello\n"),
+            (false, true)
+        );
+        assert_eq!(sse_boundary_after(false, true, b"\n"), (true, true));
+        assert_eq!(
+            sse_boundary_after(true, true, b"data: one\n\n"),
+            (true, true)
+        );
+        assert_eq!(
+            sse_boundary_after(true, true, b"data: one\n\ndata: two"),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn event_stream_content_type_ignores_parameters() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        assert!(is_text_event_stream(&headers));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(!is_text_event_stream(&headers));
     }
 
     fn route(id: &str, model: &str) -> RouteConfig {

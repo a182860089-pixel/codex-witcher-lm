@@ -1546,6 +1546,21 @@ select:focus {
   font-size: 10px;
 }
 
+.model-alias-hint {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(174, 102, 0, 0.18);
+  border-radius: 8px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.model-alias-hint[hidden] {
+  display: none;
+}
+
 .model-controls {
   display: grid;
   grid-template-columns: minmax(180px, 1fr) auto auto;

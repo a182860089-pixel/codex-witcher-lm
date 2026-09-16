@@ -226,7 +226,17 @@ environment so Codex's own reqwest client does not send the loopback listener
 through Clash; a newly applied bypass requires a full Codex restart. Response
 status and safe headers are preserved, while hop-by-hop response headers and
 `Set-Cookie` are removed. Successful response bodies, including SSE, are
-forwarded as byte streams rather than buffered to completion. 4xx/5xx bodies
+forwarded as byte streams rather than buffered to completion. For
+`text/event-stream` responses the proxy inserts SSE comment heartbeats
+(`:\n\n`) every 15 seconds, but only at complete event boundaries, so a long
+silent reasoning turn does not look idle to Codex. Upstream TCP keepalive is
+10 seconds so local HTTP proxies such as Clash are less likely to drop the
+provider connection. If a Responses turn would complete with assistant text
+and no `function_call` while tools remain available, the proxy holds that
+text, keeps the original `input` and `previous_response_id`, and retries once
+with `tool_choice=required`. A Grok HTTP 400 does not replace
+`previous_response_id` with the just-completed response; a second compact
+Continue retry restores the cached thread tool list. 4xx/5xx bodies
 are bounded and normalized to `{ "error": { "message", "type": "api_error" } }`
 so Codex can display the upstream failure.
 
@@ -273,8 +283,11 @@ settings:
 
 On the first local-proxy enable, the same transaction instead writes
 `model_provider = "cps-local"`, the chosen model, `wire_api = "responses"`,
-`supports_websockets = false`, the strict loopback Base URL, and a helper
-account bound to the proxy entry token. It does not put the upstream Base URL or
+`supports_websockets = false`, `stream_idle_timeout_ms = 600000`,
+`stream_max_retries = 2`, the strict loopback Base URL, and a helper
+account bound to the proxy entry token. Startup refresh backfills those stream
+fields on an existing `cps-local` provider without failing closed on a legacy
+config that omitted them. It does not put the upstream Base URL or
 upstream key in Codex configuration. If Codex was not already using that exact
 managed provider, the UI requires a full Codex restart. Once active, later
 Route changes take effect on the next turn without another config edit.

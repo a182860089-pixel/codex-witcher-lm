@@ -1006,6 +1006,134 @@ async fn forwards_sse_as_an_unbuffered_byte_stream() {
     proxy.shutdown().await.unwrap();
 }
 
+async fn idle_then_sse_provider() -> Response {
+    let chunks = stream::unfold(0_u8, |index| async move {
+        match index {
+            0 => {
+                sleep(Duration::from_millis(220)).await;
+                Some((
+                    Ok::<Bytes, Infallible>(Bytes::from_static(b"data: first\n\n")),
+                    1,
+                ))
+            }
+            _ => None,
+        }
+    });
+    let mut response = Response::new(Body::from_stream(chunks));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("SSE content type"),
+    );
+    response
+}
+
+#[tokio::test]
+async fn inserts_sse_comment_heartbeats_during_upstream_idle() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(idle_then_sse_provider))).await;
+    let proxy = proxy_with_route_and_options(
+        route(
+            &upstream,
+            "route-sse-heartbeat",
+            "model-sse-heartbeat",
+            vec![model("model-sse-heartbeat")],
+        ),
+        ProxyStartOptions {
+            sse_heartbeat_interval: Duration::from_millis(50),
+            ..ProxyStartOptions::default()
+        },
+    )
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("SSE heartbeat response");
+    let mut body = response.bytes_stream();
+    let first = timeout(Duration::from_millis(150), body.next())
+        .await
+        .expect("heartbeat arrived while upstream was idle")
+        .expect("heartbeat item")
+        .expect("heartbeat bytes");
+    assert_eq!(first.as_ref(), b":\n\n");
+
+    let mut all = first.to_vec();
+    while let Some(chunk) = body.next().await {
+        all.extend_from_slice(&chunk.expect("remaining SSE bytes"));
+    }
+    assert!(
+        all.windows(b"data: first\n\n".len())
+            .any(|window| window == b"data: first\n\n"),
+        "real upstream event should still arrive: {}",
+        String::from_utf8_lossy(&all)
+    );
+
+    let log = &proxy.request_logs()[0];
+    assert_eq!(log.response_bytes, b"data: first\n\n".len() as u64);
+    assert!(log.first_byte_ms.unwrap() >= 200);
+    assert!(log.stream_completed);
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn split_sse_event_provider() -> Response {
+    let chunks = stream::unfold(0_u8, |index| async move {
+        match index {
+            0 => Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"data: hel")), 1)),
+            1 => {
+                sleep(Duration::from_millis(220)).await;
+                Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"lo\n\n")), 2))
+            }
+            _ => None,
+        }
+    });
+    let mut response = Response::new(Body::from_stream(chunks));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("SSE content type"),
+    );
+    response
+}
+
+#[tokio::test]
+async fn does_not_insert_sse_heartbeats_in_the_middle_of_an_event() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(split_sse_event_provider)))
+            .await;
+    let proxy = proxy_with_route_and_options(
+        route(
+            &upstream,
+            "route-sse-split",
+            "model-sse-split",
+            vec![model("model-sse-split")],
+        ),
+        ProxyStartOptions {
+            sse_heartbeat_interval: Duration::from_millis(50),
+            ..ProxyStartOptions::default()
+        },
+    )
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("split SSE response");
+    let mut body = response.bytes_stream();
+    let mut all = Vec::new();
+    while let Some(chunk) = body.next().await {
+        all.extend_from_slice(&chunk.expect("SSE bytes"));
+    }
+    assert_eq!(all, b"data: hello\n\n");
+
+    proxy.shutdown().await.unwrap();
+}
+
 #[derive(Default)]
 struct MidStreamFailureState {
     hits: AtomicUsize,
@@ -1073,6 +1201,816 @@ async fn records_mid_stream_failure_without_replaying_request() {
     assert!(log.stream_error.is_some());
     assert_eq!(log.response_bytes, first.len() as u64);
     assert!(log.stream_duration_ms.is_some());
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn continue_with_tools_forces_tool_choice() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .route("/v1/responses/compact", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-agent-loop",
+        "model-agent-loop",
+        vec![model("model-agent-loop")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-agent-loop",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "对着现成截图改，不再空转。"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续"}]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("continue response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["tool_choice"], "required");
+    assert!(
+        requests[0].body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("function_call")
+    );
+    assert_eq!(
+        requests[0].body["input"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["role"],
+        "developer"
+    );
+    let log = &proxy.request_logs()[0];
+    assert_eq!(log.agent_guard.as_deref(), Some("force_tools"));
+    assert_eq!(log.requested_model.as_deref(), Some("model-agent-loop"));
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn continue_with_trailing_environment_context_forces_tool_choice() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-agent-env",
+        "model-agent-env",
+        vec![model("model-agent-env")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-agent-env",
+            "previous_response_id": "resp_prev12345",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "<environment_context>\n  <current_date>2026-09-17</current_date>\n</environment_context>"
+                    }]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("continue env response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(capture.requests()[0].body["tool_choice"], "required");
+    assert_eq!(
+        proxy.request_logs()[0].agent_guard.as_deref(),
+        Some("force_tools")
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_result_followup_forces_tool_choice() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-agent-tool-result",
+        "model-agent-tool-result",
+        vec![model("model-agent-tool-result")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-agent-tool-result",
+            "previous_response_id": "resp_prev12345",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "TCP 0.0.0.0:3000 LISTENING"
+            }]
+        }))
+        .send()
+        .await
+        .expect("tool result response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(capture.requests()[0].body["tool_choice"], "required");
+    assert_eq!(
+        proxy.request_logs()[0].agent_guard.as_deref(),
+        Some("force_tools")
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn greeting_with_tools_does_not_force_tool_choice() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-agent-greeting",
+        "model-agent-greeting",
+        vec![model("model-agent-greeting")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-agent-greeting",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "在吗"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("greeting response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = &capture.requests()[0].body;
+    assert!(body.get("tool_choice").is_none());
+    assert!(
+        body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("function_call")
+    );
+    assert_eq!(
+        proxy.request_logs()[0].agent_guard.as_deref(),
+        Some("instructions")
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compact_does_not_apply_agent_loop_guard() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses/compact", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-agent-compact",
+        "model-agent-compact",
+        vec![model("model-agent-compact")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/v1/responses/compact", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-agent-compact",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("compact response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = &capture.requests()[0].body;
+    assert!(body.get("tool_choice").is_none());
+    assert!(body.get("instructions").is_none());
+    assert!(proxy.request_logs()[0].agent_guard.is_none());
+
+    proxy.shutdown().await.unwrap();
+}
+
+fn sse_event(value: Value) -> Vec<u8> {
+    let mut event = b"data: ".to_vec();
+    event.extend(serde_json::to_vec(&value).expect("sse json"));
+    event.extend_from_slice(b"\n\n");
+    event
+}
+
+fn collapse_first_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_orig12345"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_text.delta",
+        "delta": "对着现成截图改，不再空转。"
+    })));
+    body.extend(sse_event(
+        json!({"type":"response.completed","response":{"id":"resp_orig12345"}}),
+    ));
+    body
+}
+
+fn collapse_item_done_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_orig12345"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "对着现成截图改，不再空转。"}]
+        }
+    })));
+    body.extend(sse_event(
+        json!({"type":"response.completed","response":{"id":"resp_orig12345"}}),
+    ));
+    body
+}
+
+fn collapse_second_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_cont99999"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "name": "exec_command"}
+    })));
+    body.extend(sse_event(
+        json!({"type":"response.completed","response":{"id":"resp_cont99999"}}),
+    ));
+    body
+}
+
+fn tool_only_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_tool12345"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "name": "exec_command"}
+    })));
+    body.extend(sse_event(
+        json!({"type":"response.completed","response":{"id":"resp_tool12345"}}),
+    ));
+    body
+}
+
+fn greeting_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_hi123456"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_text.delta",
+        "delta": "海鸥在线，你要整点薯条吗？"
+    })));
+    body.extend(sse_event(
+        json!({"type":"response.completed","response":{"id":"resp_hi123456"}}),
+    ));
+    body
+}
+
+fn sse_body(bytes: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("SSE content type"),
+    );
+    response
+}
+
+#[derive(Default)]
+struct AgentSseState {
+    requests: Mutex<Vec<CapturedRequest>>,
+}
+
+impl AgentSseState {
+    fn requests(&self) -> Vec<CapturedRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+async fn capture_sse_request(
+    state: &AgentSseState,
+    request: Request<Body>,
+) -> (usize, CapturedRequest) {
+    let path = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let body = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .expect("read captured body");
+    let body = serde_json::from_slice(&body).expect("captured JSON body");
+    let captured = CapturedRequest {
+        path,
+        headers,
+        body,
+    };
+    let mut requests = state
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    requests.push(captured.clone());
+    (requests.len(), captured)
+}
+
+async fn collapse_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    let (count, _) = capture_sse_request(&state, request).await;
+    if count == 1 {
+        sse_body(collapse_first_sse())
+    } else {
+        sse_body(collapse_second_sse())
+    }
+}
+
+async fn collapse_item_done_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    let (count, _) = capture_sse_request(&state, request).await;
+    if count == 1 {
+        sse_body(collapse_item_done_sse())
+    } else {
+        sse_body(collapse_second_sse())
+    }
+}
+
+async fn tool_call_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    sse_body(tool_only_sse())
+}
+
+async fn greeting_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    sse_body(greeting_sse())
+}
+
+#[tokio::test]
+async fn sse_one_liner_without_tools_issues_one_continuation() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(collapse_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-nudge",
+        "model-sse-nudge",
+        vec![model("model-sse-nudge")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-nudge",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("collapse SSE response");
+
+    let mut all = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        all.extend_from_slice(&chunk.expect("SSE bytes"));
+    }
+    let text = String::from_utf8(all.clone()).expect("utf8 SSE");
+    assert!(text.contains("resp_orig12345"));
+    assert!(!text.contains("resp_cont99999"));
+    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert!(text.contains("function_call"));
+    assert_eq!(text.matches("response.created").count(), 1);
+    assert_eq!(text.matches("response.completed").count(), 1);
+
+    let requests = state.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body["tool_choice"], "required");
+    assert!(requests[1].body.get("previous_response_id").is_none());
+    assert_eq!(requests[1].body["tool_choice"], "required");
+    assert_eq!(requests[1].body["input"][0]["content"][0]["text"], "继续");
+    assert_eq!(
+        requests[1].body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["role"] == "developer")
+            .count(),
+        2
+    );
+
+    let log = &proxy.request_logs()[0];
+    assert!(log.agent_nudged);
+    assert!(log.completed_without_tools);
+    assert!(log.stream_completed);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_one_liner_from_output_item_done_issues_one_continuation() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(collapse_item_done_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-item-done",
+        "model-sse-item-done",
+        vec![model("model-sse-item-done")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-item-done",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("collapse SSE response");
+
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    assert_eq!(state.requests().len(), 2);
+    assert!(proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_function_call_does_not_nudge() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(tool_call_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-tools",
+        "model-sse-tools",
+        vec![model("model-sse-tools")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-tools",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("tool SSE response");
+    let body = response.bytes().await.expect("SSE body");
+    assert!(
+        body.windows(b"function_call".len())
+            .any(|window| window == b"function_call")
+    );
+    assert_eq!(state.requests().len(), 1);
+    assert!(!proxy.request_logs()[0].agent_nudged);
+    assert!(!proxy.request_logs()[0].completed_without_tools);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_greeting_without_status_one_liner_does_not_nudge() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(greeting_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-hi",
+        "model-sse-hi",
+        vec![model("model-sse-hi")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-hi",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "在吗"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("greeting SSE response");
+    let _ = response.bytes().await.expect("SSE body");
+    assert_eq!(state.requests().len(), 1);
+    assert_eq!(
+        proxy.request_logs()[0].agent_guard.as_deref(),
+        Some("instructions")
+    );
+    assert!(!proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn keep_or_reject_prev_id_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    let (count, captured) = capture_sse_request(&state, request).await;
+    if count == 1 {
+        return sse_body(collapse_first_sse());
+    }
+    if captured
+        .body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        == Some("resp_orig12345")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(CONTENT_TYPE, "application/json")],
+            Json(json!({
+                "error": {"message": "previous_response_id is not available for this user"}
+            })),
+        )
+            .into_response();
+    }
+    sse_body(collapse_second_sse())
+}
+
+async fn collapse_twice_then_tools_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    let (count, _) = capture_sse_request(&state, request).await;
+    if count <= 2 {
+        sse_body(collapse_first_sse())
+    } else {
+        sse_body(collapse_second_sse())
+    }
+}
+
+#[tokio::test]
+async fn sse_nudge_keeps_original_previous_response_id() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(keep_or_reject_prev_id_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-keep-prev",
+        "model-sse-keep-prev",
+        vec![model("model-sse-keep-prev")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-keep-prev",
+            "previous_response_id": "resp_prev12345",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续完成任务"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("collapse SSE response");
+
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    assert!(!text.contains("对着现成截图改，不再空转。"));
+    let requests = state.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body["previous_response_id"], "resp_prev12345");
+    assert_ne!(requests[1].body["previous_response_id"], "resp_orig12345");
+    assert!(proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_second_one_liner_issues_compact_nudge() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(collapse_twice_then_tools_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-compact",
+        "model-sse-compact",
+        vec![model("model-sse-compact")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-compact",
+            "previous_response_id": "resp_prev12345",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续完成任务"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "<environment_context>\n  <cwd>D:/proj</cwd>\n</environment_context>"
+                    }]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("compact nudge response");
+
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    let requests = state.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].body["previous_response_id"], "resp_prev12345");
+    let compact_input = requests[2].body["input"].as_array().unwrap();
+    assert_eq!(compact_input.len(), 2);
+    assert_eq!(compact_input[0]["content"][0]["text"], "继续完成任务");
+    assert_eq!(compact_input[1]["role"], "developer");
+    assert!(proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn continue_without_tools_restores_cached_tools() {
+    let capture = Arc::new(CaptureState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(capture_provider))
+            .with_state(Arc::clone(&capture)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-restore-tools",
+        "model-restore-tools",
+        vec![model("model-restore-tools")],
+    ))
+    .await;
+    let client = no_redirect_client();
+
+    let first = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "thread-restore-tools")
+        .json(&json!({
+            "model": "model-restore-tools",
+            "thread_id": "thread-restore-tools",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "先看目录"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .header("thread-id", "thread-restore-tools")
+        .json(&json!({
+            "model": "model-restore-tools",
+            "thread_id": "thread-restore-tools",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续完成任务"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("continue without tools");
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let requests = capture.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert_eq!(requests[1].body["tool_choice"], "required");
+    assert_eq!(
+        proxy.request_logs()[0].agent_guard.as_deref(),
+        Some("force_tools")
+    );
 
     proxy.shutdown().await.unwrap();
 }

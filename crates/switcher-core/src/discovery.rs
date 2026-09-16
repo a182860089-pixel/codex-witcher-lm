@@ -27,6 +27,8 @@ pub struct FetchedModel {
 pub struct ModelDiscovery {
     pub base_url: String,
     pub models: Vec<FetchedModel>,
+    #[serde(default)]
+    pub hidden_alias_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,7 +115,7 @@ pub async fn fetch_models(
         let parsed = serde_json::from_slice::<ModelsResponse>(&bytes)
             .map_err(|_| "model endpoint returned an unsupported response".to_string())?;
         let mut seen = HashSet::new();
-        let mut models = parsed
+        let models = parsed
             .data
             .into_iter()
             .filter_map(|entry| {
@@ -129,12 +131,14 @@ pub async fn fetch_models(
                         .filter(|value| !value.is_empty()),
                 })
             })
-            .take(MAX_MODELS)
             .collect::<Vec<_>>();
+        let (mut models, hidden_alias_count) = prefer_unprefixed_model_ids(models);
+        models.truncate(MAX_MODELS);
         models.sort_by(|left, right| left.id.cmp(&right.id));
         return Ok(ModelDiscovery {
             base_url: api_base_from_models_endpoint(&candidate),
             models,
+            hidden_alias_count,
         });
     }
 
@@ -142,6 +146,31 @@ pub async fn fetch_models(
         "model endpoint returned HTTP {}",
         last_not_found.unwrap_or(StatusCode::NOT_FOUND).as_u16()
     ))
+}
+
+fn is_vendor_prefixed_model_id(id: &str) -> bool {
+    id.contains('/')
+}
+
+/// Aggregators like LuMingAPI often list both working short IDs (`grok-4.6`)
+/// and vendor-prefixed aliases (`x-ai/grok-4.6`, `grok/grok-imagine-video`).
+/// Codex users who pick the alias get 503s. If the catalog already has any
+/// slash-free ID, hide the prefixed copies. Pure OpenRouter catalogs keep
+/// every `vendor/model` ID because that is the real identifier.
+fn prefer_unprefixed_model_ids(models: Vec<FetchedModel>) -> (Vec<FetchedModel>, usize) {
+    let has_unprefixed = models
+        .iter()
+        .any(|model| !is_vendor_prefixed_model_id(&model.id));
+    if !has_unprefixed {
+        return (models, 0);
+    }
+    let original_len = models.len();
+    let filtered = models
+        .into_iter()
+        .filter(|model| !is_vendor_prefixed_model_id(&model.id))
+        .collect::<Vec<_>>();
+    let hidden = original_len.saturating_sub(filtered.len());
+    (filtered, hidden)
 }
 
 fn api_base_from_models_endpoint(endpoint: &str) -> String {
@@ -288,7 +317,7 @@ mod tests {
                     .contains("authorization: bearer test-key")
             );
 
-            let body = r#"{"data":[{"id":"zeta","owned_by":"vendor"},{"id":"alpha"},{"id":"alpha"},{"id":"not valid"}]}"#;
+            let body = r#"{"data":[{"id":"zeta","owned_by":"vendor"},{"id":"alpha"},{"id":"alpha"},{"id":"x-ai/alpha"},{"id":"grok/grok-imagine-video"},{"id":"not valid"}]}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -311,6 +340,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
         );
+        assert_eq!(discovery.hidden_alias_count, 2);
     }
 
     #[tokio::test]
@@ -322,5 +352,64 @@ mod tests {
             error,
             "API Key must be 1-8192 characters without line breaks"
         );
+    }
+    #[test]
+    fn hides_vendor_prefixed_aliases_when_short_ids_exist() {
+        let (models, hidden) = prefer_unprefixed_model_ids(vec![
+            FetchedModel {
+                id: "grok-4.6".into(),
+                owned_by: None,
+            },
+            FetchedModel {
+                id: "grok-4.5".into(),
+                owned_by: None,
+            },
+            FetchedModel {
+                id: "x-ai/grok-4.6".into(),
+                owned_by: Some("x-ai".into()),
+            },
+            FetchedModel {
+                id: "x-ai/grok".into(),
+                owned_by: None,
+            },
+            FetchedModel {
+                id: "grok/grok-imagine-video".into(),
+                owned_by: None,
+            },
+            FetchedModel {
+                id: "x-ai/composer-2.5".into(),
+                owned_by: None,
+            },
+        ]);
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grok-4.6", "grok-4.5"]
+        );
+        assert_eq!(hidden, 4);
+    }
+
+    #[test]
+    fn keeps_openrouter_style_catalogs_that_only_have_prefixed_ids() {
+        let (models, hidden) = prefer_unprefixed_model_ids(vec![
+            FetchedModel {
+                id: "x-ai/grok-4.6".into(),
+                owned_by: None,
+            },
+            FetchedModel {
+                id: "anthropic/claude-sonnet-4".into(),
+                owned_by: None,
+            },
+        ]);
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x-ai/grok-4.6", "anthropic/claude-sonnet-4"]
+        );
+        assert_eq!(hidden, 0);
     }
 }

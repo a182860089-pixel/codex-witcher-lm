@@ -21,6 +21,7 @@ use crate::config::ConfigPlan;
 use crate::config::LOCAL_PROXY_PROVIDER_ID;
 use crate::config::refresh_proxy_credential_helper;
 use crate::config::refresh_proxy_selected_model;
+use crate::config::refresh_proxy_stream_settings;
 use crate::config::retarget_local_proxy_base_url;
 use crate::config::sha256_hex;
 use crate::config::verify_proxy_config_binding;
@@ -225,6 +226,36 @@ pub fn refresh_proxy_selected_model_file(
         let Some(rendered) =
             refresh_proxy_selected_model(current_text, proxy_base_url, selected_model)?
         else {
+            return Ok(false);
+        };
+        let expected = ExpectedFileState::Sha256(sha256_hex(&current));
+        atomic_write_expected(config_path, &expected, rendered.as_bytes())?;
+        Ok(true)
+    })();
+    FileExt::unlock(&lock)?;
+    result
+}
+
+pub fn refresh_proxy_stream_settings_file(
+    config_path: &Path,
+    proxy_base_url: &str,
+) -> Result<bool> {
+    ensure_regular_file(config_path)?;
+    let lock_path = lock_path_for(config_path);
+    ensure_regular_or_missing(&lock_path)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    FileExt::lock(&lock)?;
+
+    let result = (|| {
+        let current = read_optional(config_path)?.ok_or_else(|| {
+            SwitcherError::Conflict("the active Codex configuration is missing".to_string())
+        })?;
+        let current_text = std::str::from_utf8(&current).map_err(|_| SwitcherError::InvalidUtf8)?;
+        let Some(rendered) = refresh_proxy_stream_settings(current_text, proxy_base_url)? else {
             return Ok(false);
         };
         let expected = ExpectedFileState::Sha256(sha256_hex(&current));

@@ -27,6 +27,8 @@ pub const LOCAL_PROXY_PROVIDER_ID: &str = "cps-local";
 pub const LOCAL_PROXY_PROVIDER_NAME: &str = "Codex Provider Switcher";
 pub const CODEX_CLIENT_MODEL: &str = "gpt-5.6-sol";
 pub const CODEX_CLIENT_MODEL_DISPLAY_NAME: &str = "5.6 Sol";
+pub const LOCAL_PROXY_STREAM_IDLE_TIMEOUT_MS: i64 = 600_000;
+pub const LOCAL_PROXY_STREAM_MAX_RETRIES: i64 = 2;
 
 pub fn is_codex_client_model(model: &str) -> bool {
     model == CODEX_CLIENT_MODEL
@@ -168,6 +170,9 @@ fn plan_config_with_account(
     provider["base_url"] = value(profile.base_url.trim_end_matches('/'));
     provider["wire_api"] = value("responses");
     provider["supports_websockets"] = value(profile.supports_websockets);
+    if profile.id == LOCAL_PROXY_PROVIDER_ID {
+        apply_local_proxy_stream_settings(&mut provider);
+    }
 
     if let Some(helper) = credential_helper.filter(|_| profile.credential_required) {
         let mut auth = Table::new();
@@ -299,6 +304,19 @@ pub fn verify_proxy_config_binding(config: &str, proxy_base_url: &str) -> Result
     {
         return Err(SwitcherError::Validation(
             "the managed local proxy contains an unsupported authentication setting".to_string(),
+        ));
+    }
+    if !optional_integer_field_matches(
+        provider,
+        "stream_idle_timeout_ms",
+        LOCAL_PROXY_STREAM_IDLE_TIMEOUT_MS,
+    ) || !optional_integer_field_matches(
+        provider,
+        "stream_max_retries",
+        LOCAL_PROXY_STREAM_MAX_RETRIES,
+    ) {
+        return Err(SwitcherError::Validation(
+            "the managed local proxy stream settings have changed".to_string(),
         ));
     }
 
@@ -474,6 +492,26 @@ pub fn retarget_local_proxy_base_url(config: &str, proxy_base_url: &str) -> Resu
     Ok(Some(rendered))
 }
 
+pub fn refresh_proxy_stream_settings(config: &str, proxy_base_url: &str) -> Result<Option<String>> {
+    let mut document = config.parse::<DocumentMut>()?;
+    let provider = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(LOCAL_PROXY_PROVIDER_ID))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            SwitcherError::Validation("the managed local proxy definition is missing".to_string())
+        })?;
+    if local_proxy_stream_settings_current(provider) {
+        verify_proxy_config_binding(config, proxy_base_url)?;
+        return Ok(None);
+    }
+    apply_local_proxy_stream_settings(provider);
+    let rendered = document.to_string();
+    verify_proxy_config_binding(&rendered, proxy_base_url)?;
+    Ok(Some(rendered))
+}
+
 pub fn verify_credential_binding(
     config: &str,
     account: &str,
@@ -543,6 +581,29 @@ pub fn verify_credential_binding(
         ));
     }
     Ok(())
+}
+
+fn apply_local_proxy_stream_settings(provider: &mut Table) {
+    provider["stream_idle_timeout_ms"] = value(LOCAL_PROXY_STREAM_IDLE_TIMEOUT_MS);
+    provider["stream_max_retries"] = value(LOCAL_PROXY_STREAM_MAX_RETRIES);
+}
+
+fn local_proxy_stream_settings_current(provider: &Table) -> bool {
+    provider
+        .get("stream_idle_timeout_ms")
+        .and_then(Item::as_integer)
+        == Some(LOCAL_PROXY_STREAM_IDLE_TIMEOUT_MS)
+        && provider
+            .get("stream_max_retries")
+            .and_then(Item::as_integer)
+            == Some(LOCAL_PROXY_STREAM_MAX_RETRIES)
+}
+
+fn optional_integer_field_matches(table: &Table, key: &str, expected: i64) -> bool {
+    match table.get(key) {
+        None => true,
+        Some(item) => item.as_integer() == Some(expected),
+    }
 }
 
 fn validate_proxy_base_url(base_url: &str) -> Result<()> {
@@ -904,6 +965,11 @@ base_url = "https://vendor.example/v1"
                 .contains("base_url = \"http://127.0.0.1:15722/v1\"")
         );
         assert!(plan.rendered_config.contains("supports_websockets = false"));
+        assert!(
+            plan.rendered_config
+                .contains("stream_idle_timeout_ms = 600000")
+        );
+        assert!(plan.rendered_config.contains("stream_max_retries = 2"));
         assert!(plan.rendered_config.contains(&account));
         assert!(!plan.rendered_config.contains("https://api.acme.test"));
         verify_credential_binding(&plan.rendered_config, &account, &helper).unwrap();
@@ -994,6 +1060,73 @@ base_url = "https://vendor.example/v1"
             )
             .is_err()
         );
+        assert!(
+            verify_proxy_config_binding(
+                &plan.rendered_config.replace(
+                    "stream_idle_timeout_ms = 600000",
+                    "stream_idle_timeout_ms = 300000",
+                ),
+                base_url,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn proxy_binding_accepts_legacy_configs_without_stream_idle_timeout() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan =
+            plan_proxy_config("", &profile(), "acme/code", &catalog, &helper, base_url).unwrap();
+        let legacy = plan
+            .rendered_config
+            .replace("stream_idle_timeout_ms = 600000\n", "")
+            .replace("stream_max_retries = 2\n", "");
+        assert!(!legacy.contains("stream_idle_timeout_ms"));
+        assert!(!legacy.contains("stream_max_retries"));
+        assert_eq!(
+            verify_proxy_config_binding(&legacy, base_url).unwrap(),
+            helper
+        );
+    }
+
+    #[test]
+    fn proxy_stream_settings_refresh_backfills_and_repairs_idle_timeout() {
+        let catalog = absolute_test_path("models.json");
+        let helper = absolute_test_path("helper");
+        let base_url = "http://127.0.0.1:15722/v1";
+        let plan =
+            plan_proxy_config("", &profile(), "acme/code", &catalog, &helper, base_url).unwrap();
+        let legacy = plan
+            .rendered_config
+            .replace("stream_idle_timeout_ms = 600000\n", "")
+            .replace("stream_max_retries = 2\n", "");
+        let refreshed = refresh_proxy_stream_settings(&legacy, base_url)
+            .unwrap()
+            .unwrap();
+        assert!(refreshed.contains("stream_idle_timeout_ms = 600000"));
+        assert!(refreshed.contains("stream_max_retries = 2"));
+        assert_eq!(
+            verify_proxy_config_binding(&refreshed, base_url).unwrap(),
+            helper
+        );
+        assert!(
+            refresh_proxy_stream_settings(&refreshed, base_url)
+                .unwrap()
+                .is_none()
+        );
+
+        let wrong = plan.rendered_config.replace(
+            "stream_idle_timeout_ms = 600000",
+            "stream_idle_timeout_ms = 300000",
+        );
+        assert!(verify_proxy_config_binding(&wrong, base_url).is_err());
+        let repaired = refresh_proxy_stream_settings(&wrong, base_url)
+            .unwrap()
+            .unwrap();
+        assert!(repaired.contains("stream_idle_timeout_ms = 600000"));
+        verify_proxy_config_binding(&repaired, base_url).unwrap();
     }
 
     #[test]
