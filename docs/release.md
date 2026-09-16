@@ -188,6 +188,20 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-16 GitHub 0.3.14
+
+[LM Codex Switch v0.3.14](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.14)
+is a Windows-only overlay release. After the first save or first fast-switch
+enable, the "fast switch is ready" dialog buttons can be clicked again. Users
+no longer need to press Esc before choosing Later or Reopen Codex.
+
+Published installer:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.14_Windows-x64-Setup.exe`,
+  SHA-256
+  `263fe63b324a791e2cf08d24ed042deb7266800f7492d1160b9dcfa1b413e0dd`.
+
 ## 2026-09-12 GitHub 0.3.11
 
 [LM Codex Switch v0.3.11](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.11)

@@ -339,6 +339,7 @@ let editingProfileId: string | null = null;
 let editingCredentialLoaded = false;
 let editingCredentialDirty = false;
 let restartNoticeShown = false;
+let restartNoticePresenting = false;
 let busy = false;
 let pendingUpdate: AppUpdateStatus | null = null;
 const AUTO_UPDATE_FIRST_DELAY_MS = 5000;
@@ -920,7 +921,7 @@ app.innerHTML = `
     <h2 id="restart-notice-title">快速切换已准备好</h2>
     <p>重新打开一次 Codex 即可生效。之后保持本软件运行，新对话使用当前模型，已有对话仍走原来的模型。</p>
     <div class="restart-dialog-actions">
-      <button id="restart-later" class="button button-secondary" type="button">稍后</button>
+      <button id="restart-later" class="button button-secondary" type="button" autofocus>稍后</button>
       <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
     </div>
   </dialog>
@@ -1154,11 +1155,15 @@ required<HTMLButtonElement>("#save-only").addEventListener("click", () => saveCo
 required<HTMLButtonElement>("#save-and-switch").addEventListener("click", () =>
   saveConnection(true),
 );
-required<HTMLButtonElement>("#restart-later").addEventListener("click", () =>
-  required<HTMLDialogElement>("#restart-notice").close(),
-);
-required<HTMLButtonElement>("#restart-now").addEventListener("click", () => {
-  required<HTMLDialogElement>("#restart-notice").close();
+required<HTMLButtonElement>("#restart-later").addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  closeRestartNotice();
+});
+required<HTMLButtonElement>("#restart-now").addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  closeRestartNotice();
   void openCodex(false);
 });
 required<HTMLDialogElement>("#editor").addEventListener("cancel", (event) => {
@@ -3131,18 +3136,97 @@ async function openCodex(confirmFirst = true): Promise<void> {
   });
 }
 
+function closeRestartNotice(): void {
+  const dialog = document.querySelector<HTMLDialogElement>("#restart-notice");
+  if (dialog?.open) dialog.close();
+}
+
+function enableRestartNoticeActions(): void {
+  const later = document.querySelector<HTMLButtonElement>("#restart-later");
+  const now = document.querySelector<HTMLButtonElement>("#restart-now");
+  if (later) later.disabled = false;
+  if (now) now.disabled = false;
+}
+
+function waitFrames(count = 2): Promise<void> {
+  return new Promise((resolve) => {
+    const step = (left: number) => {
+      if (left <= 0) {
+        resolve();
+        return;
+      }
+      requestAnimationFrame(() => step(left - 1));
+    };
+    step(count);
+  });
+}
+
 function maybeShowRestartNotice(): void {
   if (
     restartNoticeShown ||
+    restartNoticePresenting ||
     !nativeAvailable ||
     !localProxy.running ||
     !localProxy.requiresCodexRestart
   ) {
     return;
   }
+
+  const editor = document.querySelector<HTMLDialogElement>("#editor");
+  if (editor?.open) {
+    if (editor.dataset.restartOnClose !== "1") {
+      editor.dataset.restartOnClose = "1";
+      editor.addEventListener(
+        "close",
+        () => {
+          delete editor.dataset.restartOnClose;
+          maybeShowRestartNotice();
+        },
+        { once: true },
+      );
+    }
+    return;
+  }
+
+  restartNoticePresenting = true;
+  void presentRestartNotice();
+}
+
+async function presentRestartNotice(): Promise<void> {
   const dialog = required<HTMLDialogElement>("#restart-notice");
-  restartNoticeShown = true;
-  if (!dialog.open) dialog.showModal();
+  enableRestartNoticeActions();
+
+  try {
+    // Never stack this modal on the editor. Closing one <dialog> and immediately
+    // showModal()-ing another leaves WebView2's top layer eating pointer events
+    // until Escape; the visible buttons then look dead.
+    await waitFrames(2);
+    const blocking = [...document.querySelectorAll("dialog")].find(
+      (item) => item instanceof HTMLDialogElement && item.open && item !== dialog,
+    );
+    if (blocking) {
+      if (blocking.dataset.restartOnClose !== "1") {
+        blocking.dataset.restartOnClose = "1";
+        blocking.addEventListener(
+          "close",
+          () => {
+            delete blocking.dataset.restartOnClose;
+            maybeShowRestartNotice();
+          },
+          { once: true },
+        );
+      }
+      return;
+    }
+    if (!dialog.open) dialog.showModal();
+    dialog.inert = false;
+    dialog.removeAttribute("inert");
+    enableRestartNoticeActions();
+    restartNoticeShown = true;
+    required<HTMLButtonElement>("#restart-later").focus();
+  } finally {
+    restartNoticePresenting = false;
+  }
 }
 
 function buildProfile(
@@ -3306,12 +3390,16 @@ function scheduleAutoUpdateCheck(delayMs: number): void {
 }
 
 function presentPendingUpdateIfNeeded(): void {
-  if (busy) return;
+  if (busy || restartNoticePresenting) return;
   const status = pendingUpdate;
   if (!status?.updateAvailable || status.skipped) return;
   const dialog = document.querySelector<HTMLDialogElement>("#update-notice");
   if (!dialog || dialog.open) return;
   if (document.hidden) return;
+  const otherOpen = [...document.querySelectorAll("dialog")].some(
+    (item) => item instanceof HTMLDialogElement && item.open && item !== dialog,
+  );
+  if (otherOpen) return;
   showUpdateDialog(status);
 }
 
@@ -3444,16 +3532,20 @@ async function run(
 function setBusy(value: boolean): void {
   busy = value;
   document.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
-    if (button.closest("dialog")?.open) return;
+    // Keep dialog actions (restart/update/editor) out of the global busy lock.
+    // Otherwise save-flow disables #restart-later/#restart-now before the
+    // notice opens, then skips re-enabling them because the dialog is open.
+    if (button.closest("dialog")) return;
     button.disabled = value;
   });
   document
     .querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")
     .forEach((control) => {
-      if (control.closest("dialog")?.open) return;
+      if (control.closest("dialog")) return;
       control.disabled = value;
     });
   if (!value) {
+    enableRestartNoticeActions();
     required<HTMLButtonElement>("#restore").disabled =
       !dashboard.latestBackup ||
       dashboard.recoveryWarnings > 0 ||

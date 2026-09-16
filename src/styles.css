@@ -1697,6 +1697,18 @@ select:focus {
   border-radius: 18px;
   padding: 24px;
   text-align: center;
+  pointer-events: auto;
+}
+
+.restart-dialog::backdrop {
+  pointer-events: auto;
+}
+
+.restart-dialog-actions,
+.restart-dialog-actions .button {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
 }
 
 .restart-dialog-mark {
