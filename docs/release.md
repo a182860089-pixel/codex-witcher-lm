@@ -188,6 +188,22 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-16 GitHub 0.3.16
+
+[LM Codex Switch v0.3.16](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.16)
+is a Windows-only overlay release. The in-app update dialog buttons can be
+clicked again. Users no longer need to press Esc before choosing Skip this
+version or Update now. Restart and update notices now use a non-modal overlay
+instead of showModal(), so WebView2 no longer swallows pointer events after
+automatic update checks.
+
+Published installer:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.16_Windows-x64-Setup.exe`,
+  SHA-256
+  `e57a7bc0e77dce28eb9096558f18364619a4f1a2a0df2f676f2d84454d331bf5`.
+
 ## 2026-09-16 GitHub 0.3.15
 
 [LM Codex Switch v0.3.15](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.15)

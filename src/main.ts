@@ -341,6 +341,8 @@ let editingCredentialLoaded = false;
 let editingCredentialDirty = false;
 let restartNoticeShown = false;
 let restartNoticePresenting = false;
+let updateNoticePresenting = false;
+let mainWindowShown = !nativeAvailable;
 let busy = false;
 let pendingUpdate: AppUpdateStatus | null = null;
 const AUTO_UPDATE_FIRST_DELAY_MS = 5000;
@@ -917,24 +919,28 @@ app.innerHTML = `
     </div>
   </dialog>
 
-  <dialog id="restart-notice" class="restart-dialog" aria-labelledby="restart-notice-title">
-    <div class="restart-dialog-mark" aria-hidden="true">✓</div>
-    <h2 id="restart-notice-title">快速切换已准备好</h2>
-    <p>重新打开一次 Codex 即可生效。之后保持本软件运行，新对话使用当前模型，已有对话仍走原来的模型。</p>
-    <div class="restart-dialog-actions">
-      <button id="restart-later" class="button button-secondary" type="button" autofocus>稍后</button>
-      <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
+  <dialog id="restart-notice" class="notice-dialog" aria-labelledby="restart-notice-title">
+    <div class="restart-dialog">
+      <div class="restart-dialog-mark" aria-hidden="true">✓</div>
+      <h2 id="restart-notice-title">快速切换已准备好</h2>
+      <p>重新打开一次 Codex 即可生效。之后保持本软件运行，新对话使用当前模型，已有对话仍走原来的模型。</p>
+      <div class="restart-dialog-actions">
+        <button id="restart-later" class="button button-secondary" type="button" autofocus>稍后</button>
+        <button id="restart-now" class="button button-primary" type="button">重新打开 Codex</button>
+      </div>
     </div>
   </dialog>
 
-  <dialog id="update-notice" class="restart-dialog update-dialog" aria-labelledby="update-notice-title">
-    <div class="restart-dialog-mark update-dialog-mark" aria-hidden="true">↑</div>
-    <h2 id="update-notice-title">发现新版本</h2>
-    <p id="update-notice-copy">发布页有可用更新。</p>
-    <pre id="update-notice-notes" class="update-notes" hidden></pre>
-    <div class="restart-dialog-actions">
-      <button id="update-skip" class="button button-secondary" type="button">跳过此版本</button>
-      <button id="update-now" class="button button-primary" type="button">立即更新</button>
+  <dialog id="update-notice" class="notice-dialog" aria-labelledby="update-notice-title">
+    <div class="restart-dialog update-dialog">
+      <div class="restart-dialog-mark update-dialog-mark" aria-hidden="true">↑</div>
+      <h2 id="update-notice-title">发现新版本</h2>
+      <p id="update-notice-copy">发布页有可用更新。</p>
+      <pre id="update-notice-notes" class="update-notes" hidden></pre>
+      <div class="restart-dialog-actions">
+        <button id="update-skip" class="button button-secondary" type="button">跳过此版本</button>
+        <button id="update-now" class="button button-primary" type="button" autofocus>立即更新</button>
+      </div>
     </div>
   </dialog>
 `;
@@ -1008,11 +1014,33 @@ required<HTMLButtonElement>("#refresh").addEventListener("click", refreshDashboa
 required<HTMLButtonElement>("#check-update").addEventListener("click", () => {
   void checkAppUpdate(true);
 });
-required<HTMLButtonElement>("#update-skip").addEventListener("click", () => {
+required<HTMLButtonElement>("#update-skip").addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
   void skipPendingUpdate();
 });
-required<HTMLButtonElement>("#update-now").addEventListener("click", () => {
+required<HTMLButtonElement>("#update-now").addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
   void installPendingUpdate();
+});
+required<HTMLDialogElement>("#restart-notice").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeRestartNotice();
+});
+required<HTMLDialogElement>("#update-notice").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeUpdateNotice();
+});
+required<HTMLDialogElement>("#restart-notice").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeRestartNotice();
+  }
+});
+required<HTMLDialogElement>("#update-notice").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeUpdateNotice();
+  }
 });
 required<HTMLButtonElement>("#nav-dashboard").addEventListener("click", () =>
   switchAppPage("dashboard"),
@@ -3153,11 +3181,32 @@ function closeRestartNotice(): void {
   if (dialog?.open) dialog.close();
 }
 
+function closeUpdateNotice(): void {
+  const dialog = document.querySelector<HTMLDialogElement>("#update-notice");
+  if (dialog?.open) dialog.close();
+}
+
+function enableDialogActions(dialog: HTMLDialogElement): void {
+  dialog.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
+    button.disabled = false;
+  });
+}
+
 function enableRestartNoticeActions(): void {
-  const later = document.querySelector<HTMLButtonElement>("#restart-later");
-  const now = document.querySelector<HTMLButtonElement>("#restart-now");
-  if (later) later.disabled = false;
-  if (now) now.disabled = false;
+  const dialog = document.querySelector<HTMLDialogElement>("#restart-notice");
+  if (dialog) enableDialogActions(dialog);
+}
+
+function enableUpdateNoticeActions(): void {
+  const dialog = document.querySelector<HTMLDialogElement>("#update-notice");
+  if (dialog) enableDialogActions(dialog);
+}
+
+function otherOpenDialog(dialog: HTMLDialogElement): HTMLDialogElement | undefined {
+  return [...document.querySelectorAll("dialog")].find(
+    (item): item is HTMLDialogElement =>
+      item instanceof HTMLDialogElement && item.open && item !== dialog,
+  );
 }
 
 function waitFrames(count = 2): Promise<void> {
@@ -3177,6 +3226,7 @@ function maybeShowRestartNotice(): void {
   if (
     restartNoticeShown ||
     restartNoticePresenting ||
+    !mainWindowShown ||
     !nativeAvailable ||
     !localProxy.running ||
     !localProxy.requiresCodexRestart
@@ -3209,13 +3259,10 @@ async function presentRestartNotice(): Promise<void> {
   enableRestartNoticeActions();
 
   try {
-    // Never stack this modal on the editor. Closing one <dialog> and immediately
-    // showModal()-ing another leaves WebView2's top layer eating pointer events
-    // until Escape; the visible buttons then look dead.
+    // Programmatic <dialog showModal()> leaves WebView2's top layer eating
+    // pointer events until Escape. These notices use a non-modal overlay instead.
     await waitFrames(2);
-    const blocking = [...document.querySelectorAll("dialog")].find(
-      (item) => item instanceof HTMLDialogElement && item.open && item !== dialog,
-    );
+    const blocking = otherOpenDialog(dialog);
     if (blocking) {
       if (blocking.dataset.restartOnClose !== "1") {
         blocking.dataset.restartOnClose = "1";
@@ -3230,12 +3277,9 @@ async function presentRestartNotice(): Promise<void> {
       }
       return;
     }
-    if (!dialog.open) dialog.showModal();
-    dialog.inert = false;
-    dialog.removeAttribute("inert");
-    enableRestartNoticeActions();
-    restartNoticeShown = true;
-    required<HTMLButtonElement>("#restart-later").focus();
+    if (await presentNoticeDialog(dialog, "#restart-later")) {
+      restartNoticeShown = true;
+    }
   } finally {
     restartNoticePresenting = false;
   }
@@ -3387,10 +3431,54 @@ function startAutomaticUpdateChecks(): void {
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) presentPendingUpdateIfNeeded();
   });
-  if (!nativeAvailable) return;
+  if (!nativeAvailable) {
+    mainWindowShown = true;
+    return;
+  }
   void listen("main-window-shown", () => {
-    window.setTimeout(presentPendingUpdateIfNeeded, 200);
-  }).catch(() => undefined);
+    mainWindowShown = true;
+    window.setTimeout(() => {
+      void recoverNoticeDialogs();
+    }, 200);
+  }).catch(() => {
+    mainWindowShown = true;
+  });
+}
+
+async function recoverNoticeDialogs(): Promise<void> {
+  const update = document.querySelector<HTMLDialogElement>("#update-notice");
+  const restart = document.querySelector<HTMLDialogElement>("#restart-notice");
+  if (update?.open) {
+    update.close();
+    await waitFrames(2);
+  }
+  if (restart?.open) {
+    restart.close();
+    await waitFrames(2);
+  }
+  presentPendingUpdateIfNeeded();
+  maybeShowRestartNotice();
+}
+
+async function presentNoticeDialog(
+  dialog: HTMLDialogElement,
+  focusSelector: string,
+): Promise<boolean> {
+  enableDialogActions(dialog);
+  await waitFrames(2);
+  if (otherOpenDialog(dialog)) return false;
+  if (dialog.open) {
+    dialog.close();
+    await waitFrames(2);
+  }
+  dialog.inert = false;
+  dialog.removeAttribute("inert");
+  dialog.show();
+  dialog.inert = false;
+  dialog.removeAttribute("inert");
+  enableDialogActions(dialog);
+  dialog.querySelector<HTMLButtonElement>(focusSelector)?.focus();
+  return true;
 }
 
 function scheduleAutoUpdateCheck(delayMs: number): void {
@@ -3402,16 +3490,13 @@ function scheduleAutoUpdateCheck(delayMs: number): void {
 }
 
 function presentPendingUpdateIfNeeded(): void {
-  if (busy || restartNoticePresenting) return;
+  if (!mainWindowShown || busy || restartNoticePresenting || updateNoticePresenting) return;
   const status = pendingUpdate;
   if (!status?.updateAvailable || status.skipped) return;
   const dialog = document.querySelector<HTMLDialogElement>("#update-notice");
   if (!dialog || dialog.open) return;
   if (document.hidden) return;
-  const otherOpen = [...document.querySelectorAll("dialog")].some(
-    (item) => item instanceof HTMLDialogElement && item.open && item !== dialog,
-  );
-  if (otherOpen) return;
+  if (otherOpenDialog(dialog)) return;
   showUpdateDialog(status);
 }
 
@@ -3479,13 +3564,32 @@ function showUpdateDialog(status: AppUpdateStatus): void {
   notes.hidden = !body;
   notes.textContent = body;
   const dialog = required<HTMLDialogElement>("#update-notice");
-  if (!dialog.open) dialog.showModal();
+  const blocking = otherOpenDialog(dialog);
+  if (blocking) {
+    if (blocking.dataset.updateOnClose !== "1") {
+      blocking.dataset.updateOnClose = "1";
+      blocking.addEventListener(
+        "close",
+        () => {
+          delete blocking.dataset.updateOnClose;
+          presentPendingUpdateIfNeeded();
+        },
+        { once: true },
+      );
+    }
+    return;
+  }
+  if (updateNoticePresenting) return;
+  updateNoticePresenting = true;
+  void presentNoticeDialog(dialog, "#update-now").finally(() => {
+    updateNoticePresenting = false;
+  });
 }
 
 async function skipPendingUpdate(): Promise<void> {
   const status = pendingUpdate;
   pendingUpdate = status ? { ...status, skipped: true } : null;
-  required<HTMLDialogElement>("#update-notice").close();
+  closeUpdateNotice();
   if (!status) return;
   if (!nativeAvailable) {
     setStatus(`已跳过 ${status.latestVersion}`, "info");
@@ -3500,7 +3604,7 @@ async function skipPendingUpdate(): Promise<void> {
 async function installPendingUpdate(): Promise<void> {
   const status = pendingUpdate;
   if (!status) return;
-  required<HTMLDialogElement>("#update-notice").close();
+  closeUpdateNotice();
   const url = status.downloadUrl || status.releaseUrl;
   if (!nativeAvailable) {
     window.open(url, "_blank", "noopener");
@@ -3558,6 +3662,7 @@ function setBusy(value: boolean): void {
     });
   if (!value) {
     enableRestartNoticeActions();
+    enableUpdateNoticeActions();
     required<HTMLButtonElement>("#restore").disabled =
       !dashboard.latestBackup ||
       dashboard.recoveryWarnings > 0 ||
