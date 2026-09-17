@@ -227,18 +227,21 @@ through Clash; a newly applied bypass requires a full Codex restart. Response
 status and safe headers are preserved, while hop-by-hop response headers and
 `Set-Cookie` are removed. Successful response bodies, including SSE, are
 forwarded as byte streams rather than buffered to completion. For
-`text/event-stream` responses the proxy inserts SSE comment heartbeats
-(`:\n\n`) every 15 seconds, but only at complete event boundaries, so a long
-silent reasoning turn does not look idle to Codex. Upstream TCP keepalive is
-10 seconds so local HTTP proxies such as Clash are less likely to drop the
-provider connection. If a Responses turn would complete with assistant text
-and no `function_call` while tools remain available, the proxy holds that
-text, keeps the original `input` and `previous_response_id`, and retries once
-with `tool_choice=required`. A Grok HTTP 400 does not replace
-`previous_response_id` with the just-completed response; a second compact
-Continue retry restores the cached thread tool list. 4xx/5xx bodies
-are bounded and normalized to `{ "error": { "message", "type": "api_error" } }`
-so Codex can display the upstream failure.
+`text/event-stream` responses the proxy inserts `response.keep_alive` SSE
+events every 15 seconds, but only at complete event boundaries, so Codex's
+event-level idle timer stays armed during a long silent reasoning turn.
+Comment lines (`:\n\n`) are not used because Codex's EventSource parser
+discards them. Upstream TCP keepalive is 10 seconds so local HTTP proxies
+such as Clash are less likely to drop the provider connection. If a
+Responses turn would complete with assistant text and no `function_call`
+while tools remain available, the proxy holds that text and retries: first
+the original Responses body, then a compact Responses body that drops
+`previous_response_id`, then Chat Completions with `tool_choice=required`
+translated back into Responses `function_call` events. Leftover status
+text is rephased as `phase: "commentary"` so Codex does not treat it as a
+final answer. 4xx/5xx bodies are bounded and normalized to
+`{ "error": { "message", "type": "api_error" } }` so Codex can display the
+upstream failure.
 
 The local `/models` response is generated from the checked models on the active
 Route and includes an ETag. It is a wire response, not a

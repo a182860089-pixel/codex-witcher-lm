@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | macOS | Apple silicon | Version 0.3.4 passed native Web/Rust/Tauri tests plus ad-hoc DMG build and install/remove smoke on `macos-15`; the published DMG was checksum-verified after download | Add Developer ID signing, notarization, stapling, and run the complete real-host switching lifecycle |
 | macOS | Intel | Version 0.3.4 passed the same native suite plus ad-hoc DMG build and install/remove smoke on `macos-15-intel`; the published DMG was checksum-verified after download | Run the same signed and notarized real-host lifecycle |
-| Windows | x86_64 | Version 0.3.18 is the current published Windows installer from [`a182860089-pixel/codex-witcher-lm`](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.18) (`Codex.Provider.Switcher_0.3.18_Windows-x64-Setup.exe`, SHA-256 `849e7a581ae0de4838406c22633e98f6bdf3460e4fc1b816e2b901474ba33355`). It keeps SSE streams alive with comment heartbeats, 10s upstream TCP keepalive, and `cps-local` `stream_idle_timeout_ms = 600000`, and retries grok-4.6 one-line status turns with `tool_choice=required` instead of letting Codex Desktop end the turn. Version 0.3.16 remains the previous published installer (`Codex.Provider.Switcher_0.3.16_Windows-x64-Setup.exe`, SHA-256 `e57a7bc0e77dce28eb9096558f18364619a4f1a2a0df2f676f2d84454d331bf5`). Version 0.3.4 also passed public native Web/Rust/Tauri tests and NSIS package smoke | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
+| Windows | x86_64 | Version 0.3.19 is the current published Windows installer from [`a182860089-pixel/codex-witcher-lm`](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.19) (`Codex.Provider.Switcher_0.3.19_Windows-x64-Setup.exe`, SHA-256 `9f49e71939a98c988392dd3e414a8f7859179dee4b657053f3b23dffa52f00f4`). It keeps SSE streams alive with `response.keep_alive` heartbeats, collapses repeated grok-4.6 status text, falls back to Chat Completions with only `exec_command` / `apply_patch` / `wait`, and rewrites `*** Begin Patch ***` to Codex's apply_patch header. Version 0.3.18 remains the previous published installer (`Codex.Provider.Switcher_0.3.18_Windows-x64-Setup.exe`, SHA-256 `849e7a581ae0de4838406c22633e98f6bdf3460e4fc1b816e2b901474ba33355`). Version 0.3.4 also passed public native Web/Rust/Tauri tests and NSIS package smoke | Complete interactive official OAuth switching, DACL/durability, cleanup/uninstall, signing, and a live turn on an upstream model with an available channel |
 | Windows | ARM64 | Not claimed in MVP | Add a native runner and signed artifact before support |
 | Linux | x86_64 | Development host only; portable proxy unit/integration tests exist in source | No Codex Desktop product target |
 
@@ -20,11 +20,13 @@ The MVP supports providers that expose an OpenAI Responses-compatible base URL.
 Remote endpoints must use HTTPS. Plain HTTP is accepted only for loopback
 development endpoints. The 0.2.0 proxy forwards HTTP Responses and compact
 requests, including SSE bodies; it deliberately advertises
-`supports_websockets = false` and does not translate chat-completions or
-Responses WebSocket protocols. From 0.3.18 the loopback provider also writes
-`stream_idle_timeout_ms = 600000` and `stream_max_retries = 2`, and the
-proxy keeps SSE comment heartbeats on event boundaries during long silent
-reasoning turns.
+`supports_websockets = false` and does not accept chat-completions or
+Responses WebSocket protocols from Codex. From 0.3.18 the loopback provider
+also writes `stream_idle_timeout_ms = 600000` and `stream_max_retries = 2`.
+The proxy emits `response.keep_alive` SSE events on event boundaries during
+long silent reasoning turns. If Responses still answers a Continue turn with
+status text and no tool call, the proxy retries on Chat Completions internally
+and translates any `tool_calls` back into Responses SSE.
 
 Given an unversioned Base URL, the app discovers models from `/v1/models` and
 then `/models`; a versioned API path uses its adjacent model endpoint. The

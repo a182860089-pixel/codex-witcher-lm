@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.18"><strong>下载 v0.3.18</strong></a>
+  <a href="https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.19"><strong>下载 v0.3.19</strong></a>
   ·
   <a href="#三步开始使用">使用指南</a>
   ·
@@ -53,11 +53,11 @@ Responses-compatible 服务、保存常用模型，并在之后一键切换。
 ## 下载与安装
 
 > 当前仓库是 [`a182860089-pixel/codex-witcher-lm`](https://github.com/a182860089-pixel/codex-witcher-lm)。
-> 0.3.18 只发布 Windows x64 安装包，尚未代码签名。安装前请核对 Release 中的 SHA-256。
+> 0.3.19 只发布 Windows x64 安装包，尚未代码签名。安装前请核对 Release 中的 SHA-256。
 
 | 系统 | 安装包 | 安装方法 |
 | --- | --- | --- |
-| Windows x64（已在 Windows 11 验证） | [下载 EXE](https://github.com/a182860089-pixel/codex-witcher-lm/releases/download/v0.3.18/Codex.Provider.Switcher_0.3.18_Windows-x64-Setup.exe) | 双击安装；若 SmartScreen 出现，核对校验值后选择“更多信息 → 仍要运行” |
+| Windows x64（已在 Windows 11 验证） | [下载 EXE](https://github.com/a182860089-pixel/codex-witcher-lm/releases/download/v0.3.19/Codex.Provider.Switcher_0.3.19_Windows-x64-Setup.exe) | 双击安装；若 SmartScreen 出现，核对校验值后选择“更多信息 → 仍要运行” |
 | Apple silicon Mac | 本仓库暂未发布 | 等后续 Release 提供 DMG |
 | Intel Mac | 本仓库暂未发布 | 等后续 Release 提供 DMG |
 
@@ -80,12 +80,12 @@ Codex Desktop 配置和系统凭据库，因此不支持 iPhone/iPad，也没有
 Windows PowerShell：
 
 ```powershell
-Get-FileHash '.\Codex.Provider.Switcher_0.3.18_Windows-x64-Setup.exe' -Algorithm SHA256
+Get-FileHash '.\Codex.Provider.Switcher_0.3.19_Windows-x64-Setup.exe' -Algorithm SHA256
 ```
 
-当前本地 Windows 安装包 SHA-256：`849e7a581ae0de4838406c22633e98f6bdf3460e4fc1b816e2b901474ba33355`。
+当前本地 Windows 安装包 SHA-256：`9f49e71939a98c988392dd3e414a8f7859179dee4b657053f3b23dffa52f00f4`。
 
-将结果与 [v0.3.18 Release](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.18) 中的说明对比。
+将结果与 [v0.3.19 Release](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.19) 中的说明对比。
 
 </details>
 

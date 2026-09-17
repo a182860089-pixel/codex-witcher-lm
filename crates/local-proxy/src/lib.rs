@@ -10,6 +10,9 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 mod agent_loop;
+mod mcp_compat;
+
+pub use agent_loop::SSE_KEEP_ALIVE_HEARTBEAT;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,7 +58,6 @@ const DEFAULT_UPSTREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 const DEFAULT_UPSTREAM_RETRY_MAX_ELAPSED: Duration = Duration::from_secs(90);
 const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(10);
 const DEFAULT_SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-const SSE_COMMENT_HEARTBEAT: &[u8] = b":\n\n";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 300;
 const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.4");
@@ -483,8 +485,8 @@ pub struct ProxyStartOptions {
     /// Optional credential-free JSON file used to keep conversation routes
     /// across Switcher restarts and in-place upgrades.
     pub bindings_path: Option<PathBuf>,
-    /// Interval for SSE comment heartbeats (`:\n\n`) inserted only at event
-    /// boundaries. `Duration::ZERO` disables heartbeats.
+    /// Interval for `response.keep_alive` SSE heartbeats inserted only at
+    /// event boundaries. `Duration::ZERO` disables heartbeats.
     pub sse_heartbeat_interval: Duration,
 }
 
@@ -1985,6 +1987,7 @@ async fn proxy_request(
         last_byte_was_lf: true,
         parse_sse: emit_sse_heartbeats,
         allow_nudge: allow_nudge && emit_sse_heartbeats,
+        mcp: mcp_compat::McpRewriteBuffer::default(),
         force_nudge: agent_loop::should_force_nudge(&nudge_template),
         nudge_used: false,
         nudge_attempts: 0,
@@ -2023,7 +2026,7 @@ async fn proxy_request(
                 {
                     HeartbeatPoll::Heartbeat => {
                         return Some((
-                            Ok(Bytes::from_static(SSE_COMMENT_HEARTBEAT)),
+                            Ok(Bytes::from_static(agent_loop::SSE_KEEP_ALIVE_HEARTBEAT)),
                             (upstream_stream, forward, false),
                         ));
                     }
@@ -2064,10 +2067,11 @@ async fn proxy_request(
                             continue;
                         }
                         forward.flush_held_completed();
-                        if let Some(bytes) = forward.pending.pop_front() {
+                        if let Some(bytes) = forward.take_pending() {
                             (forward.last_event_complete, forward.last_byte_was_lf) =
                                 sse_boundary_after(true, true, &bytes);
-                            return Some((Ok(bytes), (upstream_stream, forward, false)));
+                            forward.finish_log();
+                            return Some((Ok(bytes), (upstream_stream, forward, true)));
                         }
                         forward.finish_log();
                         return None;
@@ -2158,6 +2162,7 @@ struct SseForward {
     parse_sse: bool,
     allow_nudge: bool,
     force_nudge: bool,
+    mcp: mcp_compat::McpRewriteBuffer,
     nudge_used: bool,
     nudge_attempts: u8,
     in_continuation: bool,
@@ -2184,11 +2189,14 @@ impl SseForward {
         }
         self.sse_tail.extend_from_slice(bytes);
         for event in agent_loop::drain_sse_events(&mut self.sse_tail) {
-            self.ingest_sse_event(event);
+            for event in self.mcp.ingest(event) {
+                self.ingest_sse_event(event);
+            }
         }
     }
 
     fn ingest_sse_event(&mut self, mut event: Vec<u8>) {
+        event = agent_loop::rewrite_apply_patch_event(&event);
         agent_loop::note_sse_event(&mut self.agent, &event);
         if self.in_continuation {
             if let Some(id) = agent_loop::sse_response_id(&event)
@@ -2231,13 +2239,37 @@ impl SseForward {
         self.pending.push_back(Bytes::from(event));
     }
 
+    fn take_pending(&mut self) -> Option<Bytes> {
+        let first = self.pending.pop_front()?;
+        if self.pending.is_empty() {
+            return Some(first);
+        }
+        let mut all = first.to_vec();
+        while let Some(bytes) = self.pending.pop_front() {
+            all.extend_from_slice(&bytes);
+        }
+        Some(Bytes::from(all))
+    }
+
     async fn try_start_nudge(&mut self, upstream_stream: &mut UpstreamByteStream) -> bool {
-        const MAX_NUDGE_ATTEMPTS: u8 = 2;
+        const MAX_NUDGE_ATTEMPTS: u8 = 3;
         if !self.allow_nudge
             || self.nudge_attempts >= MAX_NUDGE_ATTEMPTS
             || !self.agent.should_nudge(self.force_nudge)
         {
             return false;
+        }
+        *upstream_stream = Box::pin(stream::empty());
+        if self.nudge_attempts >= 2 {
+            let body = agent_loop::build_compact_nudge_request(&self.nudge_template);
+            return match self.post_chat_nudge(&body).await {
+                Ok((sse, detail)) => self.adopt_chat_sse(upstream_stream, sse, detail),
+                Err(error) => {
+                    self.nudge_attempts = self.nudge_attempts.saturating_add(1);
+                    self.note_nudge_failure(&error);
+                    false
+                }
+            };
         }
         let status_text = self.agent.status_text();
         let mut body = if self.nudge_attempts == 0 {
@@ -2315,6 +2347,117 @@ impl SseForward {
         }
     }
 
+    async fn post_chat_nudge(
+        &self,
+        responses_body: &Value,
+    ) -> Result<(Vec<u8>, &'static str), String> {
+        let response_id = self
+            .agent
+            .response_id
+            .clone()
+            .unwrap_or_else(|| "resp_cps_chat".to_string());
+        let mut last_error = String::from("chat fallback failed");
+        if let Some(url) = agent_loop::chat_completions_url(&self.nudge_url) {
+            let attempts = [
+                (
+                    "chat",
+                    agent_loop::responses_to_chat_request(responses_body),
+                ),
+                (
+                    "chat forced",
+                    agent_loop::responses_to_chat_request_forced(responses_body),
+                ),
+            ];
+            for (label, chat_body) in attempts {
+                match self
+                    .post_chat_completion(&url, &chat_body, &response_id)
+                    .await
+                {
+                    Ok(sse) => return Ok((sse, "agent nudge chat")),
+                    Err(error) => {
+                        last_error = format!("{label} {error}");
+                    }
+                }
+            }
+        } else {
+            last_error = "chat completions url could not be derived".to_string();
+        }
+        if let Some(sse) = agent_loop::synthetic_tool_call_sse(responses_body, &response_id) {
+            return Ok((sse, "agent nudge synthetic"));
+        }
+        Err(truncate_agent_error(&last_error))
+    }
+
+    async fn post_chat_completion(
+        &self,
+        url: &Url,
+        chat_body: &Value,
+        response_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        let encoded = serde_json::to_vec(chat_body)
+            .map_err(|_| "chat body could not be encoded".to_string())?;
+        match self
+            .pin_state
+            .client
+            .post(url.clone())
+            .headers(self.nudge_headers.clone())
+            .body(encoded)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let content_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|_| "chat body could not be read".to_string())?;
+                let chat = agent_loop::parse_chat_completion_body(&bytes, &content_type)
+                    .ok_or_else(|| "chat body was not a completion".to_string())?;
+                agent_loop::chat_completion_to_responses_sse(&chat, response_id)
+                    .ok_or_else(|| "completion had no tool calls".to_string())
+            }
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.bytes().await.unwrap_or_default();
+                let message =
+                    json_error_message(&bytes).unwrap_or_else(|| format!("HTTP {status}"));
+                Err(truncate_agent_error(&format!("{status}: {message}")))
+            }
+            Err(error) => Err(format!("transport: {}", classify_upstream_error(&error))),
+        }
+    }
+
+    fn adopt_chat_sse(
+        &mut self,
+        upstream_stream: &mut UpstreamByteStream,
+        sse: Vec<u8>,
+        detail: &str,
+    ) -> bool {
+        self.nudge_attempts = self.nudge_attempts.saturating_add(1);
+        self.nudge_used = true;
+        self.in_continuation = true;
+        self.held_messages.clear();
+        self.agent.reset_output();
+        self.sse_tail.clear();
+        let _ = self.mcp.flush();
+        self.pin_state.update_request_log(&self.log_id, |log| {
+            log.agent_nudged = true;
+            log.completed_without_tools = true;
+            log.details = Some(match log.details.take() {
+                Some(existing) => format!("{existing}; {detail}"),
+                None => detail.to_string(),
+            });
+        });
+        append_agent_loop_log(&format!("{} {detail}", self.log_id));
+        *upstream_stream = Box::pin(stream::once(async move { Ok(Bytes::from(sse)) }));
+        true
+    }
+
     fn adopt_nudge_stream(
         &mut self,
         upstream_stream: &mut UpstreamByteStream,
@@ -2328,6 +2471,7 @@ impl SseForward {
         self.held_messages.clear();
         self.agent.reset_output();
         self.sse_tail.clear();
+        let _ = self.mcp.flush();
         let detail = match recovered_from {
             Some(error) => format!(
                 "agent nudge {} after retrying without previous_response_id ({error})",
@@ -2361,14 +2505,34 @@ impl SseForward {
 
     fn flush_held_messages(&mut self) {
         let messages = std::mem::take(&mut self.held_messages);
+        if self.agent.saw_function_call {
+            return;
+        }
+        let text = agent_loop::collapse_repeated_text(self.agent.status_text());
+        let as_commentary = self.nudge_used || agent_loop::is_status_one_liner(&text);
+        if as_commentary {
+            for event in agent_loop::commentary_output_events(&text) {
+                self.queue_forward(event);
+            }
+            return;
+        }
         for event in messages {
             self.queue_forward(event);
         }
     }
 
     fn flush_held_completed(&mut self) {
+        for event in self.mcp.flush() {
+            self.ingest_sse_event(event);
+        }
         self.flush_held_messages();
         if let Some(event) = self.agent.held_completed.take() {
+            let event =
+                if self.nudge_used || agent_loop::is_status_one_liner(self.agent.status_text()) {
+                    agent_loop::rephase_event_as_commentary(&event)
+                } else {
+                    event
+                };
             self.queue_forward(event);
         }
         if !self.sse_tail.is_empty() {
@@ -2503,6 +2667,17 @@ fn append_agent_loop_log(line: &str) {
     {
         use std::io::Write;
         let _ = writeln!(file, "{line}");
+    }
+}
+
+fn truncate_agent_error(text: &str) -> String {
+    const MAX: usize = 240;
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_none() {
+        head
+    } else {
+        format!("{head}...")
     }
 }
 

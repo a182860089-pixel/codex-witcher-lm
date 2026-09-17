@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use codex_provider_switcher_local_proxy::{
     BearerToken, CodexModelsResponse, LocalProxy, ModelDescriptor, ProxyHandle, ProxyHealth,
-    ProxyStartOptions, RouteConfig,
+    ProxyStartOptions, RouteConfig, SSE_KEEP_ALIVE_HEARTBEAT,
 };
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -1028,7 +1028,7 @@ async fn idle_then_sse_provider() -> Response {
 }
 
 #[tokio::test]
-async fn inserts_sse_comment_heartbeats_during_upstream_idle() {
+async fn inserts_sse_keep_alive_heartbeats_during_upstream_idle() {
     let upstream =
         TestServer::spawn(Router::new().route("/v1/responses", post(idle_then_sse_provider))).await;
     let proxy = proxy_with_route_and_options(
@@ -1058,7 +1058,7 @@ async fn inserts_sse_comment_heartbeats_during_upstream_idle() {
         .expect("heartbeat arrived while upstream was idle")
         .expect("heartbeat item")
         .expect("heartbeat bytes");
-    assert_eq!(first.as_ref(), b":\n\n");
+    assert_eq!(first.as_ref(), SSE_KEEP_ALIVE_HEARTBEAT);
 
     let mut all = first.to_vec();
     while let Some(chunk) = body.next().await {
@@ -1254,7 +1254,7 @@ async fn continue_with_tools_forces_tool_choice() {
             .unwrap()
             .contains("function_call")
     );
-    assert_eq!(
+    assert_ne!(
         requests[0].body["input"]
             .as_array()
             .unwrap()
@@ -1321,7 +1321,7 @@ async fn continue_with_trailing_environment_context_forces_tool_choice() {
 }
 
 #[tokio::test]
-async fn tool_result_followup_forces_tool_choice() {
+async fn tool_result_followup_does_not_force_tool_choice() {
     let capture = Arc::new(CaptureState::default());
     let upstream = TestServer::spawn(
         Router::new()
@@ -1354,10 +1354,10 @@ async fn tool_result_followup_forces_tool_choice() {
         .await
         .expect("tool result response");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(capture.requests()[0].body["tool_choice"], "required");
+    assert!(capture.requests()[0].body.get("tool_choice").is_none());
     assert_eq!(
         proxy.request_logs()[0].agent_guard.as_deref(),
-        Some("force_tools")
+        Some("instructions")
     );
 
     proxy.shutdown().await.unwrap();
@@ -1460,6 +1460,37 @@ fn sse_event(value: Value) -> Vec<u8> {
     event
 }
 
+fn sse_read_thread_args(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        let Some(data) = block.lines().find_map(|line| line.strip_prefix("data:")) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        let mut items = Vec::new();
+        if let Some(item) = json.get("item") {
+            items.push(item.clone());
+        }
+        if let Some(output) = json.pointer("/response/output").and_then(Value::as_array) {
+            items.extend(output.iter().cloned());
+        }
+        for item in items {
+            if item.get("name").and_then(Value::as_str) != Some("read_thread") {
+                continue;
+            }
+            let Some(args) = item.get("arguments").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Ok(parsed) = serde_json::from_str::<Value>(args) {
+                out.push(parsed);
+            }
+        }
+    }
+    out
+}
+
 fn collapse_first_sse() -> Vec<u8> {
     let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_orig12345"}}));
     body.extend(sse_event(json!({
@@ -1509,6 +1540,51 @@ fn tool_only_sse() -> Vec<u8> {
     body.extend(sse_event(
         json!({"type":"response.completed","response":{"id":"resp_tool12345"}}),
     ));
+    body
+}
+
+fn hallucinated_codex_app_mcp_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_mcp12345"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "name": "read_mcp_resource",
+            "call_id": "call-eaaa1795-7073-4fad-b072-3088d0f4038c-5",
+            "arguments": "{\"server\":\"codex-app-tools\",\"uri\":\"thread://01a0a9ef-acff-7fc2-a141-04e25f2bdac1\"}"
+        }
+    })));
+    body.extend(sse_event(json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "name": "read_thread",
+            "namespace": "mcp__codex_app",
+            "call_id": "call-9b1fe36e-660b-4a56-b021-0cbcf814e7a5-8",
+            "arguments": "{\"threadId\":\"01a0a9ef-acff-7fc2-a141-04e25f2bdac1\",\"turnLimit\":20,\"includeOutputs\":true}"
+        }
+    })));
+    body.extend(sse_event(json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_mcp12345",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "read_mcp_resource",
+                    "call_id": "call-eaaa1795-7073-4fad-b072-3088d0f4038c-5",
+                    "arguments": "{\"server\":\"codex-app-tools\",\"uri\":\"thread://01a0a9ef-acff-7fc2-a141-04e25f2bdac1\"}"
+                },
+                {
+                    "type": "function_call",
+                    "name": "read_thread",
+                    "namespace": "mcp__codex_app",
+                    "call_id": "call-9b1fe36e-660b-4a56-b021-0cbcf814e7a5-8",
+                    "arguments": "{\"threadId\":\"01a0a9ef-acff-7fc2-a141-04e25f2bdac1\",\"turnLimit\":20,\"includeOutputs\":true}"
+                }
+            ]
+        }
+    })));
     body
 }
 
@@ -1602,6 +1678,14 @@ async fn tool_call_sse_provider(
     sse_body(tool_only_sse())
 }
 
+async fn codex_app_mcp_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    sse_body(hallucinated_codex_app_mcp_sse())
+}
+
 async fn greeting_sse_provider(
     State(state): State<Arc<AgentSseState>>,
     request: Request<Body>,
@@ -1668,7 +1752,7 @@ async fn sse_one_liner_without_tools_issues_one_continuation() {
             .iter()
             .filter(|item| item["role"] == "developer")
             .count(),
-        2
+        1
     );
 
     let log = &proxy.request_logs()[0];
@@ -1759,6 +1843,67 @@ async fn sse_function_call_does_not_nudge() {
     assert_eq!(state.requests().len(), 1);
     assert!(!proxy.request_logs()[0].agent_nudged);
     assert!(!proxy.request_logs()[0].completed_without_tools);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_rewrites_hallucinated_codex_app_mcp_resource() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(codex_app_mcp_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-mcp-compat",
+        "grok-4.6",
+        vec![model("grok-4.6")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "grok-4.6",
+            "tools": [
+                {"type": "function", "name": "exec_command"},
+                {"type": "function", "name": "list_threads", "namespace": "mcp__codex_app"},
+                {"type": "function", "name": "read_thread", "namespace": "mcp__codex_app"},
+                {"type": "function", "name": "read_mcp_resource"}
+            ],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "看看上一段对话做到哪了"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("mcp rewrite SSE response");
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("read_thread"));
+    assert!(text.contains("mcp__codex_app"));
+    assert!(text.contains("01a0a9ef-acff-7fc2-a141-04e25f2bdac1"));
+    assert!(!text.contains("read_mcp_resource"));
+    assert!(!text.contains("codex-app-tools"));
+    let thread_args = sse_read_thread_args(&text);
+    assert!(!thread_args.is_empty());
+    assert!(thread_args.iter().all(|args| args["turnLimit"] == 10));
+    assert!(
+        thread_args
+            .iter()
+            .all(|args| args["threadId"] == "01a0a9ef-acff-7fc2-a141-04e25f2bdac1")
+    );
+
+    let requests = state.requests();
+    assert_eq!(requests.len(), 1);
+    let instructions = requests[0].body["instructions"].as_str().unwrap();
+    assert!(instructions.contains("codex_app"));
+    assert!(instructions.contains("read_mcp_resource"));
 
     proxy.shutdown().await.unwrap();
 }
@@ -1936,12 +2081,272 @@ async fn sse_second_one_liner_issues_compact_nudge() {
     assert!(text.contains("function_call"));
     let requests = state.requests();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].body["previous_response_id"], "resp_prev12345");
+    assert!(requests[2].body.get("previous_response_id").is_none());
     let compact_input = requests[2].body["input"].as_array().unwrap();
-    assert_eq!(compact_input.len(), 2);
+    assert_eq!(compact_input.len(), 3);
     assert_eq!(compact_input[0]["content"][0]["text"], "继续完成任务");
-    assert_eq!(compact_input[1]["role"], "developer");
+    assert_eq!(compact_input[2]["role"], "developer");
     assert!(proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn always_collapse_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    sse_body(collapse_first_sse())
+}
+
+async fn chat_tool_call_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    Json(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_chat1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }
+                }]
+            }
+        }]
+    }))
+    .into_response()
+}
+
+async fn chat_text_only_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    Json(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "对着现成截图改，不再空转。"
+            }
+        }]
+    }))
+    .into_response()
+}
+
+async fn chat_422_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({"error": {"message": "Upstream error: 422"}})),
+    )
+        .into_response()
+}
+
+fn continue_with_tools_body() -> Value {
+    json!({
+        "model": "model-sse-chat",
+        "previous_response_id": "resp_prev12345",
+        "tools": [{"type": "function", "name": "exec_command"}],
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续完成任务"}]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<environment_context>\n  <cwd>D:/proj</cwd>\n</environment_context>"
+                }]
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn sse_third_one_liner_falls_back_to_chat_tool_calls() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(always_collapse_sse_provider))
+            .route("/v1/chat/completions", post(chat_tool_call_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-chat",
+        "model-sse-chat",
+        vec![model("model-sse-chat")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&continue_with_tools_body())
+        .send()
+        .await
+        .expect("chat fallback response");
+
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    assert!(text.contains("exec_command"));
+    assert!(text.contains("call_chat1"));
+    assert!(text.contains("resp_orig12345"));
+    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert_eq!(text.matches("response.created").count(), 1);
+    assert_eq!(text.matches("response.completed").count(), 1);
+
+    let requests = state.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/v1/responses")
+            .count(),
+        3
+    );
+    let chat = requests
+        .iter()
+        .find(|request| request.path == "/v1/chat/completions")
+        .expect("chat completions request");
+    assert_eq!(chat.body["tool_choice"], "required");
+    assert_eq!(chat.body["stream"], false);
+    assert!(chat.body.get("previous_response_id").is_none());
+    assert_eq!(chat.body["messages"][0]["role"], "system");
+    assert!(chat.body["messages"].as_array().unwrap().len() <= 4);
+    assert!(proxy.request_logs()[0].agent_nudged);
+    assert!(
+        proxy.request_logs()[0]
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("agent nudge chat"))
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_failed_chat_fallback_emits_synthetic_tool_call() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(always_collapse_sse_provider))
+            .route("/v1/chat/completions", post(chat_text_only_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-chat-fail",
+        "model-sse-chat-fail",
+        vec![model("model-sse-chat-fail")],
+    ))
+    .await;
+
+    let mut body = continue_with_tools_body();
+    body["model"] = json!("model-sse-chat-fail");
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&body)
+        .send()
+        .await
+        .expect("failed chat fallback response");
+
+    let bytes = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    assert!(text.contains("call_cps_synthetic"));
+    assert!(text.contains("exec_command"));
+    assert!(!text.contains("对着现成截图改，不再空转。"));
+    let requests = state.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/v1/responses")
+            .count(),
+        3
+    );
+    let chat_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .collect();
+    assert_eq!(chat_requests.len(), 2);
+    assert_eq!(chat_requests[0].body["tool_choice"], "required");
+    assert_eq!(
+        chat_requests[1].body["tool_choice"]["function"]["name"],
+        "exec_command"
+    );
+    let log = &proxy.request_logs()[0];
+    assert!(log.agent_nudged);
+    assert!(
+        log.details
+            .as_deref()
+            .is_some_and(|details| details.contains("agent nudge synthetic"))
+    );
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_chat_422_emits_synthetic_tool_call() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(always_collapse_sse_provider))
+            .route("/v1/chat/completions", post(chat_422_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-chat-422",
+        "model-sse-chat-422",
+        vec![model("model-sse-chat-422")],
+    ))
+    .await;
+
+    let mut body = continue_with_tools_body();
+    body["model"] = json!("model-sse-chat-422");
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&body)
+        .send()
+        .await
+        .expect("chat 422 fallback response");
+
+    let bytes = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    assert!(text.contains("call_cps_synthetic"));
+    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert_eq!(
+        state
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .count(),
+        2
+    );
+    assert!(
+        proxy.request_logs()[0]
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("agent nudge synthetic"))
+    );
 
     proxy.shutdown().await.unwrap();
 }
@@ -2007,9 +2412,11 @@ async fn continue_without_tools_restores_cached_tools() {
             .is_some_and(|tools| !tools.is_empty())
     );
     assert_eq!(requests[1].body["tool_choice"], "required");
-    assert_eq!(
-        proxy.request_logs()[0].agent_guard.as_deref(),
-        Some("force_tools")
+    assert!(
+        proxy
+            .request_logs()
+            .iter()
+            .any(|log| log.agent_guard.as_deref() == Some("force_tools"))
     );
 
     proxy.shutdown().await.unwrap();

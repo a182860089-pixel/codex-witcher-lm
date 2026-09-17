@@ -188,6 +188,23 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-17 GitHub 0.3.19
+
+[LM Codex Switch v0.3.19](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.19)
+is a Windows-only overlay release. Grok status sentences are collapsed to one
+copy and are not replayed when a tool call is already in the same response.
+Chat Completions fallback advertises only `exec_command`, `apply_patch`, and
+`wait`, then translates `tool_calls` back into Responses SSE. apply_patch
+payloads that start with `*** Begin Patch ***` are rewritten to Codex's
+`*** Begin Patch` header. SSE idle keep-alives use `response.keep_alive`
+because Codex's EventSource parser discards comment lines.
+
+Installer filename:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.19_Windows-x64-Setup.exe`.
+  SHA-256 `9f49e71939a98c988392dd3e414a8f7859179dee4b657053f3b23dffa52f00f4`.
+
 ## 2026-09-17 GitHub 0.3.18
 
 [LM Codex Switch v0.3.18](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.18)
