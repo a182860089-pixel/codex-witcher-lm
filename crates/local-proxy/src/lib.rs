@@ -64,7 +64,7 @@ const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(10);
 const DEFAULT_SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 300;
-const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.21");
+const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.22");
 const X_ACCEL_BUFFERING: HeaderName = HeaderName::from_static("x-accel-buffering");
 const MAX_ROUTE_ID_BYTES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 256;
@@ -1789,7 +1789,9 @@ async fn proxy_request(
     };
 
     let outbound_model = outbound_model(route.as_ref(), requested_model.as_deref());
-    if !conversation_ids.is_empty() && outbound_model != route.selected_model {
+    let stripped_continuation =
+        !conversation_ids.is_empty() && outbound_model != route.selected_model;
+    if stripped_continuation {
         strip_continuation_fields(&mut body);
     }
     body.as_object_mut()
@@ -1947,7 +1949,7 @@ async fn proxy_request(
         log_provider,
         log_model.clone(),
         log_display_name,
-        log_endpoint,
+        log_endpoint.clone(),
         log_thread_id.clone(),
         requested_model.clone(),
         agent_guard,
@@ -3067,10 +3069,9 @@ impl SseForward {
 
     async fn try_start_nudge(&mut self, upstream_stream: &mut UpstreamByteStream) -> bool {
         const MAX_NUDGE_ATTEMPTS: u8 = 3;
-        if !self.allow_nudge
-            || self.nudge_attempts >= MAX_NUDGE_ATTEMPTS
-            || !self.agent.should_nudge(self.force_nudge)
-        {
+        let status_text = self.agent.status_text().to_string();
+        let should = self.agent.should_nudge(self.force_nudge);
+        if !self.allow_nudge || self.nudge_attempts >= MAX_NUDGE_ATTEMPTS || !should {
             return false;
         }
         *upstream_stream = Box::pin(stream::empty());
@@ -3085,11 +3086,10 @@ impl SseForward {
                 }
             };
         }
-        let status_text = self.agent.status_text();
         let mut body = if self.nudge_attempts == 0 {
             agent_loop::build_nudge_request(
                 &self.nudge_template,
-                (!status_text.is_empty()).then_some(status_text),
+                (!status_text.is_empty()).then_some(status_text.as_str()),
             )
         } else {
             agent_loop::build_compact_nudge_request(&self.nudge_template)

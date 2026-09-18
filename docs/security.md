@@ -53,9 +53,9 @@ not a credential, and an expired ID requires the user to enter the API Key
 again.
 
 `profiles.json` stores only keyless shortcut metadata: profile ID and name,
-resolved Base URL, and the explicit models selected by the user. Removing a
-shortcut does not delete its keyring entry; credential deletion is an explicit
-lifecycle concern.
+resolved Base URL, selected models, and the chosen context-window size.
+Schema v3 still never stores API keys. Removing a shortcut does not delete
+its keyring entry; credential deletion is an explicit lifecycle concern.
 
 This is not a security boundary against every process running as the same OS
 user, process injection/parent spoofing, or Codex effective-config overrides

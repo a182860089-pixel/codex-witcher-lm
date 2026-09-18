@@ -77,6 +77,12 @@ const STATUS_MARKERS: &[&str] = &[
     "接下来",
     "先看",
     "先改",
+    "直接读",
+    "并看",
+    "看截图",
+    "原仓库",
+    "改回",
+    "继续干",
     "let me",
     "i'll",
     "i will",
@@ -155,14 +161,15 @@ pub fn apply_agent_loop_guard(body: &mut Value) -> AgentLoopGuard {
     if request_has_codex_app_tools(body) {
         append_instructions(body, MCP_COMPAT_INSTRUCTION);
     }
-    if should_force_tools(body) {
+    let guard = if should_force_tools(body) {
         body.as_object_mut()
             .expect("object shape checked by caller")
             .insert("tool_choice".to_string(), json!("required"));
         AgentLoopGuard::ForceTools
     } else {
         AgentLoopGuard::Instructions
-    }
+    };
+    guard
 }
 
 pub fn tools_snapshot(body: &Value) -> Option<Value> {
@@ -278,10 +285,11 @@ pub fn is_continue_nudge(text: &str) -> bool {
     matches!(
         trimmed,
         "继续" | "继续完成任务" | "继续任务" | "请继续" | "接着做"
-    ) || matches!(
-        lower.as_str(),
-        "continue" | "continue." | "keep going" | "keep working"
-    )
+    ) || trimmed.starts_with("继续完成")
+        || matches!(
+            lower.as_str(),
+            "continue" | "continue." | "keep going" | "keep working"
+        )
 }
 
 pub fn is_status_one_liner(text: &str) -> bool {
@@ -1775,8 +1783,39 @@ mod tests {
             AgentLoopGuard::ForceTools
         );
         assert_eq!(body["tool_choice"], "required");
-        assert!(!should_force_nudge(&body));
+        assert!(!continue_nudge_in_request(&body));
         assert!(last_assistant_is_unfinished(&body));
+        assert!(should_force_nudge(&body));
+    }
+
+    #[test]
+    fn leftover_style_plan_after_css_read_still_forces_tools() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续完成没有完成的任务"}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "原仓库继续，直接读样式并看截图。"}]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_css",
+                    "output": "/* globals.css */\n:root { --bg: #111; }"
+                }
+            ]
+        });
+        assert!(is_status_one_liner("原仓库继续，直接读样式并看截图。"));
+        assert!(last_assistant_is_unfinished(&body));
+        assert!(continue_nudge_in_request(&body));
+        assert_eq!(
+            apply_agent_loop_guard(&mut body),
+            AgentLoopGuard::ForceTools
+        );
+        assert_eq!(body["tool_choice"], "required");
     }
 
     #[test]
@@ -1883,6 +1922,11 @@ mod tests {
         assert!(is_status_one_liner(
             "先读 UI 技能和现有前端，再按苹果风格改界面。"
         ));
+        assert!(is_status_one_liner("原仓库继续，直接读样式并看截图。"));
+        assert!(is_status_one_liner(
+            "工作树路径无效，改回原仓库继续看截图和代码。"
+        ));
+        assert!(is_continue_nudge("继续完成没有完成的任务"));
         assert!(!is_status_one_liner("海鸥在线，你要整点薯条吗？"));
         assert!(!is_status_one_liner(
             "装完了。D 盘只剩 4.56GB，塞不下，已经落到 E 盘。Word / Excel 都能从开始菜单打开。"

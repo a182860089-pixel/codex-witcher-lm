@@ -3,12 +3,14 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::domain::DEFAULT_CONTEXT_WINDOW;
+use crate::domain::LEGACY_HARDCODED_CONTEXT_WINDOW;
 use crate::domain::ProviderProfile;
 use crate::error::Result;
 use crate::error::SwitcherError;
 use crate::validation::validate_profile;
 
-const PROFILE_STORE_SCHEMA_VERSION: u32 = 2;
+const PROFILE_STORE_SCHEMA_VERSION: u32 = 3;
 const MAX_SAVED_PROFILES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,16 +47,33 @@ fn migrate_profile_store(store: &mut ProfileStore) -> bool {
     if store.schema_version == PROFILE_STORE_SCHEMA_VERSION {
         return false;
     }
-    if store.schema_version != 1 {
-        return false;
-    }
-    for profile in &mut store.profiles {
-        for model in &mut profile.models {
-            model.supports_images = true;
+    let mut migrated = false;
+    while store.schema_version < PROFILE_STORE_SCHEMA_VERSION {
+        match store.schema_version {
+            1 => {
+                for profile in &mut store.profiles {
+                    for model in &mut profile.models {
+                        model.supports_images = true;
+                    }
+                }
+                store.schema_version = 2;
+                migrated = true;
+            }
+            2 => {
+                for profile in &mut store.profiles {
+                    for model in &mut profile.models {
+                        if model.context_window == LEGACY_HARDCODED_CONTEXT_WINDOW {
+                            model.context_window = DEFAULT_CONTEXT_WINDOW;
+                        }
+                    }
+                }
+                store.schema_version = 3;
+                migrated = true;
+            }
+            _ => break,
         }
     }
-    store.schema_version = PROFILE_STORE_SCHEMA_VERSION;
-    true
+    migrated
 }
 
 pub fn render_profile_store(store: &ProfileStore) -> Result<Vec<u8>> {
@@ -117,6 +136,7 @@ fn validate_store(store: &ProfileStore) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::DEFAULT_CONTEXT_WINDOW;
     use crate::domain::ModelSpec;
     use crate::domain::ReasoningEffort;
 
@@ -131,7 +151,7 @@ mod tests {
                 id: format!("{id}/code"),
                 display_name: format!("{id}/code"),
                 description: String::new(),
-                context_window: 128_000,
+                context_window: DEFAULT_CONTEXT_WINDOW,
                 default_reasoning: ReasoningEffort::Medium,
                 reasoning_levels: vec![
                     ReasoningEffort::Low,
@@ -210,12 +230,16 @@ mod tests {
 }"#;
         let (store, migrated) = parse_profile_store_with_migration(json).unwrap();
         assert!(migrated);
-        assert_eq!(store.schema_version, 2);
+        assert_eq!(store.schema_version, 3);
         assert!(store.profiles[0].models[0].supports_images);
+        assert_eq!(
+            store.profiles[0].models[0].context_window,
+            DEFAULT_CONTEXT_WINDOW
+        );
     }
 
     #[test]
-    fn v2_store_keeps_explicit_image_opt_out() {
+    fn v2_store_bumps_legacy_128k_context_window() {
         let json = r#"{
   "schemaVersion": 2,
   "profiles": [
@@ -241,8 +265,77 @@ mod tests {
   ]
 }"#;
         let (store, migrated) = parse_profile_store_with_migration(json).unwrap();
-        assert!(!migrated);
-        assert_eq!(store.schema_version, 2);
+        assert!(migrated);
+        assert_eq!(store.schema_version, 3);
         assert!(!store.profiles[0].models[0].supports_images);
+        assert_eq!(
+            store.profiles[0].models[0].context_window,
+            DEFAULT_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
+    fn v3_store_keeps_explicit_128k_context_window() {
+        let json = r#"{
+  "schemaVersion": 3,
+  "profiles": [
+    {
+      "id": "acme",
+      "display_name": "Acme API",
+      "base_url": "https://acme.example/v1",
+      "models": [
+        {
+          "id": "acme/code",
+          "display_name": "acme/code",
+          "description": "",
+          "context_window": 128000,
+          "default_reasoning": "medium",
+          "reasoning_levels": ["low", "medium", "high"],
+          "supports_parallel_tool_calls": true,
+          "supports_images": true
+        }
+      ],
+      "supports_websockets": false,
+      "credential_required": true
+    }
+  ]
+}"#;
+        let (store, migrated) = parse_profile_store_with_migration(json).unwrap();
+        assert!(!migrated);
+        assert_eq!(store.schema_version, 3);
+        assert_eq!(store.profiles[0].models[0].context_window, 128_000);
+    }
+
+    #[test]
+    fn missing_context_window_deserializes_to_250k() {
+        let json = r#"{
+  "schemaVersion": 3,
+  "profiles": [
+    {
+      "id": "acme",
+      "display_name": "Acme API",
+      "base_url": "https://acme.example/v1",
+      "models": [
+        {
+          "id": "acme/code",
+          "display_name": "acme/code",
+          "description": "",
+          "default_reasoning": "medium",
+          "reasoning_levels": ["low", "medium", "high"],
+          "supports_parallel_tool_calls": true,
+          "supports_images": true
+        }
+      ],
+      "supports_websockets": false,
+      "credential_required": true
+    }
+  ]
+}"#;
+        let (store, migrated) = parse_profile_store_with_migration(json).unwrap();
+        assert!(!migrated);
+        assert_eq!(
+            store.profiles[0].models[0].context_window,
+            DEFAULT_CONTEXT_WINDOW
+        );
     }
 }

@@ -224,7 +224,7 @@ mod tests {
                 id: "vendor/model-1".into(),
                 display_name: "Model 1".into(),
                 description: String::new(),
-                context_window: 128_000,
+                context_window: crate::domain::DEFAULT_CONTEXT_WINDOW,
                 default_reasoning: ReasoningEffort::Medium,
                 reasoning_levels: vec![ReasoningEffort::Low, ReasoningEffort::Medium],
                 supports_parallel_tool_calls: true,

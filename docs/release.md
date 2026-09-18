@@ -188,6 +188,23 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-18 GitHub 0.3.22
+
+[LM Codex Switch v0.3.22](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.22)
+is a Windows-only overlay release. Saved connections now expose a context-window
+slider from 64k to 2M, defaulting to 250k. `profiles.json` schema v3 rewrites
+the legacy hardcoded 128k value on upgrade and keeps an explicit later 128k
+choice. Grok plan matching covers leftover inspection sentences such as
+“直接读”, “看截图”, and “原仓库继续”; continue nudges also match
+“继续完成没有完成的任务”. After a tool result, an unfinished plan still
+forces `tool_choice=required`.
+
+Installer filename:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.22_Windows-x64-Setup.exe`.
+  SHA-256 `2eee0ee5541de0f80869210a8ecda3eb7cc9cc0b4729af96d2c751cf316c16f3`.
+
 ## 2026-09-18 GitHub 0.3.21
 
 [LM Codex Switch v0.3.21](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.21)

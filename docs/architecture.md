@@ -106,6 +106,8 @@ credential to the endpoint-bound operating-system keyring entry.
 
 `profiles.json` is a versioned, private file containing display names,
 normalized Base URLs, and selected model metadata. It never contains API keys.
+Schema v3 defaults a missing context window to 250k tokens and rewrites the
+legacy hardcoded 128k value on upgrade; an explicit later 128k choice is kept.
 The store accepts at most 64 profiles and is serialized under an exclusive
 lock with a private atomic write.
 
@@ -119,7 +121,9 @@ Opening the editor resolves the selected saved profile server-side, derives
 its endpoint-bound keyring account, and returns that credential only to the
 local Tauri WebView. The Key is shown in the editor for the current user and
 cleared when the editor closes or saving finishes. An unchanged Base URL and
-unchanged Key reuse the existing keyring entry without rewriting it.
+unchanged Key reuse the existing keyring entry without rewriting it. The
+editor also exposes a context-window slider (64k through 2M, default 250k)
+that is written onto every selected model in that connection.
 
 Removing a shortcut removes only the `profiles.json` entry; it does not
 silently alter the current Codex configuration or delete an endpoint

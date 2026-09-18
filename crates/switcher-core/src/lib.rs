@@ -34,7 +34,8 @@ pub use discovery::{
     FetchedModel, ModelDiscovery, fetch_models, model_endpoint_candidates, normalize_api_base_url,
 };
 pub use domain::{
-    ModelSpec, OFFICIAL_PROFILE_DISPLAY_NAME, OFFICIAL_PROFILE_SCHEMA_VERSION, OfficialProfile,
+    DEFAULT_CONTEXT_WINDOW, LEGACY_HARDCODED_CONTEXT_WINDOW, ModelSpec,
+    OFFICIAL_PROFILE_DISPLAY_NAME, OFFICIAL_PROFILE_SCHEMA_VERSION, OfficialProfile,
     ProviderProfile, ReasoningEffort, Selection,
 };
 pub use error::{Result, SwitcherError};

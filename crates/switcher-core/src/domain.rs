@@ -29,12 +29,20 @@ impl ReasoningEffort {
     }
 }
 
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 250_000;
+pub const LEGACY_HARDCODED_CONTEXT_WINDOW: u64 = 128_000;
+
+fn default_context_window() -> u64 {
+    DEFAULT_CONTEXT_WINDOW
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelSpec {
     pub id: String,
     pub display_name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_context_window")]
     pub context_window: u64,
     pub default_reasoning: ReasoningEffort,
     pub reasoning_levels: Vec<ReasoningEffort>,

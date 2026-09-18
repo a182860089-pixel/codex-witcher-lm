@@ -236,6 +236,9 @@ interface AppUpdateStatus {
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("missing app root");
 
+const CONTEXT_WINDOW_STEPS = [64_000, 128_000, 250_000, 500_000, 1_000_000, 2_000_000];
+const DEFAULT_CONTEXT_WINDOW = 250_000;
+
 const previewModel = (
   id: string,
   displayName: string,
@@ -244,7 +247,7 @@ const previewModel = (
   id,
   display_name: displayName,
   description,
-  context_window: 128_000,
+  context_window: DEFAULT_CONTEXT_WINDOW,
   default_reasoning: "medium",
   reasoning_levels: ["low", "medium", "high"],
   supports_parallel_tool_calls: true,
@@ -385,38 +388,7 @@ let usageOverview: UsageOverview = {
 };
 let usageFetchToken = 0;
 
-let requestLogs: RequestLogItem[] = [
-  {
-    id: "req-init-1",
-    time: formatCallTime(Date.now() - 120000),
-    provider: "当前配置",
-    model: "codex-auto-review",
-    endpoint: "/v1/responses",
-    status: 200,
-    durationMs: 420,
-    threadId: "th_01a0901b",
-    startedAtMs: Date.now() - 120000,
-    streamCompleted: true,
-    reasoningEffort: "high",
-    finishReason: "stop",
-    details: JSON.stringify({ model: "codex-auto-review", stream: true, status: "success", tokens: 312 }, null, 2)
-  },
-  {
-    id: "req-init-2",
-    time: formatCallTime(Date.now() - 65000),
-    provider: "当前配置",
-    model: "gemini-3.8-flash",
-    endpoint: "/v1/compact",
-    status: 200,
-    durationMs: 280,
-    threadId: "th_01a0901b",
-    startedAtMs: Date.now() - 65000,
-    streamCompleted: true,
-    reasoningEffort: "medium",
-    finishReason: "stop",
-    details: JSON.stringify({ model: "gemini-3.8-flash", compact: true, cached: true }, null, 2)
-  }
-];
+let requestLogs: RequestLogItem[] = previewRequestLogs();
 
 let selectedLogId: string | null = null;
 let logFilterStatus: "all" | "success" | "error" = "all";
@@ -965,6 +937,33 @@ app.innerHTML = `
               <small>开启后 Codex 会显示贴图和截图。上游若不支持视觉，发送后可能失败。</small>
             </span>
           </label>
+          <div class="context-window-field">
+            <div class="context-window-header">
+              <label for="context-window">上下文上限</label>
+              <strong id="context-window-value">250k</strong>
+            </div>
+            <input
+              id="context-window"
+              type="range"
+              min="0"
+              max="5"
+              step="1"
+              value="2"
+              aria-valuemin="0"
+              aria-valuemax="5"
+              aria-valuenow="2"
+              aria-valuetext="250k"
+            />
+            <div class="context-window-ticks" aria-hidden="true">
+              <span>64k</span>
+              <span>128k</span>
+              <span>250k</span>
+              <span>500k</span>
+              <span>1M</span>
+              <span>2M</span>
+            </div>
+            <small>Codex 会按这个上限的 95% 自动压缩。改完后重新打开 Codex，新对话才会用上。不要超过上游模型的真实窗口。</small>
+          </div>
           <div class="editor-actions">
             <button id="save-only" class="button button-secondary" type="button">仅保存</button>
             <button id="save-and-switch" class="button button-primary" type="button">保存并使用</button>
@@ -1346,6 +1345,8 @@ required<HTMLInputElement>("#manual-model").addEventListener("keydown", (event) 
     addManualModel();
   }
 });
+required<HTMLInputElement>("#context-window").addEventListener("input", updateContextWindowControl);
+updateContextWindowControl();
 required<HTMLButtonElement>("#save-only").addEventListener("click", () => saveConnection(false));
 required<HTMLButtonElement>("#save-and-switch").addEventListener("click", () =>
   saveConnection(true),
@@ -1428,7 +1429,11 @@ function showRequestedBrowserPreview(): void {
       downloadUrl: "https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.5",
       assetName: "Codex.Provider.Switcher_0.3.5_Windows-x64-Setup.exe",
     });
+    return;
   }
+  usageOverview = previewUsageOverview(usageRange);
+  requestLogs = previewRequestLogs();
+  switchAppPage("dashboard");
 }
 
 function switchAppPage(page: AppPage): void {
@@ -1461,7 +1466,7 @@ function switchAppPage(page: AppPage): void {
 
   if (page === "dashboard") {
     if (usageOverview.series.length === 0) {
-      usageOverview = emptyUsageOverview(usageRange);
+      usageOverview = nativeAvailable ? emptyUsageOverview(usageRange) : previewUsageOverview(usageRange);
     }
     renderDashboardPage();
     void fetchUsageOverview();
@@ -1555,6 +1560,386 @@ function emptyUsageOverview(range: UsageRange): UsageOverview {
   };
 }
 
+function previewHash(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function previewRandom(seed: number): () => number {
+  let state = seed || 1;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4_294_967_296;
+  };
+}
+
+function previewUsageOverview(range: UsageRange): UsageOverview {
+  const overview = emptyUsageOverview(range);
+  const now = Date.now();
+  const bucketMs =
+    range === "minutes10" ? 60_000 : range === "hour" ? 5 * 60_000 : range === "day" ? 3_600_000 : 86_400_000;
+  const count = range === "minutes10" ? 10 : range === "hour" ? 12 : range === "day" ? 24 : range === "week" ? 7 : 31;
+  const origin = now - (count - 1) * bucketMs;
+  const weekdayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+  overview.series = Array.from({ length: count }, (_, index) => {
+    const startMs = origin + index * bucketMs;
+    const date = new Date(startMs);
+    const rand = previewRandom(previewHash(range + ":" + index + ":" + date.toDateString()));
+    const weekend = date.getDay() === 0 || date.getDay() === 6;
+    const hour = date.getHours();
+    let activity = 0.45 + rand() * 0.8;
+    if (range === "day") activity *= hour >= 9 && hour <= 22 ? 1 : 0.18;
+    else if (range === "minutes10" || range === "hour") activity *= 0.75 + rand() * 0.5;
+    else activity *= weekend ? 0.28 : 1;
+    if (index === count - 3) activity *= 1.55;
+    const scale = range === "minutes10" ? 0.06 : range === "hour" ? 0.18 : range === "day" ? 0.55 : 1;
+    const calls = Math.max(range === "minutes10" ? 0 : 1, Math.round((4 + activity * 28) * scale));
+    const uncached = Math.round((6_000 + activity * 64_000) * scale);
+    const cached = Math.round((3_000 + activity * 48_000) * scale);
+    const write = Math.round((800 + activity * 9_000) * scale);
+    const completion = Math.round((2_200 + activity * 22_000) * scale);
+    const label =
+      range === "minutes10" || range === "hour"
+        ? String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0")
+        : range === "day"
+          ? String(date.getHours()).padStart(2, "0") + ":00"
+          : range === "week"
+            ? weekdayNames[date.getDay()] || date.getMonth() + 1 + "/" + date.getDate()
+            : date.getMonth() + 1 + "/" + date.getDate();
+    return {
+      label,
+      startMs,
+      cachedTokens: cached,
+      uncachedTokens: uncached,
+      cacheWriteTokens: write,
+      completionTokens: completion,
+      totalTokens: uncached + cached + write + completion,
+      calls,
+    };
+  });
+  overview.heatmap = overview.heatmap.map((cell) => {
+    const date = new Date(cell.date + "T12:00:00");
+    if (Number.isNaN(date.getTime()) || date.getTime() > now) {
+      return { ...cell, totalTokens: 0, calls: 0 };
+    }
+    const rand = previewRandom(previewHash(cell.date));
+    const weekend = cell.weekday === 0 || cell.weekday === 6;
+    if (rand() < (weekend ? 0.42 : 0.1)) return { ...cell, totalTokens: 0, calls: 0 };
+    const intensity = (weekend ? 0.28 : 1) * (0.18 + rand() * 1.15);
+    const calls = Math.max(1, Math.round(intensity * 22));
+    const totalTokens = Math.round(
+      intensity * (rand() > 0.93 ? 1_050_000 : rand() > 0.72 ? 240_000 : 52_000),
+    );
+    return { ...cell, calls, totalTokens };
+  });
+  const calls = overview.series.reduce((sum, point) => sum + point.calls, 0);
+  const promptTokens = overview.series.reduce((sum, point) => sum + point.uncachedTokens + point.cachedTokens, 0);
+  const completionTokens = overview.series.reduce((sum, point) => sum + point.completionTokens, 0);
+  const cachedTokens = overview.series.reduce((sum, point) => sum + point.cachedTokens, 0);
+  const cacheWriteTokens = overview.series.reduce((sum, point) => sum + point.cacheWriteTokens, 0);
+  const totalTokens = overview.series.reduce((sum, point) => sum + point.totalTokens, 0);
+  const errors = Math.max(1, Math.round(calls * 0.04));
+  overview.range = range;
+  overview.fromMs = overview.series[0]?.startMs ?? 0;
+  overview.toMs = now;
+  overview.calls = calls;
+  overview.success = Math.max(0, calls - errors);
+  overview.errors = errors;
+  overview.promptTokens = promptTokens;
+  overview.completionTokens = completionTokens;
+  overview.cachedTokens = cachedTokens;
+  overview.cacheWriteTokens = cacheWriteTokens;
+  overview.totalTokens = totalTokens;
+  overview.cacheHitRate = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
+  overview.estimatedUsd = Number(((totalTokens / 1_000_000) * 4.8).toFixed(2));
+  overview.cacheUsd = Number(((cacheWriteTokens / 1_000_000) * 6.25).toFixed(2));
+  return overview;
+}
+
+function previewRequestLogs(): RequestLogItem[] {
+  const now = Date.now();
+  const samples: Array<Omit<RequestLogItem, "time"> & { ago: number }> = [
+    {
+      ago: 18_000,
+      id: "req-preview-1",
+      provider: "Studio API",
+      model: "code-pro",
+      displayName: "Code Pro",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 0,
+      threadId: "th_01preview01",
+      startedAtMs: now - 18_000,
+      firstByteMs: 210,
+      streamCompleted: false,
+      reasoningEffort: "high",
+      serviceTier: "fast",
+      promptTokens: 6_420,
+      completionTokens: 0,
+      details: JSON.stringify({ model: "code-pro", stream: true, status: "running" }, null, 2),
+    },
+    {
+      ago: 52_000,
+      id: "req-preview-2",
+      provider: "Studio API",
+      model: "code-pro",
+      displayName: "Code Pro",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 1_860,
+      streamDurationMs: 1_860,
+      threadId: "th_01preview01",
+      startedAtMs: now - 52_000,
+      firstByteMs: 180,
+      responseBytes: 48_320,
+      streamCompleted: true,
+      reasoningEffort: "high",
+      finishReason: "stop",
+      serviceTier: "fast",
+      promptTokens: 8_240,
+      completionTokens: 1_128,
+      cachedTokens: 3_200,
+      totalTokens: 9_368,
+      details: JSON.stringify({ model: "code-pro", stream: true, status: "success", tokens: 9368 }, null, 2),
+    },
+    {
+      ago: 95_000,
+      id: "req-preview-3",
+      provider: "Studio API",
+      model: "code-fast",
+      displayName: "Code Fast",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 640,
+      streamDurationMs: 640,
+      threadId: "th_01preview02",
+      startedAtMs: now - 95_000,
+      firstByteMs: 90,
+      responseBytes: 12_880,
+      streamCompleted: true,
+      reasoningEffort: "low",
+      finishReason: "stop",
+      promptTokens: 2_180,
+      completionTokens: 412,
+      cachedTokens: 960,
+      totalTokens: 2_592,
+      details: JSON.stringify({ model: "code-fast", stream: true, status: "success" }, null, 2),
+    },
+    {
+      ago: 148_000,
+      id: "req-preview-4",
+      provider: "Studio API",
+      model: "code-pro",
+      displayName: "Code Pro",
+      endpoint: "/v1/compact",
+      status: 200,
+      durationMs: 310,
+      threadId: "th_01preview01",
+      startedAtMs: now - 148_000,
+      firstByteMs: 70,
+      responseBytes: 4_120,
+      streamCompleted: true,
+      reasoningEffort: "medium",
+      finishReason: "stop",
+      promptTokens: 18_400,
+      completionTokens: 86,
+      cachedTokens: 14_200,
+      totalTokens: 18_486,
+      details: JSON.stringify({ model: "code-pro", compact: true, cached: true }, null, 2),
+    },
+    {
+      ago: 210_000,
+      id: "req-preview-5",
+      provider: "Studio API",
+      model: "code-pro",
+      displayName: "Code Pro",
+      endpoint: "/v1/responses",
+      status: 429,
+      durationMs: 420,
+      threadId: "th_01preview03",
+      startedAtMs: now - 210_000,
+      retryCount: 2,
+      streamCompleted: false,
+      streamError: "upstream 429 rate limited",
+      reasoningEffort: "high",
+      finishReason: "error",
+      error: "Too Many Requests",
+      promptTokens: 5_120,
+      details: JSON.stringify({ model: "code-pro", status: 429, retry: 2 }, null, 2),
+    },
+    {
+      ago: 286_000,
+      id: "req-preview-6",
+      provider: "OpenAI",
+      model: "gpt-5",
+      displayName: "GPT-5",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 2_240,
+      streamDurationMs: 2_240,
+      threadId: "th_01preview04",
+      startedAtMs: now - 286_000,
+      firstByteMs: 260,
+      responseBytes: 61_440,
+      streamCompleted: true,
+      reasoningEffort: "xhigh",
+      finishReason: "stop",
+      agentGuard: "instructions",
+      promptTokens: 11_860,
+      completionTokens: 1_640,
+      cachedTokens: 4_800,
+      cacheWriteTokens: 1_200,
+      totalTokens: 13_500,
+      details: JSON.stringify({ model: "gpt-5", stream: true, status: "success" }, null, 2),
+    },
+    {
+      ago: 365_000,
+      id: "req-preview-7",
+      provider: "Studio API",
+      model: "code-fast",
+      displayName: "Code Fast",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 980,
+      streamDurationMs: 980,
+      threadId: "th_01preview05",
+      startedAtMs: now - 365_000,
+      firstByteMs: 140,
+      responseBytes: 22_016,
+      streamCompleted: true,
+      reasoningEffort: "medium",
+      finishReason: "stop",
+      agentNudged: true,
+      promptTokens: 4_560,
+      completionTokens: 736,
+      totalTokens: 5_296,
+      details: JSON.stringify({ model: "code-fast", agent_nudged: true }, null, 2),
+    },
+    {
+      ago: 448_000,
+      id: "req-preview-8",
+      provider: "Studio API",
+      model: "code-pro",
+      displayName: "Code Pro",
+      endpoint: "/v1/responses",
+      status: 500,
+      durationMs: 1_120,
+      threadId: "th_01preview06",
+      startedAtMs: now - 448_000,
+      retryCount: 1,
+      streamCompleted: false,
+      streamError: "upstream disconnected after first byte",
+      reasoningEffort: "high",
+      finishReason: "error",
+      error: "Bad Gateway",
+      firstByteMs: 390,
+      promptTokens: 7_040,
+      details: JSON.stringify({ model: "code-pro", status: 500, stream_error: true }, null, 2),
+    },
+    {
+      ago: 612_000,
+      id: "req-preview-9",
+      provider: "Studio API",
+      model: "code-fast",
+      displayName: "Code Fast",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 540,
+      streamDurationMs: 540,
+      threadId: "th_01preview07",
+      startedAtMs: now - 612_000,
+      firstByteMs: 88,
+      responseBytes: 9_216,
+      streamCompleted: true,
+      reasoningEffort: "minimal",
+      finishReason: "stop",
+      completedWithoutTools: true,
+      promptTokens: 1_280,
+      completionTokens: 196,
+      totalTokens: 1_476,
+      details: JSON.stringify({ model: "code-fast", completed_without_tools: true }, null, 2),
+    },
+    {
+      ago: 890_000,
+      id: "req-preview-10",
+      provider: "Studio API",
+      model: "code-pro",
+      displayName: "Code Pro",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 3_180,
+      streamDurationMs: 3_180,
+      threadId: "th_01preview08",
+      startedAtMs: now - 890_000,
+      firstByteMs: 310,
+      responseBytes: 88_704,
+      streamCompleted: true,
+      reasoningEffort: "high",
+      finishReason: "stop",
+      serviceTier: "fast",
+      agentGuard: "force_tools",
+      promptTokens: 16_240,
+      completionTokens: 2_410,
+      cachedTokens: 7_680,
+      cacheWriteTokens: 2_040,
+      totalTokens: 18_650,
+      details: JSON.stringify({ model: "code-pro", tools: true, status: "success" }, null, 2),
+    },
+    {
+      ago: 1_260_000,
+      id: "req-preview-11",
+      provider: "OpenAI",
+      model: "gpt-5",
+      displayName: "GPT-5",
+      endpoint: "/v1/compact",
+      status: 200,
+      durationMs: 260,
+      threadId: "th_01preview04",
+      startedAtMs: now - 1_260_000,
+      firstByteMs: 64,
+      responseBytes: 3_072,
+      streamCompleted: true,
+      reasoningEffort: "medium",
+      finishReason: "stop",
+      promptTokens: 22_400,
+      completionTokens: 54,
+      cachedTokens: 19_200,
+      totalTokens: 22_454,
+      details: JSON.stringify({ model: "gpt-5", compact: true }, null, 2),
+    },
+    {
+      ago: 1_540_000,
+      id: "req-preview-12",
+      provider: "Studio API",
+      model: "code-fast",
+      displayName: "Code Fast",
+      endpoint: "/v1/responses",
+      status: 400,
+      durationMs: 180,
+      threadId: "th_01preview09",
+      startedAtMs: now - 1_540_000,
+      streamCompleted: false,
+      streamError: "invalid request: missing input",
+      reasoningEffort: "low",
+      finishReason: "error",
+      error: "Bad Request",
+      details: JSON.stringify({ model: "code-fast", status: 400 }, null, 2),
+    },
+  ];
+  return samples.map((sample) => {
+    const { ago, ...item } = sample;
+    return {
+      ...item,
+      startedAtMs: now - ago,
+      time: formatCallTime(now - ago),
+    };
+  });
+}
+
 function customUsageBounds(): { fromMs?: number; toMs?: number } {
   const fromValue = document.querySelector<HTMLInputElement>("#usage-from")?.value;
   const toValue = document.querySelector<HTMLInputElement>("#usage-to")?.value;
@@ -1581,7 +1966,7 @@ async function setUsageRange(range: UsageRange): Promise<void> {
 async function fetchUsageOverview(): Promise<void> {
   const token = ++usageFetchToken;
   if (!nativeAvailable) {
-    usageOverview = emptyUsageOverview(usageRange);
+    usageOverview = previewUsageOverview(usageRange);
     renderDashboardPage();
     return;
   }
@@ -1654,20 +2039,20 @@ function renderDashboardPage(): void {
   cost.textContent = formatUsd(overview.estimatedUsd);
   costSub.textContent = "缓存读写 " + formatUsd(overview.cacheUsd);
 
-  const maxTotal = Math.max(
-    1,
-    ...overview.series.map((point) =>
-      stackedSeries(point).reduce((sum, part) => sum + part.value, 0),
-    ),
+  const seriesTotals = overview.series.map((point) =>
+    stackedSeries(point).reduce((sum, part) => sum + part.value, 0),
   );
+  const maxTotal = Math.max(1, ...seriesTotals);
   chart.classList.toggle("usage-chart-dense", overview.series.length > 24);
   chart.innerHTML = overview.series
     .map((point, index) => {
+      const total = seriesTotals[index] ?? 0;
+      const stackHeight = total <= 0 ? 0 : Math.max(12, (total / maxTotal) * 100);
       const stacks = stackedSeries(point)
         .filter((part) => part.value > 0)
         .map((part) => {
-          const height = Math.max(3, (part.value / maxTotal) * 100);
-          return "<span class=\"usage-bar-seg usage-bar-" + part.key + "\" style=\"height:" + height + "%\"></span>";
+          const share = total > 0 ? (part.value / total) * 100 : 0;
+          return "<span class=\"usage-bar-seg usage-bar-" + part.key + "\" style=\"height:" + share + "%\"></span>";
         })
         .join("");
       const title = escapeHtml(point.label);
@@ -1678,7 +2063,9 @@ function renderDashboardPage(): void {
         title +
         "\">" +
         "<span class=\"usage-bar-track\">" +
-        "<span class=\"usage-bar-stack\">" +
+        "<span class=\"usage-bar-stack\"" +
+        (stackHeight > 0 ? " style=\"height:" + stackHeight + "%\"" : "") +
+        ">" +
         stacks +
         "</span>" +
         "</span>" +
@@ -1908,6 +2295,7 @@ function inspectorEyeIcon(): string {
 
 async function fetchProxyRequestLogs(): Promise<void> {
   if (!nativeAvailable) {
+    if (requestLogs.length === 0) requestLogs = previewRequestLogs();
     refreshInspectorUi();
     return;
   }
@@ -2148,9 +2536,10 @@ function renderInspectorDetail(): void {
 
 async function refreshDashboard(): Promise<void> {
   if (!nativeAvailable) {
-    usageOverview = emptyUsageOverview(usageRange);
+    usageOverview = previewUsageOverview(usageRange);
+    if (requestLogs.length === 0) requestLogs = previewRequestLogs();
     renderDashboard();
-    setStatus("通过桌面应用打开后，会自动读取当前接入和模型。", "info");
+    setStatus("浏览器预览已载入示例用量和调用记录。", "info");
     return;
   }
   await run("正在读取当前状态…", async () => {
@@ -2894,6 +3283,7 @@ function openEditor(): void {
   input("#model-search").value = "";
   input("#manual-model").value = "";
   required<HTMLInputElement>("#supports-images").checked = true;
+  setContextWindowControl(DEFAULT_CONTEXT_WINDOW);
   required<HTMLElement>("#model-step").hidden = true;
   required<HTMLElement>("#editor-kicker").textContent = "添加接入";
   required<HTMLElement>("#editor-title").textContent = "选择接入方式";
@@ -2966,6 +3356,7 @@ async function openProfileEditor(
   required<HTMLInputElement>("#supports-images").checked = profile.models.some(
     (model) => model.supports_images,
   );
+  setContextWindowControl(profileContextWindow(profile));
   required<HTMLElement>("#model-step").hidden = false;
   setConnectionEditorView("api");
   required<HTMLElement>("#editor-description").textContent =
@@ -3935,6 +4326,58 @@ async function presentRestartNotice(): Promise<void> {
   }
 }
 
+function formatContextWindow(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    return Number.isInteger(millions) ? `${millions}M` : `${millions.toFixed(1)}M`;
+  }
+  return `${Math.round(tokens / 1_000)}k`;
+}
+
+function contextWindowStepIndex(tokens: number): number {
+  let closest = 0;
+  let best = Number.POSITIVE_INFINITY;
+  CONTEXT_WINDOW_STEPS.forEach((step, index) => {
+    const distance = Math.abs(step - tokens);
+    if (distance < best) {
+      best = distance;
+      closest = index;
+    }
+  });
+  return closest;
+}
+
+function selectedContextWindow(): number {
+  const index = Number(required<HTMLInputElement>("#context-window").value);
+  return CONTEXT_WINDOW_STEPS[index] ?? DEFAULT_CONTEXT_WINDOW;
+}
+
+function profileContextWindow(profile: ProviderProfile): number {
+  return profile.models.reduce(
+    (max, model) => Math.max(max, model.context_window),
+    profile.models[0]?.context_window ?? DEFAULT_CONTEXT_WINDOW,
+  );
+}
+
+function setContextWindowControl(tokens: number): void {
+  required<HTMLInputElement>("#context-window").value = String(contextWindowStepIndex(tokens));
+  updateContextWindowControl();
+}
+
+function updateContextWindowControl(): void {
+  const slider = required<HTMLInputElement>("#context-window");
+  const tokens = selectedContextWindow();
+  const label = formatContextWindow(tokens);
+  const max = Number(slider.max) || CONTEXT_WINDOW_STEPS.length - 1;
+  required<HTMLElement>("#context-window-value").textContent = label;
+  slider.setAttribute("aria-valuenow", slider.value);
+  slider.setAttribute("aria-valuetext", label);
+  slider.style.setProperty(
+    "--slider-progress",
+    `${max === 0 ? 0 : (Number(slider.value) / max) * 100}%`,
+  );
+}
+
 function buildProfile(
   displayName: string,
   baseUrl: string,
@@ -3950,7 +4393,7 @@ function buildProfile(
         id,
         display_name: id,
         description: "",
-        context_window: 128_000,
+        context_window: selectedContextWindow(),
         default_reasoning: "medium",
         reasoning_levels: ["low", "medium", "high"],
         supports_parallel_tool_calls: true,

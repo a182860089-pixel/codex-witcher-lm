@@ -84,7 +84,8 @@ same user goal, not a different product mode.
   and focus returns to the button that opened it.
 - The editor reveals one task at a time. Model selection stays unavailable
   until a connection has been checked, and saving stays unavailable until the
-  required models are selected.
+  required models are selected. After models are chosen, a context-window
+  slider sets the Codex compression ceiling for that saved connection.
 - Status changes use a persistent, polite live region. Destructive, restart,
   and manual-recovery states require explicit confirmation.
 - The layout collapses to a top navigation bar below 680 px; cards and action

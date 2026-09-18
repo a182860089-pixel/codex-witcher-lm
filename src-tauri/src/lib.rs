@@ -1144,7 +1144,7 @@ async fn repair_fast_switch(
     }
     if profiles_migrated {
         steps.push(
-            "\u{5df2}\u{4e3a}\u{5df2}\u{4fdd}\u{5b58}\u{63a5}\u{5165}\u{5f00}\u{542f}\u{56fe}\u{7247}\u{8f93}\u{5165}"
+            "\u{5df2}\u{5c06}\u{5df2}\u{4fdd}\u{5b58}\u{63a5}\u{5165}\u{7684}\u{9ed8}\u{8ba4}\u{4e0a}\u{4e0b}\u{6587}\u{7a97}\u{53e3}\u{8c03}\u{5230} 250k"
                 .to_string(),
         );
         state.requires_codex_restart = true;
@@ -3531,7 +3531,7 @@ mod tests {
                     id: (*id).to_string(),
                     display_name: (*id).to_string(),
                     description: String::new(),
-                    context_window: 128_000,
+                    context_window: 250_000,
                     default_reasoning: ReasoningEffort::Medium,
                     reasoning_levels: vec![
                         ReasoningEffort::Low,
