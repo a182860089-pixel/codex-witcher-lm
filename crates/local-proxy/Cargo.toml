@@ -20,7 +20,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-registry = "0.6"
+windows-registry = "0.100"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
