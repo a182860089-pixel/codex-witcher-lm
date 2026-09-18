@@ -11,10 +11,14 @@
 
 mod agent_loop;
 mod mcp_compat;
+mod usage;
 
 pub use agent_loop::SSE_KEEP_ALIVE_HEARTBEAT;
+pub use usage::{
+    HeatMonthLabel, UsageHeatCell, UsageOverview, UsageSeriesPoint,
+    load_overview as load_usage_overview,
+};
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
@@ -23,14 +27,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
 use axum::http::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH,
-    RETRY_AFTER, USER_AGENT,
+    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
+    IF_NONE_MATCH, RETRY_AFTER, USER_AGENT,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -60,7 +64,8 @@ const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(10);
 const DEFAULT_SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 300;
-const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.4");
+const UPSTREAM_USER_AGENT: HeaderValue = HeaderValue::from_static("codex-provider-switcher/0.3.21");
+const X_ACCEL_BUFFERING: HeaderName = HeaderName::from_static("x-accel-buffering");
 const MAX_ROUTE_ID_BYTES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const CODEX_CLIENT_MODEL: &str = "gpt-5.6-sol";
@@ -433,6 +438,16 @@ impl RouteConfig {
         self.models.iter().any(|item| item.slug == model)
     }
 
+    fn display_name_for(&self, model: &str) -> String {
+        self.models
+            .iter()
+            .find(|item| item.slug == model)
+            .map(|item| item.display_name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(model)
+            .to_string()
+    }
+
     fn with_selected_model(&self, model: &str) -> Option<Self> {
         if !self.contains_model(model) {
             return None;
@@ -488,6 +503,8 @@ pub struct ProxyStartOptions {
     /// Interval for `response.keep_alive` SSE heartbeats inserted only at
     /// event boundaries. `Duration::ZERO` disables heartbeats.
     pub sse_heartbeat_interval: Duration,
+    /// Optional JSON file used to keep usage totals across restarts.
+    pub usage_stats_path: Option<PathBuf>,
 }
 
 impl Default for ProxyStartOptions {
@@ -505,6 +522,7 @@ impl Default for ProxyStartOptions {
             use_system_proxy: false,
             bindings_path: None,
             sse_heartbeat_interval: DEFAULT_SSE_HEARTBEAT_INTERVAL,
+            usage_stats_path: None,
         }
     }
 }
@@ -529,6 +547,8 @@ pub struct ProxyRequestLog {
     pub time: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub display_name: String,
     pub endpoint: String,
     pub status: u16,
     pub duration_ms: u64,
@@ -555,6 +575,24 @@ pub struct ProxyRequestLog {
     pub completed_without_tools: bool,
     #[serde(default)]
     pub agent_nudged: bool,
+    #[serde(default)]
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 /// Starts proxy instances for Tauri without exposing a command-line surface.
@@ -634,6 +672,7 @@ impl LocalProxy {
             metrics: Arc::new(ProxyMetrics::default()),
             request_logs: Mutex::new(VecDeque::with_capacity(128)),
             cached_thread_tools: Mutex::new(HashMap::new()),
+            usage: usage::UsageStore::load(options.usage_stats_path.clone()),
         });
         state.metrics.running.store(true, Ordering::Release);
 
@@ -741,6 +780,15 @@ impl ProxyHandle {
         self.state.clear_request_logs();
     }
 
+    pub fn usage_overview(
+        &self,
+        range: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> UsageOverview {
+        self.state.usage.overview(range, from_ms, to_ms)
+    }
+
     pub async fn shutdown(&self) -> Result<(), ProxyError> {
         if let Some(sender) = lock_unpoisoned(&self.lifecycle.shutdown_sender).take() {
             let _ = sender.send(());
@@ -785,12 +833,25 @@ struct ProxyState {
     metrics: Arc<ProxyMetrics>,
     request_logs: Mutex<VecDeque<ProxyRequestLog>>,
     cached_thread_tools: Mutex<HashMap<String, Value>>,
+    usage: usage::UsageStore,
 }
 
 impl ProxyState {
     fn record_request_log(&self, log: ProxyRequestLog) {
+        self.usage.upsert_from_log(
+            &log.id,
+            log.started_at_ms,
+            log.status,
+            usage::TokenUsage {
+                prompt_tokens: log.prompt_tokens,
+                completion_tokens: log.completion_tokens,
+                cached_tokens: log.cached_tokens,
+                cache_write_tokens: log.cache_write_tokens,
+                total_tokens: log.total_tokens,
+            },
+        );
         if let Ok(mut logs) = self.request_logs.lock() {
-            if logs.len() >= 100 {
+            if logs.len() >= 200 {
                 logs.pop_back();
             }
             logs.push_front(log);
@@ -809,11 +870,29 @@ impl ProxyState {
     where
         F: FnOnce(&mut ProxyRequestLog),
     {
-        if let Ok(mut logs) = self.request_logs.lock()
-            && let Some(log) = logs.iter_mut().find(|log| log.id == id)
-        {
+        let snapshot = {
+            let Ok(mut logs) = self.request_logs.lock() else {
+                return;
+            };
+            let Some(log) = logs.iter_mut().find(|log| log.id == id) else {
+                return;
+            };
             update(log);
-        }
+            (
+                log.id.clone(),
+                log.started_at_ms,
+                log.status,
+                usage::TokenUsage {
+                    prompt_tokens: log.prompt_tokens,
+                    completion_tokens: log.completion_tokens,
+                    cached_tokens: log.cached_tokens,
+                    cache_write_tokens: log.cache_write_tokens,
+                    total_tokens: log.total_tokens,
+                },
+            )
+        };
+        self.usage
+            .upsert_from_log(&snapshot.0, snapshot.1, snapshot.2, snapshot.3);
     }
 
     fn clear_request_logs(&self) {
@@ -1744,6 +1823,8 @@ async fn proxy_request(
     let continue_nudge = agent_loop::continue_nudge_in_request(&body);
     let original_previous_response_id =
         string_at(&body, "/previous_response_id").map(str::to_string);
+    let reasoning_effort = extract_reasoning_effort(&body);
+    let service_tier = extract_service_tier(&body);
     let nudge_template = body.clone();
     let body = match serde_json::to_vec(&body) {
         Ok(body) => body,
@@ -1786,218 +1867,123 @@ async fn proxy_request(
     let log_id = format!("req-{}", uuid::Uuid::new_v4().simple());
     let log_provider = route.id.clone();
     let log_model = outbound_model.clone();
+    let log_display_name = route.display_name_for(&outbound_model);
     let log_endpoint = format!("/{}", endpoint.relative_path());
     let log_thread_id = thread_id.clone();
 
     let lease = RequestLease::begin(Arc::clone(&state.metrics));
-    let mut retry_count = 0_u32;
-    let upstream = loop {
-        let attempt = state
-            .client
-            .post(route.endpoint_url(endpoint))
-            .headers(headers.clone())
-            .body(body.clone())
-            .send()
-            .await;
-        match attempt {
-            Ok(response) if response.status().is_success() => break response,
-            Ok(response) if is_retryable_status(response.status()) => {
-                let status = response.status();
-                let retry_after = retry_after_duration(response.headers());
-                let error_body = response.bytes().await.ok();
-                if retry_count as usize >= state.upstream_max_retries
-                    || !wait_before_retry(
-                        request_start_time,
-                        state.upstream_retry_max_elapsed,
-                        state.upstream_retry_base_delay,
-                        state.upstream_retry_max_delay,
-                        retry_count as usize,
-                        retry_after,
-                    )
-                    .await
-                {
-                    let duration_ms = request_start_time.elapsed().as_millis() as u64;
-                    let message = error_body
-                        .as_deref()
-                        .and_then(json_error_message)
-                        .or_else(|| {
-                            error_body
-                                .as_deref()
-                                .and_then(|body| html_error_message(status, body))
-                        })
-                        .unwrap_or_else(|| format!("upstream provider returned {status}"));
-                    drop(lease);
-                    state.record_request_log(ProxyRequestLog {
-                        id: log_id,
-                        time: log_time,
-                        provider: log_provider,
-                        model: log_model,
-                        endpoint: log_endpoint,
-                        status: status.as_u16(),
-                        duration_ms,
-                        thread_id: log_thread_id,
-                        error: Some(message.clone()),
-                        details: Some(format!(
-                            "Upstream returned retryable status {status} after {retry_count} retries"
-                        )),
-                        retry_count,
-                        first_byte_ms: None,
-                        response_bytes: 0,
-                        stream_duration_ms: None,
-                        stream_completed: false,
-                        stream_error: None,
-                        requested_model,
-                        agent_guard: agent_guard.as_log_value().map(str::to_string),
-                        completed_without_tools: false,
-                        agent_nudged: false,
-                    });
-                    return error_response(status, message);
-                }
-                retry_count += 1;
-            }
-            Ok(response) => break response,
-            Err(error) => {
-                if retry_count as usize >= state.upstream_max_retries
-                    || !wait_before_retry(
-                        request_start_time,
-                        state.upstream_retry_max_elapsed,
-                        state.upstream_retry_base_delay,
-                        state.upstream_retry_max_delay,
-                        retry_count as usize,
-                        None,
-                    )
-                    .await
-                {
-                    drop(lease);
-                    let duration_ms = request_start_time.elapsed().as_millis() as u64;
-                    let err_msg = classify_upstream_error(&error);
-                    state.record_request_log(ProxyRequestLog {
-                        id: log_id,
-                        time: log_time,
-                        provider: log_provider,
-                        model: log_model,
-                        endpoint: log_endpoint,
-                        status: StatusCode::BAD_GATEWAY.as_u16(),
-                        duration_ms,
-                        thread_id: log_thread_id,
-                        error: Some(err_msg.to_string()),
-                        details: Some(format!(
-                            "Gateway error: {err_msg} after {retry_count} retries"
-                        )),
-                        retry_count,
-                        first_byte_ms: None,
-                        response_bytes: 0,
-                        stream_duration_ms: None,
-                        stream_completed: false,
-                        stream_error: None,
-                        requested_model,
-                        agent_guard: agent_guard.as_log_value().map(str::to_string),
-                        completed_without_tools: false,
-                        agent_nudged: false,
-                    });
-                    return error_response(StatusCode::BAD_GATEWAY, err_msg);
-                }
-                retry_count += 1;
-            }
+    let pin_route = bind_route_to_model(&route, &outbound_model);
+    let fetch = FetchUpstream {
+        client: state.client.clone(),
+        url: route.endpoint_url(endpoint),
+        headers: headers.clone(),
+        body: body.clone(),
+        start: request_start_time,
+        max_retries: state.upstream_max_retries,
+        retry_base_delay: state.upstream_retry_base_delay,
+        retry_max_delay: state.upstream_retry_max_delay,
+        retry_max_elapsed: state.upstream_retry_max_elapsed,
+        retry_count: 0,
+    };
+
+    if matches!(endpoint, UpstreamEndpoint::Responses) {
+        return stream_responses_early(
+            state,
+            fetch,
+            lease,
+            pin_route,
+            thread_id,
+            conversation_ids,
+            log_id,
+            log_time,
+            log_provider,
+            log_model,
+            log_display_name,
+            log_endpoint,
+            log_thread_id,
+            requested_model,
+            agent_guard,
+            allow_nudge,
+            tools_count,
+            restored_tools,
+            continue_nudge,
+            original_previous_response_id,
+            reasoning_effort,
+            service_tier,
+            nudge_template,
+            upstream_request_headers,
+            nudge_url,
+        )
+        .await;
+    }
+
+    let (upstream, retry_count) = match fetch_upstream(fetch).await {
+        Ok(result) => result,
+        Err(error) => {
+            drop(lease);
+            return record_fetch_error(
+                &state,
+                error,
+                log_id,
+                log_time,
+                log_provider,
+                log_model,
+                log_display_name,
+                log_endpoint,
+                log_thread_id,
+                requested_model,
+                agent_guard,
+                reasoning_effort,
+                service_tier,
+            );
         }
     };
 
     let status = upstream.status();
-    state
-        .metrics
-        .last_upstream_status
-        .store(status.as_u16(), Ordering::Release);
-    let duration_ms = request_start_time.elapsed().as_millis() as u64;
-    state.record_request_log(ProxyRequestLog {
-        id: log_id.clone(),
-        time: log_time.clone(),
-        provider: log_provider,
-        model: log_model.clone(),
-        endpoint: log_endpoint,
-        status: status.as_u16(),
-        duration_ms,
-        thread_id: log_thread_id.clone(),
-        error: if status.is_client_error() || status.is_server_error() {
-            Some(format!("HTTP {}", status.as_u16()))
-        } else {
-            None
-        },
-        details: Some(format!(
-            "Upstream returned status {} in {} ms after {} retries; tools={tools_count} restored_tools={restored_tools} continue={continue_nudge} prev={} guard={}",
-            status.as_u16(),
-            duration_ms,
-            retry_count,
-            original_previous_response_id.as_deref().unwrap_or("-"),
-            agent_guard.as_log_value().unwrap_or("none"),
-        )),
+    record_upstream_headers(
+        &state,
+        &log_id,
+        log_time.clone(),
+        log_provider,
+        log_model.clone(),
+        log_display_name,
+        log_endpoint,
+        log_thread_id.clone(),
+        requested_model.clone(),
+        agent_guard,
+        reasoning_effort.clone(),
+        service_tier.clone(),
+        allow_nudge,
+        tools_count,
+        restored_tools,
+        continue_nudge,
+        original_previous_response_id.as_deref(),
+        status,
         retry_count,
-        first_byte_ms: None,
-        response_bytes: 0,
-        stream_duration_ms: None,
-        stream_completed: false,
-        stream_error: None,
-        requested_model: requested_model.clone(),
-        agent_guard: agent_guard.as_log_value().map(str::to_string),
-        completed_without_tools: false,
-        agent_nudged: false,
-    });
-    append_agent_loop_log(&format!(
-        "{log_time} {log_id} thread={} model={log_model} tools={tools_count} restored={restored_tools} continue={continue_nudge} prev={} guard={} allow_nudge={allow_nudge} status={}",
-        log_thread_id.as_deref().unwrap_or("-"),
-        original_previous_response_id.as_deref().unwrap_or("-"),
-        agent_guard.as_log_value().unwrap_or("none"),
-        status.as_u16(),
-    ));
+        request_start_time,
+    );
     if status.is_client_error() || status.is_server_error() {
         drop(lease);
         return normalize_upstream_error(status, upstream).await;
     }
-    let pin_route = bind_route_to_model(&route, &outbound_model);
-    if let Some(thread_id) = thread_id.as_deref() {
-        state.routes.pin_thread(thread_id, Arc::clone(&pin_route));
-    }
-    for conversation_id in &conversation_ids {
-        state
-            .routes
-            .pin_conversation(conversation_id, Arc::clone(&pin_route));
-    }
+    pin_successful_route(&state, thread_id.as_deref(), &conversation_ids, &pin_route);
     let mut headers = sanitize_response_headers(upstream.headers());
-    if let Some(catalog) = state.routes.catalog_response() {
-        headers.insert(
-            X_MODELS_ETAG,
-            HeaderValue::from_str(&catalog_etag_for(&catalog))
-                .expect("catalog ETag is always valid ASCII"),
-        );
-    }
+    apply_streaming_headers(&mut headers, state.routes.catalog_response().as_ref());
     let emit_sse_heartbeats = is_text_event_stream(&headers);
     let heartbeat_interval = state.sse_heartbeat_interval;
-    let forward = SseForward {
-        scanner: ResponseIdScanner::default(),
-        agent: agent_loop::SseAgentState::default(),
-        pending: VecDeque::new(),
-        sse_tail: Vec::new(),
-        pin_state: Arc::clone(&state),
-        pin_route: Arc::clone(&pin_route),
-        log_id: log_id.clone(),
-        stream_start: request_start_time,
+    let forward = new_sse_forward(
+        Arc::clone(&state),
+        Arc::clone(&pin_route),
+        log_id.clone(),
+        request_start_time,
         lease,
-        response_bytes: 0,
-        first_byte_seen: false,
-        last_event_complete: true,
-        last_byte_was_lf: true,
-        parse_sse: emit_sse_heartbeats,
-        allow_nudge: allow_nudge && emit_sse_heartbeats,
-        mcp: mcp_compat::McpRewriteBuffer::default(),
-        force_nudge: agent_loop::should_force_nudge(&nudge_template),
-        nudge_used: false,
-        nudge_attempts: 0,
-        in_continuation: false,
-        continuation_id: None,
-        held_messages: Vec::new(),
+        emit_sse_heartbeats,
+        allow_nudge,
+        false,
         nudge_template,
-        nudge_headers: upstream_request_headers,
+        upstream_request_headers,
         nudge_url,
-    };
+    );
     let stream = stream::unfold(
         (
             Box::pin(upstream.bytes_stream()) as UpstreamByteStream,
@@ -2048,6 +2034,14 @@ async fn proxy_request(
                         }
                     }
                     HeartbeatPoll::Upstream(Err(_)) => {
+                        if forward.parse_sse {
+                            if let Some(bytes) =
+                                forward.terminate_sse("upstream response stream failed")
+                            {
+                                return Some((Ok(bytes), (upstream_stream, forward, true)));
+                            }
+                            return None;
+                        }
                         forward
                             .pin_state
                             .update_request_log(&forward.log_id, |log| {
@@ -2065,6 +2059,14 @@ async fn proxy_request(
                     HeartbeatPoll::Ended => {
                         if forward.try_start_nudge(&mut upstream_stream).await {
                             continue;
+                        }
+                        if forward.parse_sse {
+                            if let Some(bytes) = forward
+                                .terminate_sse("upstream closed the stream before completion")
+                            {
+                                return Some((Ok(bytes), (upstream_stream, forward, true)));
+                            }
+                            return None;
                         }
                         forward.flush_held_completed();
                         if let Some(bytes) = forward.take_pending() {
@@ -2089,6 +2091,770 @@ async fn proxy_request(
 
 fn unauthorized_response() -> Response {
     error_response(StatusCode::UNAUTHORIZED, "invalid local proxy bearer token")
+}
+
+struct FetchUpstream {
+    client: reqwest::Client,
+    url: Url,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    start: std::time::Instant,
+    max_retries: usize,
+    retry_base_delay: Duration,
+    retry_max_delay: Duration,
+    retry_max_elapsed: Duration,
+    retry_count: u32,
+}
+
+enum FetchError {
+    Status {
+        status: StatusCode,
+        message: String,
+        retry_count: u32,
+    },
+    Transport {
+        message: &'static str,
+        retry_count: u32,
+    },
+}
+
+async fn fetch_upstream(mut fetch: FetchUpstream) -> Result<(reqwest::Response, u32), FetchError> {
+    loop {
+        let attempt = fetch
+            .client
+            .post(fetch.url.clone())
+            .headers(fetch.headers.clone())
+            .body(fetch.body.clone())
+            .send()
+            .await;
+        match attempt {
+            Ok(response) if response.status().is_success() => {
+                return Ok((response, fetch.retry_count));
+            }
+            Ok(response) if is_retryable_status(response.status()) => {
+                let status = response.status();
+                let retry_after = retry_after_duration(response.headers());
+                let error_body = response.bytes().await.ok();
+                if fetch.retry_count as usize >= fetch.max_retries
+                    || !wait_before_retry(
+                        fetch.start,
+                        fetch.retry_max_elapsed,
+                        fetch.retry_base_delay,
+                        fetch.retry_max_delay,
+                        fetch.retry_count as usize,
+                        retry_after,
+                    )
+                    .await
+                {
+                    let message = error_body
+                        .as_deref()
+                        .and_then(json_error_message)
+                        .or_else(|| {
+                            error_body
+                                .as_deref()
+                                .and_then(|body| html_error_message(status, body))
+                        })
+                        .unwrap_or_else(|| format!("upstream provider returned {status}"));
+                    return Err(FetchError::Status {
+                        status,
+                        message,
+                        retry_count: fetch.retry_count,
+                    });
+                }
+                fetch.retry_count += 1;
+            }
+            Ok(response) => return Ok((response, fetch.retry_count)),
+            Err(error) => {
+                if fetch.retry_count as usize >= fetch.max_retries
+                    || !wait_before_retry(
+                        fetch.start,
+                        fetch.retry_max_elapsed,
+                        fetch.retry_base_delay,
+                        fetch.retry_max_delay,
+                        fetch.retry_count as usize,
+                        None,
+                    )
+                    .await
+                {
+                    return Err(FetchError::Transport {
+                        message: classify_upstream_error(&error),
+                        retry_count: fetch.retry_count,
+                    });
+                }
+                fetch.retry_count += 1;
+            }
+        }
+    }
+}
+
+fn record_fetch_error(
+    state: &ProxyState,
+    error: FetchError,
+    log_id: String,
+    log_time: String,
+    log_provider: String,
+    log_model: String,
+    log_display_name: String,
+    log_endpoint: String,
+    log_thread_id: Option<String>,
+    requested_model: Option<String>,
+    agent_guard: agent_loop::AgentLoopGuard,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+) -> Response {
+    match error {
+        FetchError::Status {
+            status,
+            message,
+            retry_count,
+        } => {
+            state.record_request_log(ProxyRequestLog {
+                id: log_id,
+                time: log_time,
+                provider: log_provider,
+                model: log_model,
+                display_name: log_display_name,
+                endpoint: log_endpoint,
+                status: status.as_u16(),
+                duration_ms: 0,
+                thread_id: log_thread_id,
+                error: Some(message.clone()),
+                details: Some(format!(
+                    "Upstream returned retryable status {status} after {retry_count} retries"
+                )),
+                retry_count,
+                first_byte_ms: None,
+                response_bytes: 0,
+                stream_duration_ms: None,
+                stream_completed: false,
+                stream_error: None,
+                requested_model,
+                agent_guard: agent_guard.as_log_value().map(str::to_string),
+                completed_without_tools: false,
+                agent_nudged: false,
+                started_at_ms: now_epoch_ms(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 0,
+                reasoning_effort,
+                finish_reason: Some("error".to_string()),
+                service_tier,
+            });
+            error_response(status, message)
+        }
+        FetchError::Transport {
+            message,
+            retry_count,
+        } => {
+            state.record_request_log(ProxyRequestLog {
+                id: log_id,
+                time: log_time,
+                provider: log_provider,
+                model: log_model,
+                display_name: log_display_name,
+                endpoint: log_endpoint,
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                duration_ms: 0,
+                thread_id: log_thread_id,
+                error: Some(message.to_string()),
+                details: Some(format!(
+                    "Gateway error: {message} after {retry_count} retries"
+                )),
+                retry_count,
+                first_byte_ms: None,
+                response_bytes: 0,
+                stream_duration_ms: None,
+                stream_completed: false,
+                stream_error: None,
+                requested_model,
+                agent_guard: agent_guard.as_log_value().map(str::to_string),
+                completed_without_tools: false,
+                agent_nudged: false,
+                started_at_ms: now_epoch_ms(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 0,
+                reasoning_effort,
+                finish_reason: Some("error".to_string()),
+                service_tier,
+            });
+            error_response(StatusCode::BAD_GATEWAY, message)
+        }
+    }
+}
+
+fn record_upstream_headers(
+    state: &ProxyState,
+    log_id: &str,
+    log_time: String,
+    log_provider: String,
+    log_model: String,
+    log_display_name: String,
+    log_endpoint: String,
+    log_thread_id: Option<String>,
+    requested_model: Option<String>,
+    agent_guard: agent_loop::AgentLoopGuard,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    allow_nudge: bool,
+    tools_count: usize,
+    restored_tools: bool,
+    continue_nudge: bool,
+    previous_response_id: Option<&str>,
+    status: StatusCode,
+    retry_count: u32,
+    request_start_time: std::time::Instant,
+) {
+    state
+        .metrics
+        .last_upstream_status
+        .store(status.as_u16(), Ordering::Release);
+    let duration_ms = request_start_time.elapsed().as_millis() as u64;
+    let details = format!(
+        "Upstream returned status {} in {} ms after {} retries; tools={tools_count} restored_tools={restored_tools} continue={continue_nudge} prev={} guard={}",
+        status.as_u16(),
+        duration_ms,
+        retry_count,
+        previous_response_id.unwrap_or("-"),
+        agent_guard.as_log_value().unwrap_or("none"),
+    );
+    let error = if status.is_client_error() || status.is_server_error() {
+        Some(format!("HTTP {}", status.as_u16()))
+    } else {
+        None
+    };
+    let mut updated = false;
+    state.update_request_log(log_id, |log| {
+        updated = true;
+        log.status = status.as_u16();
+        log.duration_ms = duration_ms;
+        log.retry_count = retry_count;
+        if error.is_some() {
+            log.error.clone_from(&error);
+        }
+        log.details = Some(match log.details.take() {
+            Some(existing) => format!("{existing}; {details}"),
+            None => details.clone(),
+        });
+    });
+    if !updated {
+        state.record_request_log(ProxyRequestLog {
+            id: log_id.to_string(),
+            time: log_time.clone(),
+            provider: log_provider,
+            model: log_model.clone(),
+            display_name: log_display_name,
+            endpoint: log_endpoint,
+            status: status.as_u16(),
+            duration_ms,
+            thread_id: log_thread_id.clone(),
+            error,
+            details: Some(details),
+            retry_count,
+            first_byte_ms: None,
+            response_bytes: 0,
+            stream_duration_ms: None,
+            stream_completed: false,
+            stream_error: None,
+            requested_model,
+            agent_guard: agent_guard.as_log_value().map(str::to_string),
+            completed_without_tools: false,
+            agent_nudged: false,
+            started_at_ms: now_epoch_ms(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            total_tokens: 0,
+            reasoning_effort,
+            finish_reason: None,
+            service_tier,
+        });
+    } else {
+        let _ = (
+            log_provider,
+            log_endpoint,
+            log_display_name,
+            requested_model,
+            reasoning_effort,
+            service_tier,
+        );
+    }
+    append_agent_loop_log(&format!(
+        "{log_time} {log_id} thread={} model={log_model} tools={tools_count} restored={restored_tools} continue={continue_nudge} prev={} guard={} allow_nudge={allow_nudge} status={}",
+        log_thread_id.as_deref().unwrap_or("-"),
+        previous_response_id.unwrap_or("-"),
+        agent_guard.as_log_value().unwrap_or("none"),
+        status.as_u16(),
+    ));
+}
+
+fn apply_streaming_headers(headers: &mut HeaderMap, catalog: Option<&CodexModelsResponse>) {
+    if let Some(catalog) = catalog {
+        headers.insert(
+            X_MODELS_ETAG,
+            HeaderValue::from_str(&catalog_etag_for(catalog))
+                .expect("catalog ETag is always valid ASCII"),
+        );
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(X_ACCEL_BUFFERING, HeaderValue::from_static("no"));
+}
+
+fn sse_response_headers(catalog: Option<&CodexModelsResponse>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    apply_streaming_headers(&mut headers, catalog);
+    headers
+}
+
+fn new_sse_forward(
+    state: Arc<ProxyState>,
+    pin_route: Arc<RouteConfig>,
+    log_id: String,
+    stream_start: std::time::Instant,
+    lease: RequestLease,
+    parse_sse: bool,
+    allow_nudge: bool,
+    early_created: bool,
+    nudge_template: Value,
+    nudge_headers: HeaderMap,
+    nudge_url: Url,
+) -> SseForward {
+    let mut forward = SseForward {
+        scanner: ResponseIdScanner::default(),
+        agent: agent_loop::SseAgentState::default(),
+        pending: VecDeque::new(),
+        sse_tail: Vec::new(),
+        pin_state: state,
+        pin_route,
+        log_id,
+        stream_start,
+        lease,
+        response_bytes: 0,
+        first_byte_seen: false,
+        last_event_complete: true,
+        last_byte_was_lf: true,
+        parse_sse,
+        allow_nudge: allow_nudge && parse_sse,
+        mcp: mcp_compat::McpRewriteBuffer::default(),
+        force_nudge: agent_loop::should_force_nudge(&nudge_template),
+        nudge_used: false,
+        nudge_attempts: 0,
+        in_continuation: false,
+        early_created,
+        live_text_forwarded: false,
+        continuation_id: None,
+        held_messages: Vec::new(),
+        nudge_template,
+        nudge_headers,
+        nudge_url,
+        token_usage: usage::TokenUsage::default(),
+    };
+    if early_created {
+        let response_id = format!("resp_cps_{}", uuid::Uuid::new_v4().simple());
+        forward.agent.response_id = Some(response_id.clone());
+        forward.queue_forward(agent_loop::sse_response_created(&response_id));
+    }
+    forward
+}
+
+fn sse_error_events(response_id: Option<&str>, message: &str) -> Bytes {
+    let id = response_id.unwrap_or("resp_cps_error");
+    Bytes::from(agent_loop::sse_response_failed(id, message))
+}
+
+fn pin_successful_route(
+    state: &ProxyState,
+    thread_id: Option<&str>,
+    conversation_ids: &[String],
+    pin_route: &Arc<RouteConfig>,
+) {
+    if let Some(thread_id) = thread_id {
+        state.routes.pin_thread(thread_id, Arc::clone(pin_route));
+    }
+    for conversation_id in conversation_ids {
+        state
+            .routes
+            .pin_conversation(conversation_id, Arc::clone(pin_route));
+    }
+}
+
+async fn stream_responses_early(
+    state: Arc<ProxyState>,
+    fetch: FetchUpstream,
+    lease: RequestLease,
+    pin_route: Arc<RouteConfig>,
+    thread_id: Option<String>,
+    conversation_ids: Vec<String>,
+    log_id: String,
+    log_time: String,
+    log_provider: String,
+    log_model: String,
+    log_display_name: String,
+    log_endpoint: String,
+    log_thread_id: Option<String>,
+    requested_model: Option<String>,
+    agent_guard: agent_loop::AgentLoopGuard,
+    allow_nudge: bool,
+    tools_count: usize,
+    restored_tools: bool,
+    continue_nudge: bool,
+    original_previous_response_id: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    nudge_template: Value,
+    upstream_request_headers: HeaderMap,
+    nudge_url: Url,
+) -> Response {
+    let heartbeat_interval = state.sse_heartbeat_interval;
+    let headers = sse_response_headers(state.routes.catalog_response().as_ref());
+    let forward = new_sse_forward(
+        Arc::clone(&state),
+        pin_route,
+        log_id.clone(),
+        fetch.start,
+        lease,
+        true,
+        allow_nudge,
+        true,
+        nudge_template,
+        upstream_request_headers,
+        nudge_url,
+    );
+    state.record_request_log(ProxyRequestLog {
+        id: log_id.clone(),
+        time: log_time.clone(),
+        provider: log_provider.clone(),
+        model: log_model.clone(),
+        display_name: log_display_name.clone(),
+        endpoint: log_endpoint.clone(),
+        status: StatusCode::OK.as_u16(),
+        duration_ms: 0,
+        thread_id: log_thread_id.clone(),
+        error: None,
+        details: Some("opened Codex SSE before upstream headers".to_string()),
+        retry_count: 0,
+        first_byte_ms: Some(0),
+        response_bytes: 0,
+        stream_duration_ms: None,
+        stream_completed: false,
+        stream_error: None,
+        requested_model: requested_model.clone(),
+        agent_guard: agent_guard.as_log_value().map(str::to_string),
+        completed_without_tools: false,
+        agent_nudged: false,
+        started_at_ms: now_epoch_ms(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+        total_tokens: 0,
+        reasoning_effort: reasoning_effort.clone(),
+        finish_reason: None,
+        service_tier: service_tier.clone(),
+    });
+    let start = fetch.start;
+    let stream = stream::unfold(
+        (
+            Some(tokio::spawn(fetch_upstream(fetch))),
+            Box::pin(stream::empty()) as UpstreamByteStream,
+            forward,
+            false,
+            false,
+        ),
+        move |(mut fetch, mut upstream_stream, mut forward, mut connected, finished)| {
+            let state = Arc::clone(&state);
+            let log_id = log_id.clone();
+            let log_time = log_time.clone();
+            let log_provider = log_provider.clone();
+            let log_model = log_model.clone();
+            let log_display_name = log_display_name.clone();
+            let log_endpoint = log_endpoint.clone();
+            let log_thread_id = log_thread_id.clone();
+            let requested_model = requested_model.clone();
+            let original_previous_response_id = original_previous_response_id.clone();
+            let reasoning_effort = reasoning_effort.clone();
+            let service_tier = service_tier.clone();
+            let thread_id = thread_id.clone();
+            let conversation_ids = conversation_ids.clone();
+            async move {
+                if finished {
+                    return None;
+                }
+                loop {
+                    if let Some(bytes) = forward.pending.pop_front() {
+                        (forward.last_event_complete, forward.last_byte_was_lf) =
+                            sse_boundary_after(true, true, &bytes);
+                        return Some((
+                            Ok::<Bytes, io::Error>(bytes),
+                            (fetch, upstream_stream, forward, connected, false),
+                        ));
+                    }
+                    if !connected {
+                        let Some(mut pending) = fetch.take() else {
+                            return Some((
+                                Ok(sse_error_events(
+                                    forward.agent.response_id.as_deref(),
+                                    "upstream request was dropped",
+                                )),
+                                (None, upstream_stream, forward, true, true),
+                            ));
+                        };
+                        match tokio::time::timeout(heartbeat_interval, &mut pending).await {
+                            Err(_) => {
+                                return Some((
+                                    Ok(Bytes::from_static(agent_loop::SSE_KEEP_ALIVE_HEARTBEAT)),
+                                    (Some(pending), upstream_stream, forward, false, false),
+                                ));
+                            }
+                            Ok(Ok(Ok((upstream, retry_count)))) => {
+                                let status = upstream.status();
+                                if !status.is_client_error() && !status.is_server_error() {
+                                    pin_successful_route(
+                                        &state,
+                                        thread_id.as_deref(),
+                                        &conversation_ids,
+                                        &forward.pin_route,
+                                    );
+                                    if let Some(response_id) = forward.agent.response_id.as_deref()
+                                    {
+                                        state.routes.pin_conversation(
+                                            response_id,
+                                            Arc::clone(&forward.pin_route),
+                                        );
+                                    }
+                                }
+                                record_upstream_headers(
+                                    &state,
+                                    &log_id,
+                                    log_time.clone(),
+                                    log_provider.clone(),
+                                    log_model.clone(),
+                                    log_display_name.clone(),
+                                    log_endpoint.clone(),
+                                    log_thread_id.clone(),
+                                    requested_model.clone(),
+                                    agent_guard,
+                                    reasoning_effort.clone(),
+                                    service_tier.clone(),
+                                    allow_nudge,
+                                    tools_count,
+                                    restored_tools,
+                                    continue_nudge,
+                                    original_previous_response_id.as_deref(),
+                                    status,
+                                    retry_count,
+                                    start,
+                                );
+                                if status.is_client_error() || status.is_server_error() {
+                                    let message = match upstream.bytes().await {
+                                        Ok(bytes) => json_error_message(&bytes)
+                                            .or_else(|| html_error_message(status, &bytes))
+                                            .unwrap_or_else(|| {
+                                                format!("upstream provider returned {status}")
+                                            }),
+                                        Err(_) => format!("upstream provider returned {status}"),
+                                    };
+                                    forward
+                                        .pin_state
+                                        .update_request_log(&forward.log_id, |log| {
+                                            log.status = status.as_u16();
+                                            log.error = Some(message.clone());
+                                            log.stream_error = Some(message.clone());
+                                            log.stream_completed = true;
+                                            log.stream_duration_ms =
+                                                Some(forward.stream_start.elapsed().as_millis()
+                                                    as u64);
+                                        });
+                                    return Some((
+                                        Ok(sse_error_events(
+                                            forward.agent.response_id.as_deref(),
+                                            &message,
+                                        )),
+                                        (None, upstream_stream, forward, true, true),
+                                    ));
+                                }
+                                if !is_text_event_stream(upstream.headers()) {
+                                    if status.is_success() {
+                                        let bytes = upstream.bytes().await.unwrap_or_default();
+                                        let payload = serde_json::from_slice::<Value>(&bytes).ok();
+                                        if let Some(id) = payload
+                                            .as_ref()
+                                            .and_then(|json| json.get("id").and_then(Value::as_str))
+                                        {
+                                            state.routes.pin_conversation(
+                                                id,
+                                                Arc::clone(&forward.pin_route),
+                                            );
+                                        }
+                                        if let Some(usage) =
+                                            payload.as_ref().and_then(usage::extract_token_usage)
+                                        {
+                                            forward.token_usage.merge(usage);
+                                        }
+                                        let response_id = forward
+                                            .agent
+                                            .response_id
+                                            .clone()
+                                            .unwrap_or_else(|| "resp_cps_json".to_string());
+                                        forward.queue_forward(agent_loop::sse_response_completed(
+                                            &response_id,
+                                            payload.as_ref(),
+                                        ));
+                                        if let Some(bytes) = forward.take_pending() {
+                                            (
+                                                forward.last_event_complete,
+                                                forward.last_byte_was_lf,
+                                            ) = sse_boundary_after(true, true, &bytes);
+                                            forward.finish_log();
+                                            return Some((
+                                                Ok(bytes),
+                                                (None, upstream_stream, forward, true, true),
+                                            ));
+                                        }
+                                        forward.finish_log();
+                                        return None;
+                                    }
+                                    let message = "upstream did not return an event stream";
+                                    forward
+                                        .pin_state
+                                        .update_request_log(&forward.log_id, |log| {
+                                            log.stream_error = Some(message.to_string());
+                                            log.stream_completed = true;
+                                            log.stream_duration_ms =
+                                                Some(forward.stream_start.elapsed().as_millis()
+                                                    as u64);
+                                        });
+                                    return Some((
+                                        Ok(sse_error_events(
+                                            forward.agent.response_id.as_deref(),
+                                            message,
+                                        )),
+                                        (None, upstream_stream, forward, true, true),
+                                    ));
+                                }
+                                upstream_stream = Box::pin(upstream.bytes_stream());
+                                fetch = None;
+                                connected = true;
+                                continue;
+                            }
+                            Ok(Ok(Err(error))) => {
+                                let (status, message, retry_count) = match error {
+                                    FetchError::Status {
+                                        status,
+                                        message,
+                                        retry_count,
+                                    } => (status, message, retry_count),
+                                    FetchError::Transport {
+                                        message,
+                                        retry_count,
+                                    } => {
+                                        (StatusCode::BAD_GATEWAY, message.to_string(), retry_count)
+                                    }
+                                };
+                                forward
+                                    .pin_state
+                                    .update_request_log(&forward.log_id, |log| {
+                                        log.status = status.as_u16();
+                                        log.error = Some(message.clone());
+                                        log.retry_count = retry_count;
+                                        log.stream_error = Some(message.clone());
+                                        log.stream_completed = true;
+                                        log.stream_duration_ms =
+                                            Some(forward.stream_start.elapsed().as_millis() as u64);
+                                    });
+                                return Some((
+                                    Ok(sse_error_events(
+                                        forward.agent.response_id.as_deref(),
+                                        &message,
+                                    )),
+                                    (None, upstream_stream, forward, true, true),
+                                ));
+                            }
+                            Ok(Err(_)) => {
+                                return Some((
+                                    Ok(sse_error_events(
+                                        forward.agent.response_id.as_deref(),
+                                        "upstream request was dropped",
+                                    )),
+                                    (None, upstream_stream, forward, true, true),
+                                ));
+                            }
+                        }
+                    }
+                    let emit_heartbeat = forward.sse_tail.is_empty() && forward.last_event_complete;
+                    match next_upstream_or_heartbeat(
+                        &mut upstream_stream,
+                        heartbeat_interval,
+                        emit_heartbeat,
+                    )
+                    .await
+                    {
+                        HeartbeatPoll::Heartbeat => {
+                            return Some((
+                                Ok(Bytes::from_static(agent_loop::SSE_KEEP_ALIVE_HEARTBEAT)),
+                                (fetch, upstream_stream, forward, connected, false),
+                            ));
+                        }
+                        HeartbeatPoll::Upstream(Ok(bytes)) => {
+                            if !forward.first_byte_seen {
+                                forward.first_byte_seen = true;
+                                forward
+                                    .pin_state
+                                    .update_request_log(&forward.log_id, |log| {
+                                        log.first_byte_ms =
+                                            Some(forward.stream_start.elapsed().as_millis() as u64);
+                                    });
+                            }
+                            forward.push_upstream_bytes(&bytes);
+                            if let Some(bytes) = forward.pending.pop_front() {
+                                (forward.last_event_complete, forward.last_byte_was_lf) =
+                                    sse_boundary_after(true, true, &bytes);
+                                return Some((
+                                    Ok(bytes),
+                                    (fetch, upstream_stream, forward, connected, false),
+                                ));
+                            }
+                        }
+                        HeartbeatPoll::Upstream(Err(_)) => {
+                            if let Some(bytes) =
+                                forward.terminate_sse("upstream response stream failed")
+                            {
+                                return Some((
+                                    Ok(bytes),
+                                    (fetch, upstream_stream, forward, connected, true),
+                                ));
+                            }
+                            return None;
+                        }
+                        HeartbeatPoll::Ended => {
+                            if forward.try_start_nudge(&mut upstream_stream).await {
+                                continue;
+                            }
+                            if let Some(bytes) = forward
+                                .terminate_sse("upstream closed the stream before completion")
+                            {
+                                return Some((
+                                    Ok(bytes),
+                                    (fetch, upstream_stream, forward, connected, true),
+                                ));
+                            }
+                            return None;
+                        }
+                    }
+                }
+            }
+        },
+    );
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    *response.headers_mut() = headers;
+    response
 }
 
 enum HeartbeatPoll<T> {
@@ -2166,11 +2932,14 @@ struct SseForward {
     nudge_used: bool,
     nudge_attempts: u8,
     in_continuation: bool,
+    early_created: bool,
+    live_text_forwarded: bool,
     continuation_id: Option<String>,
     held_messages: Vec<Vec<u8>>,
     nudge_template: Value,
     nudge_headers: HeaderMap,
     nudge_url: Url,
+    token_usage: usage::TokenUsage,
 }
 
 impl SseForward {
@@ -2197,12 +2966,24 @@ impl SseForward {
 
     fn ingest_sse_event(&mut self, mut event: Vec<u8>) {
         event = agent_loop::rewrite_apply_patch_event(&event);
+        event = agent_loop::rewrite_exec_command_event(&event);
+        if let Some(usage) = usage::extract_token_usage_from_sse(&event) {
+            self.token_usage.merge(usage);
+        }
+        if let Some(reason) = agent_loop::sse_data_json(&event)
+            .as_ref()
+            .and_then(extract_finish_reason)
+        {
+            self.pin_state.update_request_log(&self.log_id, |log| {
+                log.finish_reason = Some(reason);
+            });
+        }
         agent_loop::note_sse_event(&mut self.agent, &event);
-        if self.in_continuation {
+        if self.in_continuation || self.early_created {
             if let Some(id) = agent_loop::sse_response_id(&event)
                 && self.agent.response_id.as_deref() != Some(id.as_str())
             {
-                self.continuation_id.get_or_insert(id);
+                self.continuation_id = Some(id);
             }
             if agent_loop::is_response_created_event(&event) {
                 return;
@@ -2220,13 +3001,17 @@ impl SseForward {
         }
         if self.allow_nudge
             && !self.agent.saw_function_call
-            && agent_loop::is_assistant_text_event(&event)
+            && agent_loop::is_held_message_event(&event)
         {
             self.held_messages.push(event);
             return;
         }
         if self.allow_nudge && self.agent.saw_function_call {
             self.flush_held_messages();
+        }
+        if self.allow_nudge && agent_loop::is_live_text_event(&event) {
+            self.live_text_forwarded = true;
+            event = agent_loop::rephase_event_as_commentary(&event);
         }
         self.queue_forward(event);
     }
@@ -2249,6 +3034,35 @@ impl SseForward {
             all.extend_from_slice(&bytes);
         }
         Some(Bytes::from(all))
+    }
+
+    fn terminate_sse(&mut self, incomplete_message: &str) -> Option<Bytes> {
+        if self.agent.held_completed.is_none() {
+            self.held_messages.clear();
+            self.sse_tail.clear();
+            let _ = self.mcp.flush();
+            let id = self
+                .agent
+                .response_id
+                .clone()
+                .unwrap_or_else(|| "resp_cps_error".to_string());
+            self.queue_forward(agent_loop::sse_response_failed(&id, incomplete_message));
+            self.pin_state.update_request_log(&self.log_id, |log| {
+                if log.error.is_none() {
+                    log.error = Some(incomplete_message.to_string());
+                }
+                log.stream_error = Some(incomplete_message.to_string());
+            });
+        } else {
+            self.flush_held_completed();
+        }
+        let bytes = self.take_pending();
+        if let Some(ref chunk) = bytes {
+            (self.last_event_complete, self.last_byte_was_lf) =
+                sse_boundary_after(true, true, chunk);
+        }
+        self.finish_log();
+        bytes
     }
 
     async fn try_start_nudge(&mut self, upstream_stream: &mut UpstreamByteStream) -> bool {
@@ -2508,6 +3322,9 @@ impl SseForward {
         if self.agent.saw_function_call {
             return;
         }
+        if self.live_text_forwarded && agent_loop::is_status_one_liner(self.agent.status_text()) {
+            return;
+        }
         let text = agent_loop::collapse_repeated_text(self.agent.status_text());
         let as_commentary = self.nudge_used || agent_loop::is_status_one_liner(&text);
         if as_commentary {
@@ -2544,12 +3361,23 @@ impl SseForward {
     fn finish_log(&mut self) {
         let completed_without_tools =
             self.nudge_used || (self.allow_nudge && !self.agent.saw_function_call);
+        let usage = self.token_usage;
         self.pin_state.update_request_log(&self.log_id, |log| {
             log.stream_duration_ms = Some(self.stream_start.elapsed().as_millis() as u64);
             log.response_bytes = self.response_bytes;
             log.stream_completed = true;
             log.completed_without_tools = completed_without_tools;
             log.agent_nudged = self.nudge_used;
+            log.prompt_tokens = usage.prompt_tokens;
+            log.completion_tokens = usage.completion_tokens;
+            log.cached_tokens = usage.cached_tokens;
+            log.cache_write_tokens = usage.cache_write_tokens;
+            log.total_tokens = usage.total_tokens;
+            if self.agent.saw_function_call {
+                log.finish_reason = Some("tool_use".to_string());
+            } else if log.finish_reason.is_none() {
+                log.finish_reason = inferred_finish_reason(log, false);
+            }
         });
     }
 }
@@ -2831,6 +3659,58 @@ fn string_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+fn extract_reasoning_effort(body: &Value) -> Option<String> {
+    string_at(body, "/reasoning/effort")
+        .or_else(|| string_at(body, "/reasoning_effort"))
+        .map(str::to_string)
+}
+
+fn extract_service_tier(body: &Value) -> Option<String> {
+    if body.get("fast").and_then(Value::as_bool) == Some(true) {
+        return Some("fast".to_string());
+    }
+    string_at(body, "/service_tier")
+        .or_else(|| string_at(body, "/serviceTier"))
+        .map(str::to_string)
+}
+
+fn extract_finish_reason(json: &Value) -> Option<String> {
+    let kind = json.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "response.completed" {
+        return Some("stop".to_string());
+    }
+    if kind == "response.incomplete" {
+        return string_at(json, "/response/incomplete_details/reason")
+            .or_else(|| string_at(json, "/incomplete_details/reason"))
+            .map(str::to_string)
+            .or_else(|| Some("incomplete".to_string()));
+    }
+    if kind.contains("failed") || kind.contains("error") {
+        return Some("error".to_string());
+    }
+    string_at(json, "/response/status")
+        .or_else(|| string_at(json, "/status"))
+        .or_else(|| string_at(json, "/finish_reason"))
+        .map(|status| match status {
+            "completed" => "stop".to_string(),
+            "failed" => "error".to_string(),
+            other => other.to_string(),
+        })
+}
+
+fn inferred_finish_reason(log: &ProxyRequestLog, saw_function_call: bool) -> Option<String> {
+    if log.stream_error.is_some() || log.error.is_some() || log.status >= 400 {
+        return Some("error".to_string());
+    }
+    if saw_function_call {
+        return Some("tool_use".to_string());
+    }
+    if log.stream_completed {
+        return Some("stop".to_string());
+    }
+    None
+}
+
 fn validate_turn_key_part(name: &'static str, value: &str) -> Result<(), ProxyError> {
     if value.trim().is_empty() || value.len() > MAX_TURN_KEY_BYTES {
         return Err(ProxyError::InvalidTurnKey(name));
@@ -2973,6 +3853,13 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3476,8 +4363,12 @@ mod tests {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let upstream_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let proxy_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let upstream_port =
-            serve_http("HTTP/1.1 200 OK", "upstream-ok", upstream_hits.clone()).await;
+        let upstream_port = serve_http(
+            "HTTP/1.1 200 OK",
+            r#"{"ok":"upstream-ok"}"#,
+            upstream_hits.clone(),
+        )
+        .await;
         let proxy_port =
             serve_http("HTTP/1.1 502 Bad Gateway", "proxy-hit", proxy_hits.clone()).await;
         let _http = EnvGuard::set("HTTP_PROXY", &format!("http://127.0.0.1:{proxy_port}"));

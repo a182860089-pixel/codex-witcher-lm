@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -7,6 +7,10 @@ use url::Url;
 const CODEX_CLI_NOT_FOUND: &str =
     "the official Codex CLI could not be found; install or update @openai/codex";
 const MAX_LOGIN_URL_BYTES: usize = 8 * 1024;
+const OFFICIAL_CODEX_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
+const OFFICIAL_CODEX_PACKAGE_NAME: &str = "OpenAI.Codex";
+const CODEX_OPEN_FAILED: &str =
+    "未找到可启动的官方 Codex。请确认已安装 Microsoft Store 版或官方桌面版 Codex。";
 
 pub fn open_login_url(value: &str) -> Result<(), String> {
     let url = validate_login_url(value)?;
@@ -326,7 +330,7 @@ pub fn authorize_codex_parent() -> Result<(), String> {
 
 #[cfg(windows)]
 pub fn open_codex() -> Result<String, String> {
-    with_windows_runtime(open_codex_windows)
+    with_windows_runtime(open_codex_windows_with_retry)
 }
 
 #[cfg(windows)]
@@ -366,14 +370,10 @@ fn restart_codex_windows() -> Result<String, String> {
         }
     }
 
-    // Tree-kill leftovers that ignore a single TerminateProcess (hung UI / child trees).
-    for pid in &targets {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        killed.insert(*pid);
+    // One hidden tree-kill covers hung UI / child leftovers without flashing consoles.
+    if !targets.is_empty() {
+        taskkill_process_tree(&targets);
+        killed.extend(targets.iter().copied());
     }
 
     // Give Windows a moment to release package activation / file locks.
@@ -381,23 +381,44 @@ fn restart_codex_windows() -> Result<String, String> {
 
     // Second pass for stubborn leftovers.
     let remaining = discover_codex_process_ids().unwrap_or_default();
-    for pid in remaining {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        killed.insert(pid);
-        soft_failures = soft_failures.saturating_add(1);
+    if !remaining.is_empty() {
+        taskkill_process_tree(&remaining);
+        for pid in remaining {
+            killed.insert(pid);
+            soft_failures = soft_failures.saturating_add(1);
+        }
     }
     thread::sleep(Duration::from_millis(500));
 
-    let launch = open_codex_windows()?;
+    let launch = open_codex_windows_with_retry()?;
     Ok(format!(
         "terminated={} soft_failures={} launch={launch}",
         killed.len(),
         soft_failures
     ))
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn taskkill_process_tree(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new("taskkill");
+    command.arg("/F").arg("/T");
+    for pid in pids {
+        command.arg("/PID").arg(pid.to_string());
+    }
+    let _ = command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(windows)]
@@ -525,55 +546,49 @@ fn open_validated_login_url(value: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn open_codex_windows_with_retry() -> Result<String, String> {
+    use std::thread;
+    use std::time::Duration;
+
+    let mut last_error = None;
+    for attempt in 0..4 {
+        match open_codex_windows() {
+            Ok(detail) => return Ok(detail),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(350 + attempt * 250));
+    }
+    Err(last_error.unwrap_or_else(|| CODEX_OPEN_FAILED.to_string()))
+}
+
+#[cfg(windows)]
 fn open_codex_windows() -> Result<String, String> {
-    use windows::ApplicationModel::PackageSignatureKind;
-    use windows::Management::Deployment::PackageManager;
-    use windows::core::HSTRING;
-
-    let manager =
-        PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
-    let packages = manager
-        .FindPackagesByUserSecurityId(&HSTRING::new())
-        .map_err(|_| "Windows package discovery failed".to_string())?;
-    let mut candidates = Vec::new();
-    for package in packages {
-        let id = package
-            .Id()
-            .map_err(|_| "Windows package identity could not be read".to_string())?;
-        if id
-            .Name()
-            .map_err(|_| "Windows package identity could not be read".to_string())?
-            .to_string()
-            != "OpenAI.Codex"
-        {
-            continue;
-        }
-        if package
-            .IsResourcePackage()
-            .map_err(|_| "Windows package identity could not be read".to_string())?
-            || package
-                .IsDevelopmentMode()
-                .map_err(|_| "Windows package identity could not be read".to_string())?
-            || package
-                .SignatureKind()
-                .map_err(|_| "Windows package identity could not be read".to_string())?
-                != PackageSignatureKind::Store
-            || !package
-                .Status()
-                .and_then(|status| status.VerifyIsOK())
-                .map_err(|_| "Windows package status could not be read".to_string())?
-        {
-            continue;
-        }
-        candidates.push(package);
+    let aumid = official_codex_app_user_model_id();
+    if let Ok(detail) = open_codex_store_package() {
+        return Ok(detail);
     }
-    if candidates.len() != 1 {
-        return Err(
-            "expected exactly one registered official OpenAI.Codex Store package".to_string(),
-        );
+    if let Ok(detail) = activate_codex_aumid(&aumid) {
+        return Ok(detail);
     }
+    if let Ok(detail) = open_codex_via_apps_folder(&aumid) {
+        return Ok(detail);
+    }
+    if let Ok(detail) = open_codex_store_executable() {
+        return Ok(detail);
+    }
+    if let Ok(detail) = open_codex_desktop_sidecar() {
+        return Ok(detail);
+    }
+    Err(CODEX_OPEN_FAILED.to_string())
+}
 
-    let package = candidates.pop().expect("candidate count was checked");
+#[cfg(windows)]
+fn open_codex_store_package() -> Result<String, String> {
+    let mut candidates = official_codex_store_packages()?;
+    let Some(package) = select_newest_store_package(&mut candidates) else {
+        return Err("no registered official OpenAI.Codex Store package".to_string());
+    };
+
     let family_name = package
         .Id()
         .and_then(|id| id.FamilyName())
@@ -592,17 +607,13 @@ fn open_codex_windows() -> Result<String, String> {
         if valid_app_user_model_id(&app_user_model_id)
             && app_user_model_id.starts_with(&format!("{family_name}!"))
         {
-            launchable.push(entry);
+            launchable.push((app_user_model_id, entry));
         }
     }
-    if launchable.len() != 1 {
-        return Err(
-            "expected exactly one launchable application in the OpenAI.Codex package".to_string(),
-        );
-    }
-    let launched = launchable
-        .pop()
-        .expect("launchable count was checked")
+    let Some((_, entry)) = pick_preferred_launchable_entry(&mut launchable) else {
+        return Err("no launchable application in the OpenAI.Codex package".to_string());
+    };
+    let launched = entry
         .LaunchAsync()
         .and_then(|operation| operation.join())
         .map_err(|_| "Windows could not activate Codex".to_string())?;
@@ -610,6 +621,266 @@ fn open_codex_windows() -> Result<String, String> {
         return Err("Windows declined to activate Codex".to_string());
     }
     Ok(format!("store-package:{family_name}"))
+}
+
+#[cfg(windows)]
+fn official_codex_store_packages() -> Result<Vec<windows::ApplicationModel::Package>, String> {
+    use std::collections::HashSet;
+
+    use windows::Management::Deployment::PackageManager;
+    use windows::core::HSTRING;
+
+    let manager =
+        PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
+    let mut packages = Vec::new();
+    if let Ok(found) =
+        manager.FindPackagesByPackageFamilyName(&HSTRING::from(OFFICIAL_CODEX_PACKAGE_FAMILY))
+    {
+        packages.extend(found);
+    }
+    if let Ok(found) = manager.FindPackagesByUserSecurityId(&HSTRING::new()) {
+        packages.extend(found);
+    }
+    if packages
+        .iter()
+        .filter(|package| is_official_store_codex_package(package))
+        .count()
+        == 0
+    {
+        if let Ok(found) = manager.FindPackages() {
+            packages.extend(found);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for package in packages {
+        if !is_official_store_codex_package(&package) {
+            continue;
+        }
+        let Ok(id) = package.Id() else {
+            continue;
+        };
+        let full_name = id
+            .FullName()
+            .map(|name| name.to_string())
+            .or_else(|_| id.FamilyName().map(|name| name.to_string()))
+            .unwrap_or_default();
+        if full_name.is_empty() || !seen.insert(full_name) {
+            continue;
+        }
+        candidates.push(package);
+    }
+    Ok(candidates)
+}
+
+#[cfg(windows)]
+fn is_official_store_codex_package(package: &windows::ApplicationModel::Package) -> bool {
+    use windows::ApplicationModel::PackageSignatureKind;
+
+    let Ok(id) = package.Id() else {
+        return false;
+    };
+    let Ok(name) = id.Name() else {
+        return false;
+    };
+    if name.to_string() != OFFICIAL_CODEX_PACKAGE_NAME {
+        return false;
+    }
+    if package.IsResourcePackage() == Ok(true)
+        || package.IsBundle() == Ok(true)
+        || package.IsFramework() == Ok(true)
+        || package.IsDevelopmentMode() == Ok(true)
+        || package.SignatureKind() != Ok(PackageSignatureKind::Store)
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn select_newest_store_package(
+    packages: &mut Vec<windows::ApplicationModel::Package>,
+) -> Option<windows::ApplicationModel::Package> {
+    if packages.is_empty() {
+        return None;
+    }
+    packages.sort_by_key(store_package_version_key);
+    packages.pop()
+}
+
+#[cfg(windows)]
+fn store_package_version_key(package: &windows::ApplicationModel::Package) -> (u16, u16, u16, u16) {
+    package
+        .Id()
+        .ok()
+        .and_then(|id| id.Version().ok())
+        .map(|version| {
+            (
+                version.Major,
+                version.Minor,
+                version.Build,
+                version.Revision,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0))
+}
+
+#[cfg(windows)]
+fn pick_preferred_launchable_entry<T>(launchable: &mut Vec<(String, T)>) -> Option<(String, T)> {
+    if launchable.is_empty() {
+        return None;
+    }
+    if let Some(index) = launchable
+        .iter()
+        .position(|(aumid, _)| aumid.ends_with("!App"))
+    {
+        return Some(launchable.swap_remove(index));
+    }
+    Some(launchable.remove(0))
+}
+
+#[cfg(windows)]
+fn official_codex_app_user_model_id() -> String {
+    let family = official_codex_package_family_name()
+        .unwrap_or_else(|| OFFICIAL_CODEX_PACKAGE_FAMILY.to_string());
+    format!("{family}!App")
+}
+
+#[cfg(windows)]
+fn activate_codex_aumid(aumid: &str) -> Result<String, String> {
+    use windows::Win32::System::Com::CLSCTX_ALL;
+    use windows::Win32::System::Com::CoCreateInstance;
+    use windows::Win32::UI::Shell::AO_NONE;
+    use windows::Win32::UI::Shell::ApplicationActivationManager;
+    use windows::Win32::UI::Shell::IApplicationActivationManager;
+    use windows::core::PCWSTR;
+
+    if !valid_app_user_model_id(aumid) {
+        return Err("Codex application identity is invalid".to_string());
+    }
+    let manager: IApplicationActivationManager =
+        unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL) }
+            .map_err(|_| "could not create the Windows application activator".to_string())?;
+    let aumid_wide: Vec<u16> = aumid.encode_utf16().chain(Some(0)).collect();
+    let empty: [u16; 1] = [0];
+    unsafe {
+        manager.ActivateApplication(PCWSTR(aumid_wide.as_ptr()), PCWSTR(empty.as_ptr()), AO_NONE)
+    }
+    .map_err(|_| "Windows could not activate Codex".to_string())?;
+    Ok(format!("aumid:{aumid}"))
+}
+
+#[cfg(windows)]
+fn open_codex_via_apps_folder(aumid: &str) -> Result<String, String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::HSTRING;
+
+    if !valid_app_user_model_id(aumid) {
+        return Err("Codex application identity is invalid".to_string());
+    }
+    let target = HSTRING::from(format!("shell:AppsFolder\\{aumid}"));
+    let result = unsafe { ShellExecuteW(None, None, &target, None, None, SW_SHOWNORMAL) };
+    if result.0 as isize <= 32 {
+        return Err("could not activate Codex from AppsFolder".to_string());
+    }
+    Ok(format!("apps-folder:{aumid}"))
+}
+
+#[cfg(windows)]
+fn official_codex_package_family_name() -> Option<String> {
+    let mut packages = official_codex_store_packages().ok()?;
+    select_newest_store_package(&mut packages)?
+        .Id()
+        .ok()?
+        .FamilyName()
+        .ok()
+        .map(|name| name.to_string())
+}
+
+#[cfg(windows)]
+fn open_codex_store_executable() -> Result<String, String> {
+    let mut packages = official_codex_store_packages()?;
+    packages.sort_by_key(store_package_version_key);
+    for package in packages.into_iter().rev() {
+        let Ok(installed_path) = package.InstalledPath() else {
+            continue;
+        };
+        let exe = PathBuf::from(installed_path.to_string())
+            .join("app")
+            .join("ChatGPT.exe");
+        if exe.is_file() {
+            shell_open_path(&exe)?;
+            return Ok(format!("store-exe:{}", exe.display()));
+        }
+    }
+    Err("Codex Store executable is missing".to_string())
+}
+
+#[cfg(windows)]
+fn open_codex_desktop_sidecar() -> Result<String, String> {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return Err("LOCALAPPDATA is unavailable".to_string());
+    };
+    let bin = PathBuf::from(local)
+        .join("OpenAI")
+        .join("Codex")
+        .join("bin");
+    if !bin.is_dir() {
+        return Err("desktop Codex sidecar is missing".to_string());
+    }
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&bin) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let exe = if path.is_file() && name.eq_ignore_ascii_case("codex.exe") {
+                path
+            } else if path.is_dir()
+                && name.len() >= 8
+                && name.len() <= 64
+                && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                path.join("codex.exe")
+            } else {
+                continue;
+            };
+            if exe.is_file() {
+                if let Some(text) = exe.to_str() {
+                    if authenticode_signer_is_openai(text) {
+                        candidates.push(exe);
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    });
+    let Some(exe) = candidates.pop() else {
+        return Err("no signed desktop Codex executable was found".to_string());
+    };
+    shell_open_path(&exe)?;
+    Ok(format!("desktop-sidecar:{}", exe.display()))
+}
+
+#[cfg(windows)]
+fn shell_open_path(path: &Path) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::HSTRING;
+
+    let target = HSTRING::from(path.as_os_str());
+    let result = unsafe { ShellExecuteW(None, None, &target, None, None, SW_SHOWNORMAL) };
+    if result.0 as isize <= 32 {
+        return Err(format!("could not launch {}", path.display()));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -660,7 +931,7 @@ fn is_trusted_windows_codex_process(path: &str, store_roots: &[String]) -> bool 
         .iter()
         .filter(|root| path_is_within_case_insensitive(path, root))
         .count();
-    if matching_packages == 1 {
+    if matching_packages >= 1 {
         return true;
     }
     (is_official_windows_npm_codex_path(path) || is_official_windows_desktop_sidecar_path(path))
@@ -737,33 +1008,8 @@ fn process_image_path(pid: u32) -> Result<String, String> {
 
 #[cfg(windows)]
 fn official_codex_store_roots() -> Result<Vec<String>, String> {
-    use windows::ApplicationModel::PackageSignatureKind;
-    use windows::Management::Deployment::PackageManager;
-    use windows::core::HSTRING;
-
-    let manager =
-        PackageManager::new().map_err(|_| "Windows package discovery failed".to_string())?;
-    let packages = manager
-        .FindPackagesByUserSecurityId(&HSTRING::new())
-        .map_err(|_| "Windows package discovery failed".to_string())?;
     let mut roots = Vec::new();
-    for package in packages {
-        let is_official = package
-            .Id()
-            .and_then(|id| id.Name())
-            .is_ok_and(|name| name == "OpenAI.Codex")
-            && package.IsResourcePackage().is_ok_and(|value| !value)
-            && package.IsDevelopmentMode().is_ok_and(|value| !value)
-            && package
-                .SignatureKind()
-                .is_ok_and(|kind| kind == PackageSignatureKind::Store)
-            && package
-                .Status()
-                .and_then(|status| status.VerifyIsOK())
-                .is_ok_and(|value| value);
-        if !is_official {
-            continue;
-        }
+    for package in official_codex_store_packages()? {
         let Ok(installed_path) = package.InstalledPath() else {
             continue;
         };
@@ -1127,5 +1373,17 @@ mod tests {
         assert!(valid_app_user_model_id("OpenAI.Codex_test!App"));
         assert!(!valid_app_user_model_id("OpenAI.Codex test!App"));
         assert!(!valid_app_user_model_id("OpenAI.Codex_test"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prefers_the_app_entry_when_multiple_launchables_exist() {
+        let mut launchable = vec![
+            ("OpenAI.Codex_test!Other".to_string(), 1_u8),
+            ("OpenAI.Codex_test!App".to_string(), 2_u8),
+        ];
+        let picked = pick_preferred_launchable_entry(&mut launchable).expect("launchable");
+        assert_eq!(picked.0, "OpenAI.Codex_test!App");
+        assert_eq!(picked.1, 2);
     }
 }

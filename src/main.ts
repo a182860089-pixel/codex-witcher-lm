@@ -97,6 +97,50 @@ interface ProfileEditorOptions {
 
 type SwitchMode = "localProxy" | "directConfig";
 type AppPage = "dashboard" | "switcher" | "inspector" | "advanced";
+type UsageRange = "hour" | "day" | "minutes10" | "week" | "month" | "custom";
+
+interface UsageSeriesPoint {
+  label: string;
+  startMs: number;
+  cachedTokens: number;
+  uncachedTokens: number;
+  cacheWriteTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  calls: number;
+}
+
+interface UsageHeatCell {
+  date: string;
+  weekday: number;
+  totalTokens: number;
+  calls: number;
+}
+
+interface HeatMonthLabel {
+  label: string;
+  column: number;
+}
+
+interface UsageOverview {
+  range: string;
+  fromMs: number;
+  toMs: number;
+  calls: number;
+  success: number;
+  errors: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens?: number;
+  totalTokens: number;
+  cacheHitRate: number;
+  estimatedUsd: number;
+  cacheUsd: number;
+  series: UsageSeriesPoint[];
+  heatmap: UsageHeatCell[];
+  heatMonths: HeatMonthLabel[];
+}
 
 type OutboundProxyMode = "auto" | "direct" | "system";
 
@@ -291,6 +335,7 @@ interface RequestLogItem {
   time: string;
   provider: string;
   model: string;
+  displayName?: string;
   endpoint: string;
   status: number;
   durationMs: number;
@@ -307,35 +352,76 @@ interface RequestLogItem {
   agentGuard?: string;
   completedWithoutTools?: boolean;
   agentNudged?: boolean;
+  startedAtMs?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  cachedTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
+  reasoningEffort?: string;
+  finishReason?: string;
+  serviceTier?: string;
 }
+
+let usageRange: UsageRange = "month";
+let usageOverview: UsageOverview = {
+  range: "month",
+  fromMs: 0,
+  toMs: 0,
+  calls: 0,
+  success: 0,
+  errors: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+  cachedTokens: 0,
+  cacheWriteTokens: 0,
+  totalTokens: 0,
+  cacheHitRate: 0,
+  estimatedUsd: 0,
+  cacheUsd: 0,
+  series: [],
+  heatmap: [],
+  heatMonths: [],
+};
+let usageFetchToken = 0;
 
 let requestLogs: RequestLogItem[] = [
   {
     id: "req-init-1",
-    time: new Date(Date.now() - 120000).toLocaleTimeString(),
+    time: formatCallTime(Date.now() - 120000),
     provider: "当前配置",
     model: "codex-auto-review",
     endpoint: "/v1/responses",
     status: 200,
     durationMs: 420,
     threadId: "th_01a0901b",
+    startedAtMs: Date.now() - 120000,
+    streamCompleted: true,
+    reasoningEffort: "high",
+    finishReason: "stop",
     details: JSON.stringify({ model: "codex-auto-review", stream: true, status: "success", tokens: 312 }, null, 2)
   },
   {
     id: "req-init-2",
-    time: new Date(Date.now() - 65000).toLocaleTimeString(),
+    time: formatCallTime(Date.now() - 65000),
     provider: "当前配置",
     model: "gemini-3.8-flash",
     endpoint: "/v1/compact",
     status: 200,
     durationMs: 280,
     threadId: "th_01a0901b",
+    startedAtMs: Date.now() - 65000,
+    streamCompleted: true,
+    reasoningEffort: "medium",
+    finishReason: "stop",
     details: JSON.stringify({ model: "gemini-3.8-flash", compact: true, cached: true }, null, 2)
   }
 ];
 
 let selectedLogId: string | null = null;
 let logFilterStatus: "all" | "success" | "error" = "all";
+let logPageIndex = 1;
+let logPageSize = 20;
 
 let activePage: AppPage = "switcher";
 let discoveryId: string | null = null;
@@ -367,39 +453,44 @@ app.innerHTML = `
         </div>
         <div class="brand-copy">
           <strong>LM Codex Switch</strong>
-          <span>模型与接入</span>
         </div>
       </div>
 
       <nav class="sidebar-nav">
-        <button id="nav-dashboard" class="nav-item" type="button" aria-label="打开仪表盘">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" /><rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" /></svg>
-          <span>仪表盘</span>
-        </button>
-        <button id="nav-switcher" class="nav-item nav-item-active" type="button" aria-current="page">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4 7.5h16M4 16.5h16M8 4v7M16 13v7" />
-          </svg>
-          <span>模型切换</span>
-        </button>
-        <button id="nav-inspector" class="nav-item" type="button" aria-label="打开调用详情">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round" /><line x1="8" y1="11" x2="14" y2="11" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>
-          <span>调用详情</span>
-        </button>
-        <button
-          id="advanced-settings-toggle"
-          class="nav-item"
-          type="button"
-          aria-label="打开高级设置"
-          aria-controls="advanced-settings"
-          aria-expanded="false"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="12" cy="12" r="3" />
-            <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.82 2.82-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.04 1.56V21h-4v-.08A1.7 1.7 0 0 0 8.96 19.36a1.7 1.7 0 0 0-1.88.34l-.06.06-2.82-2.82.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3v-4h.04A1.7 1.7 0 0 0 4.6 8.92a1.7 1.7 0 0 0-.34-1.88L4.2 6.98l2.82-2.82.06.06a1.7 1.7 0 0 0 1.88.34A1.7 1.7 0 0 0 10 3V3h4v.08a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.82 2.82-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.56 1.04H21v4h-.04A1.7 1.7 0 0 0 19.4 15Z" />
-          </svg>
-          <span>高级设置</span>
-        </button>
+        <div class="nav-group">
+          <p class="nav-group-label">概览</p>
+          <button id="nav-dashboard" class="nav-item" type="button" aria-label="打开仪表盘">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" /><rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" /></svg>
+            <span>仪表盘</span>
+          </button>
+          <button id="nav-switcher" class="nav-item nav-item-active" type="button" aria-current="page">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7.5h16M4 16.5h16M8 4v7M16 13v7" />
+            </svg>
+            <span>模型切换</span>
+          </button>
+        </div>
+        <div class="nav-group">
+          <p class="nav-group-label">工具</p>
+          <button id="nav-inspector" class="nav-item" type="button" aria-label="打开调用详情">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" /><line x1="8" y1="11" x2="14" y2="11" /></svg>
+            <span>调用详情</span>
+          </button>
+          <button
+            id="advanced-settings-toggle"
+            class="nav-item"
+            type="button"
+            aria-label="打开高级设置"
+            aria-controls="advanced-settings"
+            aria-expanded="false"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+            </svg>
+            <span>高级设置</span>
+          </button>
+        </div>
       </nav>
 
       <div class="sidebar-footer">
@@ -418,7 +509,10 @@ app.innerHTML = `
           </div>
         </div>
         <div class="sidebar-footer-row">
-          <span id="app-version" class="version-label">Version</span>
+          <button id="check-update" class="check-update-btn" type="button" title="检查应用更新">
+            <span>检查更新</span>
+            <small id="app-version">Version</small>
+          </button>
           <button id="theme-toggle-btn" class="theme-toggle-btn" type="button" aria-label="切换浅色/深色主题" title="切换浅色/深色外观">
             <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
@@ -433,209 +527,169 @@ app.innerHTML = `
     </aside>
 
     <div class="workspace">
-      <header class="app-header">
-        <div class="page-heading">
-          <p>LM Codex Switch</p>
-          <h1 id="page-title">模型切换</h1>
-          <span id="page-description" hidden></span>
-        </div>
-        <div class="header-actions">
-          <button id="restart-codex" class="button button-toolbar" type="button" title="强制结束 Codex 相关进程并重新打开">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 6v6l4 2" />
-              <circle cx="12" cy="12" r="8" />
-              <path d="M16.5 7.5 19 5M19 5v4h-4" />
-            </svg>
-            <span>重启 Codex</span>
-          </button>
-          <button id="check-update" class="button button-toolbar" type="button" title="检查 GitHub 发布页是否有新版本">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 5v10M8 11l4 4 4-4" />
-              <path d="M6 19h12" />
-            </svg>
-            <span>检测更新</span>
-          </button>
-          <button id="refresh" class="button button-toolbar" type="button">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" />
-            </svg>
-            <span>刷新</span>
-          </button>
-        </div>
-      </header>
-
       <main class="content-scroll">
         
         <section id="dashboard-view" class="page-view dashboard-view" aria-labelledby="db-heading" hidden>
-          <div class="db-stats-grid">
-            <div class="db-card stat-card">
-              <div class="stat-header">
-                <span class="stat-title">当前活跃模型</span>
-                <span id="db-active-pulse" class="live-badge">
-                  <span class="pulse-dot"></span> 运行就绪
-                </span>
+          <div class="usage-head">
+            <h2 id="db-heading">概览</h2>
+            <div class="usage-toolbar">
+              <div class="usage-range" role="tablist" aria-label="用量时间范围">
+                <button class="usage-range-btn" type="button" data-usage-range="hour" role="tab">近1小时</button>
+                <button class="usage-range-btn" type="button" data-usage-range="day" role="tab">近1自然日</button>
+                <button class="usage-range-btn" type="button" data-usage-range="minutes10" role="tab">近10分钟</button>
+                <button class="usage-range-btn" type="button" data-usage-range="week" role="tab">近一周</button>
+                <button class="usage-range-btn is-active" type="button" data-usage-range="month" role="tab" aria-selected="true">近一个月</button>
+                <button class="usage-range-btn" type="button" data-usage-range="custom" role="tab">自定义</button>
               </div>
-              <div id="db-current-model" class="stat-value-primary">读取中…</div>
-              <div id="db-current-provider" class="stat-desc">供应商：正在连接…</div>
-            </div>
-
-            <div class="db-card stat-card">
-              <div class="stat-header">
-                <span class="stat-title">累计转发请求</span>
-                <svg class="stat-icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </div>
-              <div id="db-req-count" class="stat-value-num">--</div>
-              <div id="db-req-sub" class="stat-desc">活跃接入：已就绪</div>
-            </div>
-
-            <div class="db-card stat-card">
-              <div class="stat-header">
-                <span class="stat-title">平均响应延时</span>
-                <svg class="stat-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><polyline points="12 6 12 12 16 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </div>
-              <div id="db-avg-latency" class="stat-value-num">320 ms</div>
-              <div class="stat-desc">上游端点连通率 100%</div>
-            </div>
-
-            <div class="db-card stat-card">
-              <div class="stat-header">
-                <span class="stat-title">出站代理模式</span>
-                <svg class="stat-icon" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </div>
-              <div id="db-outbound-mode" class="stat-value-text">自动检测</div>
-              <div id="db-outbound-detail" class="stat-desc">直连 / 系统代理自适应</div>
+              <button id="usage-refresh" class="usage-refresh" type="button" aria-label="刷新用量" title="刷新用量">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" />
+                </svg>
+              </button>
             </div>
           </div>
-
-          <div class="db-middle-grid">
-            <div class="db-card quick-actions-card">
-              <div class="card-title-row">
-                <h3>快捷指令</h3>
-                <span class="card-badge-sub">一键控制</span>
-              </div>
-              <div class="quick-btn-group">
-                <button id="db-btn-restart" class="button button-secondary quick-btn" type="button">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v6l4 2" /><circle cx="12" cy="12" r="8" /><path d="M16.5 7.5 19 5M19 5v4h-4" /></svg>
-                  <span>立即重启 Codex</span>
-                </button>
-                <button id="db-btn-test-all" class="button button-secondary quick-btn" type="button">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg>
-                  <span>测速当前端点</span>
-                </button>
-                <button id="db-btn-to-switch" class="button button-primary quick-btn" type="button">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5h16M4 16.5h16M8 4v7M16 13v7" /></svg>
-                  <span>切换模型</span>
-                </button>
-              </div>
-            </div>
-
-            <div class="db-card health-banner-card">
-              <div class="card-title-row">
-                <h3>服务健康矩阵</h3>
-                <span class="health-dot dot-online"></span>
-              </div>
-              <div class="health-list">
-                <div class="health-row">
-                  <span>本地代理内核 (127.0.0.1)</span>
-                  <strong id="db-core-status" class="text-success">正常监听</strong>
-                </div>
-                <div class="health-row">
-                  <span>Codex 配置文件绑定</span>
-                  <strong id="db-bind-status" class="text-success">已安全挂载</strong>
-                </div>
-                <div class="health-row">
-                  <span>最近一次上游握手</span>
-                  <strong id="db-last-upstream" class="text-success">HTTP 200 OK</strong>
-                </div>
-              </div>
-            </div>
+          <div id="usage-custom" class="usage-custom" hidden>
+            <label>
+              <span>开始</span>
+              <input id="usage-from" type="date" />
+            </label>
+            <label>
+              <span>结束</span>
+              <input id="usage-to" type="date" />
+            </label>
+            <button id="usage-custom-apply" class="button button-secondary" type="button">应用</button>
           </div>
-
-          <div class="db-card mini-feed-card">
-            <div class="card-title-row">
-              <h3>最近请求流</h3>
-              <button id="db-goto-inspector" class="link-btn" type="button">查看完整日志 &rarr;</button>
+          <section class="usage-chart-card" aria-label="用量趋势">
+            <div id="usage-chart" class="usage-chart"></div>
+          </section>
+          <section class="usage-kpi-grid" aria-label="用量指标">
+            <article class="usage-kpi">
+              <div class="usage-kpi-label">
+                <span>缓存命中率</span>
+                <span class="usage-info" title="缓存输入 Token 占提示词 Token 的比例">i</span>
+              </div>
+              <div class="usage-gauge">
+                <svg viewBox="0 0 120 120" aria-hidden="true">
+                  <circle class="usage-gauge-track" cx="60" cy="60" r="46" />
+                  <circle id="usage-hit-ring" class="usage-gauge-value" cx="60" cy="60" r="46" />
+                </svg>
+                <strong id="usage-hit-rate">0%</strong>
+              </div>
+            </article>
+            <article class="usage-kpi">
+              <div class="usage-kpi-label">
+                <span>LLM 调用</span>
+                <span class="usage-info" title="本地代理转发的模型请求次数">i</span>
+              </div>
+              <strong id="usage-calls">0</strong>
+              <small id="usage-calls-sub">成功 0 / 异常 0</small>
+            </article>
+            <article class="usage-kpi">
+              <div class="usage-kpi-label">
+                <span>Token 消耗</span>
+                <span class="usage-info" title="提示词与模型输出 Token 合计">i</span>
+              </div>
+              <strong id="usage-tokens">0</strong>
+              <small id="usage-tokens-sub">提示词 0</small>
+            </article>
+            <article class="usage-kpi">
+              <div class="usage-kpi-label">
+                <span>价值估算</span>
+                <span class="usage-info" title="按公开单价估算，仅供参考">i</span>
+              </div>
+              <strong id="usage-cost">$0.00</strong>
+              <small id="usage-cost-sub">缓存读写 $0.00</small>
+            </article>
+          </section>
+          <section class="usage-heat-card" aria-label="年度用量热力图">
+            <div class="usage-heat-scroll">
+              <div id="usage-heat-months" class="usage-heat-months"></div>
+              <div id="usage-heatmap" class="usage-heatmap"></div>
             </div>
-            <div id="db-mini-feed-list" class="mini-feed-list">
-            </div>
-          </div>
+          </section>
+          <div id="usage-tooltip" class="usage-tooltip" hidden></div>
         </section>
 
         <section id="inspector-view" class="page-view inspector-view" aria-labelledby="insp-heading" hidden>
           <div class="inspector-header-bar">
-            <div class="inspector-filters">
-              <button id="insp-filter-all" class="filter-chip chip-active" type="button">全部调用</button>
-              <button id="insp-filter-success" class="filter-chip" type="button">仅成功 (2xx)</button>
-              <button id="insp-filter-error" class="filter-chip" type="button">仅异常</button>
+            <div class="inspector-title-group">
+              <h2 id="insp-heading" class="inspector-title">调用</h2>
+              <div class="inspector-filters" role="tablist" aria-label="按状态筛选">
+                <button id="insp-filter-all" class="filter-chip chip-active" type="button">全部</button>
+                <button id="insp-filter-success" class="filter-chip" type="button">成功</button>
+                <button id="insp-filter-error" class="filter-chip" type="button">异常</button>
+              </div>
             </div>
             <div class="inspector-actions">
-              <button id="insp-mock-ping" class="button button-secondary" type="button">模拟发包测速</button>
-              <button id="insp-clear-logs" class="button button-secondary" type="button">清空日志</button>
+              <button id="insp-mock-ping" class="button button-quiet" type="button">测速</button>
+              <button id="insp-clear-logs" class="button button-quiet" type="button">清空</button>
+              <button id="insp-refresh" class="button button-icon" type="button" aria-label="刷新调用记录" title="刷新">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" />
+                </svg>
+              </button>
             </div>
           </div>
 
-          <div class="inspector-split-layout">
+          <div class="inspector-table-card">
             <div class="inspector-table-container">
               <table class="inspector-table">
                 <thead>
                   <tr>
-                    <th style="width: 70px;">状态</th>
-                    <th style="width: 90px;">时间</th>
-                    <th>模型</th>
-                    <th>端点</th>
-                    <th style="width: 80px;">耗时</th>
-                    <th style="width: 60px;">详情</th>
+                    <th>状态</th>
+                    <th>显示名称</th>
+                    <th>时间</th>
+                    <th>模型名称</th>
+                    <th>思考强度</th>
+                    <th>Fast</th>
+                    <th>调用类型</th>
+                    <th>路由</th>
+                    <th>Finish Reason</th>
+                    <th>HTTP</th>
+                    <th>耗时</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="inspector-log-tbody">
                 </tbody>
               </table>
             </div>
-
-            <div id="inspector-detail-panel" class="inspector-detail-panel">
-              <div class="detail-panel-header">
-                <h4>请求检视器</h4>
-                <span id="detail-panel-id" class="panel-sub-id">请选择一条请求</span>
-              </div>
-              <div id="detail-panel-content" class="detail-panel-content">
-                <div class="detail-empty-placeholder">
-                  <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-                  <p>在左侧列表中点击任意一次请求记录，查看端点元数据与详细 JSON 报文。</p>
-                </div>
-              </div>
-            </div>
+            <div class="inspector-pager" id="inspector-pager"></div>
           </div>
         </section>
 
         <section id="switcher-page" class="page-view" aria-labelledby="current-title">
-          <section class="current-section">
-            <div class="current-heading">
-              <div class="current-symbol" aria-hidden="true">
-                <svg viewBox="0 0 24 24">
-                  <path d="m8 7 5 5-5 5M13 7l5 5-5 5" />
-                </svg>
+          <section class="settings-block">
+            <h2 class="list-section-title">当前使用</h2>
+            <section class="current-section grouped-list">
+              <div class="list-row current-heading">
+                <div class="current-symbol" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <path d="m8 7 5 5-5 5M13 7l5 5-5 5" />
+                  </svg>
+                </div>
+                <div class="current-copy list-copy">
+                  <h2 id="current-title">正在读取…</h2>
+                  <p id="current-kicker">当前模型</p>
+                </div>
+                <span id="current-badge" class="badge">读取中</span>
               </div>
-              <div class="current-copy">
-                <p id="current-kicker" class="section-kicker">当前模型</p>
-                <h2 id="current-title">正在读取…</h2>
+              <div id="current-details" class="current-details"></div>
+              <p id="current-https-ip-warning" class="current-https-ip-warning" hidden></p>
+              <div id="current-proxy-actions" class="current-proxy-actions list-row-actions" hidden>
+                <button id="repair-proxy" class="button button-primary" type="button">一键修复</button>
+                <button id="stop-proxy-main" class="button button-quiet danger-text" type="button">关闭快速切换</button>
               </div>
-              <span id="current-badge" class="badge">读取中</span>
-            </div>
-            <div id="current-details" class="current-details"></div>
-            <p id="current-https-ip-warning" class="current-https-ip-warning" hidden></p>
-            <div id="current-proxy-actions" class="current-proxy-actions" hidden>
-              <button id="repair-proxy" class="button button-primary" type="button">一键修复</button>
-              <button id="stop-proxy-main" class="button button-secondary danger-text" type="button">关闭快速切换</button>
-            </div>
+            </section>
           </section>
 
-          <section class="connections-section" aria-labelledby="connections-title">
+          <section class="connections-section settings-block" aria-labelledby="connections-title">
             <div class="section-title-row">
               <div>
-                <h2 id="connections-title">可用接入</h2>
-                <p id="connections-help">选择接入和模型，应用会自动完成切换。</p>
+                <h2 id="connections-title" class="list-section-title">接入</h2>
+                <p id="connections-help">选择一项即可切换。</p>
               </div>
-              <button id="add-connection" class="button button-primary" type="button">
+              <button id="add-connection" class="button button-quiet" type="button">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M12 5v14M5 12h14" />
                 </svg>
@@ -643,18 +697,9 @@ app.innerHTML = `
               </button>
             </div>
 
-            <div class="provider-list">
+            <div class="provider-list grouped-list">
               <article class="official-section" aria-labelledby="official-title">
-                <div class="provider-heading">
-                  <div class="provider-icon provider-icon-official" aria-hidden="true">O</div>
-                  <div>
-                    <p class="section-kicker">Codex 内置</p>
-                    <h3 id="official-title">OpenAI 官方账号</h3>
-                    <p>登录凭据始终由 Codex 管理。</p>
-                  </div>
-                  <span id="official-badge" class="badge badge-neutral">未保存</span>
-                </div>
-                <div id="official-profile" class="official-profile"></div>
+                <div id="official-profile"></div>
               </article>
               <div id="profiles" class="profile-grid"></div>
             </div>
@@ -668,7 +713,7 @@ app.innerHTML = `
               <h2 id="switch-mode-title">切换与恢复</h2>
               <p>默认推荐快速切换。兼容模式和恢复工具只在排查问题时使用。</p>
             </div>
-            <button id="advanced-settings-close" class="button button-secondary" type="button">
+            <button id="advanced-settings-close" class="button button-quiet" type="button">
               返回模型切换
             </button>
           </div>
@@ -761,13 +806,14 @@ app.innerHTML = `
               </div>
               <div class="mode-summary-actions">
                 <button id="restore" class="button button-quiet" type="button">撤销上次更改</button>
+                <button id="restart-codex" class="button button-secondary" type="button">重启 Codex</button>
                 <button id="open-codex" class="button button-secondary" type="button" hidden>重新打开 Codex</button>
                 <button id="stop-proxy" class="button button-secondary danger-text" type="button" hidden>关闭快速切换</button>
               </div>
             </div>
           </section>
 
-                    <section class="settings-group" aria-labelledby="tool-channel-heading">
+          <section class="settings-group" aria-labelledby="tool-channel-heading">
             <div class="settings-group-heading">
               <h3 id="tool-channel-heading">Codex 工具通道</h3>
               <p>修复 Windows 沙箱 ACL / Guardian 模式导致的 shell、Node、MCP 全挂。升级后可在此一键处理。</p>
@@ -952,6 +998,28 @@ app.innerHTML = `
       </div>
     </div>
   </dialog>
+
+  <dialog id="inspector-detail" class="notice-dialog inspector-detail-dialog" aria-labelledby="inspector-detail-title">
+    <div class="inspector-detail-sheet">
+      <header class="inspector-detail-head">
+        <div>
+          <p class="section-kicker">请求详情</p>
+          <h2 id="inspector-detail-title">调用记录</h2>
+          <p id="inspector-detail-id" class="panel-sub-id">未选中请求</p>
+        </div>
+        <button id="inspector-detail-close" class="button button-icon" type="button" aria-label="关闭">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m7 7 10 10M17 7 7 17" />
+          </svg>
+        </button>
+      </header>
+      <div id="inspector-detail-content" class="inspector-detail-body">
+        <div class="detail-empty-placeholder">
+          <p>选择一条请求，查看元数据与报文。</p>
+        </div>
+      </div>
+    </div>
+  </dialog>
 `;
 
 const status = required<HTMLOutputElement>("#status");
@@ -1007,6 +1075,70 @@ function initTheme(): void {
 
 initTheme();
 
+const MORE_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.4" /><circle cx="12" cy="12" r="1.4" /><circle cx="18" cy="12" r="1.4" /></svg>';
+
+function closeAllMenus(except?: HTMLElement): void {
+  document.querySelectorAll<HTMLElement>(".row-menu").forEach((menu) => {
+    if (menu === except) return;
+    menu.hidden = true;
+    menu.style.top = "";
+    menu.style.bottom = "";
+    const owner = menu
+      .closest(".row-more")
+      ?.querySelector<HTMLElement>("[aria-expanded]");
+    owner?.setAttribute("aria-expanded", "false");
+  });
+}
+
+function toggleMenu(button: HTMLElement, menu: HTMLElement): void {
+  const willOpen = menu.hidden;
+  closeAllMenus(willOpen ? menu : undefined);
+  menu.hidden = !willOpen;
+  button.setAttribute("aria-expanded", String(willOpen));
+  if (willOpen) positionOverflowMenu(menu);
+}
+
+function positionOverflowMenu(menu: HTMLElement): void {
+  menu.style.top = "";
+  menu.style.bottom = "";
+  const rect = menu.getBoundingClientRect();
+  const scroller = document.querySelector<HTMLElement>(".content-scroll");
+  const scrollerBottom = scroller?.getBoundingClientRect().bottom ?? window.innerHeight;
+  if (rect.bottom > scrollerBottom - 8) {
+    menu.style.top = "auto";
+    menu.style.bottom = "calc(100% + 6px)";
+  }
+}
+
+function bindOverflowMenus(root: ParentNode = document): void {
+  root.querySelectorAll<HTMLButtonElement>("[data-row-more]").forEach((button) => {
+    if (button.dataset.menuBound === "1") return;
+    button.dataset.menuBound = "1";
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = button.parentElement?.querySelector<HTMLElement>(".row-menu");
+      if (!menu) return;
+      toggleMenu(button, menu);
+    });
+    const menu = button.parentElement?.querySelector<HTMLElement>(".row-menu");
+    menu?.addEventListener("click", (event) => event.stopPropagation());
+  });
+}
+
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    closeAllMenus();
+    return;
+  }
+  if (target.closest(".row-more")) return;
+  closeAllMenus();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeAllMenus();
+});
+
 required<HTMLButtonElement>("#detect-outbound").addEventListener("click", () => {
   void refreshOutboundProxy(true);
 });
@@ -1019,7 +1151,6 @@ required<HTMLButtonElement>("#ensure-outbound").addEventListener("click", () => 
 required<HTMLButtonElement>("#restart-codex").addEventListener("click", () => {
   void restartCodexHard();
 });
-required<HTMLButtonElement>("#refresh").addEventListener("click", refreshDashboard);
 required<HTMLButtonElement>("#check-update").addEventListener("click", () => {
   void checkAppUpdate(true);
 });
@@ -1068,18 +1199,26 @@ required<HTMLButtonElement>("#advanced-settings-close").addEventListener("click"
   required<HTMLButtonElement>("#nav-switcher").focus();
 });
 
-required<HTMLButtonElement>("#db-btn-restart").addEventListener("click", () => {
-  void restartCodexHard();
+document.querySelectorAll<HTMLButtonElement>("[data-usage-range]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const range = button.dataset.usageRange as UsageRange | undefined;
+    if (range) void setUsageRange(range);
+  });
 });
-required<HTMLButtonElement>("#db-btn-test-all").addEventListener("click", () => {
-  void mockPingEndpoint();
+required<HTMLButtonElement>("#usage-refresh").addEventListener("click", () => {
+  void fetchUsageOverview();
 });
-required<HTMLButtonElement>("#db-btn-to-switch").addEventListener("click", () => {
-  switchAppPage("switcher");
+required<HTMLButtonElement>("#usage-custom-apply").addEventListener("click", () => {
+  void fetchUsageOverview();
 });
-required<HTMLButtonElement>("#db-goto-inspector").addEventListener("click", () => {
-  switchAppPage("inspector");
-});
+const usageChart = required<HTMLElement>("#usage-chart");
+usageChart.addEventListener("pointerover", onUsageChartPointer);
+usageChart.addEventListener("pointermove", onUsageChartPointer);
+usageChart.addEventListener("pointerleave", hideUsageTooltip);
+const usageHeatmap = required<HTMLElement>("#usage-heatmap");
+usageHeatmap.addEventListener("pointerover", onUsageHeatPointer);
+usageHeatmap.addEventListener("pointermove", onUsageHeatPointer);
+usageHeatmap.addEventListener("pointerleave", hideUsageTooltip);
 
 required<HTMLButtonElement>("#insp-filter-all").addEventListener("click", () => {
   setLogFilter("all");
@@ -1095,6 +1234,21 @@ required<HTMLButtonElement>("#insp-mock-ping").addEventListener("click", () => {
 });
 required<HTMLButtonElement>("#insp-clear-logs").addEventListener("click", () => {
   clearRequestLogs();
+});
+required<HTMLButtonElement>("#insp-refresh").addEventListener("click", () => {
+  void fetchProxyRequestLogs();
+});
+required<HTMLButtonElement>("#inspector-detail-close").addEventListener("click", () => {
+  closeInspectorDetail();
+});
+required<HTMLDialogElement>("#inspector-detail").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeInspectorDetail();
+});
+required<HTMLDialogElement>("#inspector-detail").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeInspectorDetail();
+  }
 });
 
 required<HTMLButtonElement>("#mode-local-proxy").addEventListener("click", () =>
@@ -1128,11 +1282,14 @@ required<HTMLButtonElement>("#open-codex").addEventListener("click", () => openC
 required<HTMLButtonElement>("#add-connection").addEventListener("click", openEditor);
 required<HTMLElement>("#official-profile").addEventListener("click", (event) => {
   const target = event.target;
-  if (!(target instanceof HTMLButtonElement)) return;
-  if (target.dataset.officialAction === "login") void loginOfficialAccount();
-  if (target.dataset.officialAction === "relogin") void reloginOfficialAccount();
-  if (target.dataset.officialAction === "activate") void activateOfficial();
-  if (target.dataset.officialAction === "logout") void logoutOfficialAccount();
+  if (!(target instanceof Element)) return;
+  const button = target.closest<HTMLButtonElement>("[data-official-action]");
+  if (!button) return;
+  closeAllMenus();
+  if (button.dataset.officialAction === "login") void loginOfficialAccount();
+  if (button.dataset.officialAction === "relogin") void reloginOfficialAccount();
+  if (button.dataset.officialAction === "activate") void activateOfficial();
+  if (button.dataset.officialAction === "logout") void logoutOfficialAccount();
 });
 required<HTMLButtonElement>("#choose-official-connection").addEventListener("click", async () => {
   await closeEditor();
@@ -1210,9 +1367,10 @@ required<HTMLDialogElement>("#editor").addEventListener("cancel", (event) => {
 });
 
 setInterval(() => {
-  if (localProxy.running) {
+  if (localProxy.running || activePage === "inspector") {
     void fetchProxyRequestLogs();
   }
+  if (localProxy.running && activePage === "dashboard") void fetchUsageOverview();
 }, 2500);
 
 void refreshDashboard().then(() => {
@@ -1284,8 +1442,6 @@ function switchAppPage(page: AppPage): void {
   const navSwitcher = required<HTMLButtonElement>("#nav-switcher");
   const navInspector = required<HTMLButtonElement>("#nav-inspector");
   const navAdvanced = required<HTMLButtonElement>("#advanced-settings-toggle");
-  const pageTitle = required<HTMLElement>("#page-title");
-  const pageDescription = required<HTMLElement>("#page-description");
 
   dashboardEl.hidden = page !== "dashboard";
   switcher.hidden = page !== "switcher";
@@ -1304,23 +1460,14 @@ function switchAppPage(page: AppPage): void {
   navAdvanced.setAttribute("aria-expanded", String(page === "advanced"));
 
   if (page === "dashboard") {
-    pageTitle.textContent = "服务仪表盘";
-    pageDescription.textContent = "实时查看模型状态、请求统计与节点握手健康矩阵。";
-    pageDescription.hidden = false;
+    if (usageOverview.series.length === 0) {
+      usageOverview = emptyUsageOverview(usageRange);
+    }
     renderDashboardPage();
-  } else if (page === "switcher") {
-    pageTitle.textContent = "模型切换";
-    pageDescription.textContent = "";
-    pageDescription.hidden = true;
+    void fetchUsageOverview();
   } else if (page === "inspector") {
-    pageTitle.textContent = "调用详情";
-    pageDescription.textContent = "抓取与排查转发日志、报文分析及连通性探针。";
-    pageDescription.hidden = false;
     renderInspectorPage();
-  } else {
-    pageTitle.textContent = "高级设置";
-    pageDescription.textContent = "切换工作方式，查看服务状态或安全恢复设置。";
-    pageDescription.hidden = false;
+    void fetchProxyRequestLogs();
   }
 
   required<HTMLElement>(".content-scroll").scrollTo({
@@ -1336,81 +1483,442 @@ function setAdvancedSettingsVisible(visible: boolean): void {
   switchAppPage(visible ? "advanced" : "switcher");
 }
 
-function renderDashboardPage(): void {
-  const modelEl = document.querySelector<HTMLElement>("#db-current-model");
-  const providerEl = document.querySelector<HTMLElement>("#db-current-provider");
-  const reqCountEl = document.querySelector<HTMLElement>("#db-req-count");
-  const avgLatencyEl = document.querySelector<HTMLElement>("#db-avg-latency");
-  const outboundModeEl = document.querySelector<HTMLElement>("#db-outbound-mode");
-  const outboundDetailEl = document.querySelector<HTMLElement>("#db-outbound-detail");
-  const feedList = document.querySelector<HTMLElement>("#db-mini-feed-list");
-  const coreStatus = document.querySelector<HTMLElement>("#db-core-status");
-
-  const proxyProfile = dashboard.profiles.find((p) => p.id === localProxy.currentProfileId);
-  const proxyIsActive = localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
-  const activeModel = proxyIsActive ? (localProxy.currentModelId ?? "自动选择") : (dashboard.current.modelId ?? "OpenAI 官方路由");
-  const activeProvider = proxyIsActive ? (proxyProfile?.display_name ?? "快捷接入") : (dashboard.current.providerName ?? "OpenAI 账号");
-
-  if (modelEl) modelEl.textContent = activeModel;
-  if (providerEl) providerEl.textContent = "接入供应商：" + activeProvider;
-  if (reqCountEl) reqCountEl.textContent = String(requestLogs.length) + " 次";
-
-  if (avgLatencyEl) {
-    const avg = requestLogs.length > 0 ? Math.round(requestLogs.reduce((acc, cur) => acc + cur.durationMs, 0) / requestLogs.length) : 0;
-    avgLatencyEl.textContent = String(avg || 240) + " ms";
-  }
-
-  if (outboundModeEl) {
-    outboundModeEl.textContent = outboundProxyModeLabel(localProxy.outboundProxyMode || "auto");
-  }
-  if (outboundDetailEl) {
-    outboundDetailEl.textContent = outboundProxy?.detail || "回环代理正常监听中";
-  }
-  if (coreStatus) {
-    coreStatus.textContent = localProxy.running ? "127.0.0.1:15722 正常监听" : "未运行 (可一键修复)";
-    coreStatus.className = localProxy.running ? "text-success" : "text-warning";
-  }
-
-  if (feedList) {
-    const recent = requestLogs.slice(0, 5);
-    if (recent.length === 0) {
-      feedList.innerHTML = "<div class=\"mini-feed-empty\">暂无请求日志</div>";
-    } else {
-      feedList.innerHTML = recent.map((item) => {
-        const pillClass = item.status >= 200 && item.status < 300 ? "pill-success" : "pill-danger";
-        return "<div class=\"mini-feed-item\">" +
-          "<span class=\"status-pill " + pillClass + "\">" + item.status + "</span>" +
-          "<span class=\"feed-time\">" + escapeHtml(item.time) + "</span>" +
-          "<strong class=\"feed-model\">" + escapeHtml(item.model) + "</strong>" +
-          "<span class=\"feed-endpoint\">" + escapeHtml(item.endpoint) + "</span>" +
-          "<span class=\"feed-duration\">" + item.durationMs + " ms</span>" +
-          "</div>";
-      }).join("");
+function emptyUsageOverview(range: UsageRange): UsageOverview {
+  const now = Date.now();
+  const dayMs = 86_400_000;
+  const seriesCount = range === "minutes10" ? 10 : range === "hour" ? 12 : range === "day" ? 24 : range === "week" ? 7 : 31;
+  const series = Array.from({ length: seriesCount }, (_, index) => {
+    const start = now - (seriesCount - 1 - index) * dayMs;
+    const date = new Date(start);
+    return {
+      label:
+        range === "minutes10" || range === "hour" || range === "day"
+          ? String(date.getHours()).padStart(2, "0") + ":00"
+          : date.getDay() === 0
+            ? "周日"
+            : date.getDay() === 6
+              ? "周六"
+              : date.getMonth() + 1 + "/" + date.getDate(),
+      startMs: start,
+      cachedTokens: 0,
+      uncachedTokens: 0,
+      cacheWriteTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      calls: 0,
+    };
+  });
+  const weekday = new Date().getDay();
+  const end = now + (6 - weekday) * dayMs;
+  const start = end - 52 * 7 * dayMs;
+  const heatmap: UsageHeatCell[] = [];
+  const heatMonths: HeatMonthLabel[] = [];
+  let lastMonth = -1;
+  for (let index = 0; index < 53 * 7; index += 1) {
+    const time = start + index * dayMs;
+    const date = new Date(time);
+    const iso =
+      date.getFullYear() +
+      "-" +
+      String(date.getMonth() + 1).padStart(2, "0") +
+      "-" +
+      String(date.getDate()).padStart(2, "0");
+    heatmap.push({
+      date: iso,
+      weekday: date.getDay(),
+      totalTokens: 0,
+      calls: 0,
+    });
+    if (date.getDay() === 0 && date.getMonth() !== lastMonth) {
+      lastMonth = date.getMonth();
+      heatMonths.push({ label: date.getMonth() + 1 + "月", column: Math.floor(index / 7) });
     }
   }
+  return {
+    range,
+    fromMs: 0,
+    toMs: 0,
+    calls: 0,
+    success: 0,
+    errors: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    cacheHitRate: 0,
+    estimatedUsd: 0,
+    cacheUsd: 0,
+    series,
+    heatmap,
+    heatMonths,
+  };
+}
+
+function customUsageBounds(): { fromMs?: number; toMs?: number } {
+  const fromValue = document.querySelector<HTMLInputElement>("#usage-from")?.value;
+  const toValue = document.querySelector<HTMLInputElement>("#usage-to")?.value;
+  const fromMs = fromValue ? Date.parse(fromValue + "T00:00:00+08:00") : undefined;
+  const toMs = toValue ? Date.parse(toValue + "T23:59:59+08:00") : undefined;
+  return {
+    fromMs: Number.isFinite(fromMs) ? fromMs : undefined,
+    toMs: Number.isFinite(toMs) ? toMs : undefined,
+  };
+}
+
+async function setUsageRange(range: UsageRange): Promise<void> {
+  usageRange = range;
+  document.querySelectorAll<HTMLButtonElement>("[data-usage-range]").forEach((button) => {
+    const active = button.dataset.usageRange === range;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  const custom = document.querySelector<HTMLElement>("#usage-custom");
+  if (custom) custom.hidden = range !== "custom";
+  await fetchUsageOverview();
+}
+
+async function fetchUsageOverview(): Promise<void> {
+  const token = ++usageFetchToken;
+  if (!nativeAvailable) {
+    usageOverview = emptyUsageOverview(usageRange);
+    renderDashboardPage();
+    return;
+  }
+  try {
+    const bounds = usageRange === "custom" ? customUsageBounds() : {};
+    const overview = await invoke<UsageOverview>("get_usage_overview", {
+      range: usageRange,
+      fromMs: bounds.fromMs ?? null,
+      toMs: bounds.toMs ?? null,
+    });
+    if (token !== usageFetchToken) return;
+    usageOverview = overview;
+    renderDashboardPage();
+  } catch (error) {
+    console.warn("Failed to load usage overview:", error);
+    if (token !== usageFetchToken) return;
+    usageOverview = emptyUsageOverview(usageRange);
+    renderDashboardPage();
+  }
+}
+
+function formatCompactCount(value: number): string {
+  if (value >= 1_000_000_000) return (value / 1_000_000_000).toFixed(1).replace(/\.0$/, "") + "B";
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (value >= 10_000) return (value / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
+  return String(value);
+}
+
+function formatUsd(value: number): string {
+  return "$" + value.toFixed(2);
+}
+
+function formatTokenTooltip(value: number): string {
+  return formatCompactCount(value);
+}
+
+function stackedSeries(point: UsageSeriesPoint): Array<{ key: string; value: number }> {
+  return [
+    { key: "uncached", value: point.uncachedTokens || 0 },
+    { key: "cached", value: point.cachedTokens || 0 },
+    { key: "write", value: point.cacheWriteTokens || 0 },
+    { key: "output", value: point.completionTokens || 0 },
+  ];
+}
+
+function renderDashboardPage(): void {
+  const overview = usageOverview;
+  const hitRate = required<HTMLElement>("#usage-hit-rate");
+  const hitRing = required<SVGCircleElement>("#usage-hit-ring");
+  const calls = required<HTMLElement>("#usage-calls");
+  const callsSub = required<HTMLElement>("#usage-calls-sub");
+  const tokens = required<HTMLElement>("#usage-tokens");
+  const tokensSub = required<HTMLElement>("#usage-tokens-sub");
+  const cost = required<HTMLElement>("#usage-cost");
+  const costSub = required<HTMLElement>("#usage-cost-sub");
+  const chart = required<HTMLElement>("#usage-chart");
+  const months = required<HTMLElement>("#usage-heat-months");
+  const heatmap = required<HTMLElement>("#usage-heatmap");
+
+  hitRate.textContent = overview.cacheHitRate.toFixed(2) + "%";
+  const circumference = 2 * Math.PI * 46;
+  hitRing.style.strokeDasharray = String(circumference);
+  hitRing.style.strokeDashoffset = String(
+    circumference * (1 - Math.min(Math.max(overview.cacheHitRate, 0), 100) / 100),
+  );
+  calls.textContent = formatCompactCount(overview.calls);
+  callsSub.textContent = "成功 " + overview.success + " / 异常 " + overview.errors;
+  tokens.textContent = formatCompactCount(overview.totalTokens);
+  tokensSub.textContent = "提示词 " + formatCompactCount(overview.promptTokens);
+  cost.textContent = formatUsd(overview.estimatedUsd);
+  costSub.textContent = "缓存读写 " + formatUsd(overview.cacheUsd);
+
+  const maxTotal = Math.max(
+    1,
+    ...overview.series.map((point) =>
+      stackedSeries(point).reduce((sum, part) => sum + part.value, 0),
+    ),
+  );
+  chart.classList.toggle("usage-chart-dense", overview.series.length > 24);
+  chart.innerHTML = overview.series
+    .map((point, index) => {
+      const stacks = stackedSeries(point)
+        .filter((part) => part.value > 0)
+        .map((part) => {
+          const height = Math.max(3, (part.value / maxTotal) * 100);
+          return "<span class=\"usage-bar-seg usage-bar-" + part.key + "\" style=\"height:" + height + "%\"></span>";
+        })
+        .join("");
+      const title = escapeHtml(point.label);
+      return (
+        "<button class=\"usage-bar\" type=\"button\" data-series-index=\"" +
+        index +
+        "\" aria-label=\"" +
+        title +
+        "\">" +
+        "<span class=\"usage-bar-track\">" +
+        "<span class=\"usage-bar-stack\">" +
+        stacks +
+        "</span>" +
+        "</span>" +
+        "<span class=\"usage-bar-label\">" +
+        title +
+        "</span>" +
+        "</button>"
+      );
+    })
+    .join("");
+
+  const weekCount = Math.max(1, Math.ceil((overview.heatmap.length || 53 * 7) / 7));
+  const cellSize = 11;
+  const cellGap = 3;
+  const weekWidth = cellSize + cellGap;
+  heatmap.style.setProperty("--heat-weeks", String(weekCount));
+  heatmap.innerHTML = overview.heatmap
+    .map((cell, index) => {
+      const level =
+        cell.totalTokens <= 0 ? 0 : cell.totalTokens < 8_000 ? 1 : cell.totalTokens < 80_000 ? 2 : cell.totalTokens < 800_000 ? 3 : 4;
+      return (
+        "<span class=\"usage-heat-cell heat-l" +
+        level +
+        "\" data-heat-index=\"" +
+        index +
+        "\"></span>"
+      );
+    })
+    .join("");
+  months.style.width = weekCount * weekWidth - cellGap + "px";
+  months.innerHTML = overview.heatMonths
+    .map((month) => {
+      return (
+        "<span style=\"left:" +
+        month.column * weekWidth +
+        "px\">" +
+        escapeHtml(month.label) +
+        "</span>"
+      );
+    })
+    .join("");
+}
+
+function usageTooltipContent(point: UsageSeriesPoint): string {
+  return (
+    "<strong>" +
+    escapeHtml(point.label) +
+    "</strong>" +
+    "<span>总请求：" +
+    (point.calls || 0) +
+    "</span>" +
+    "<span class=\"usage-tip-row\"><i class=\"dot-uncached\"></i>输入（非缓存）：" +
+    formatTokenTooltip(point.uncachedTokens || 0) +
+    "</span>" +
+    "<span class=\"usage-tip-row\"><i class=\"dot-cached\"></i>缓存输入：" +
+    formatTokenTooltip(point.cachedTokens || 0) +
+    "</span>" +
+    "<span class=\"usage-tip-row\"><i class=\"dot-write\"></i>缓存写入：" +
+    formatTokenTooltip(point.cacheWriteTokens || 0) +
+    "</span>" +
+    "<span class=\"usage-tip-row\"><i class=\"dot-output\"></i>模型输出：" +
+    formatTokenTooltip(point.completionTokens || 0) +
+    "</span>"
+  );
+}
+
+function heatTooltipContent(cell: UsageHeatCell): string {
+  return (
+    "<strong>" +
+    escapeHtml(cell.date) +
+    "</strong>" +
+    "<span>请求 " +
+    cell.calls +
+    "</span>" +
+    "<span>Token " +
+    formatCompactCount(cell.totalTokens) +
+    "</span>"
+  );
+}
+
+function placeUsageTooltip(event: PointerEvent, html: string): void {
+  const tooltip = required<HTMLElement>("#usage-tooltip");
+  const page = required<HTMLElement>("#dashboard-view");
+  tooltip.innerHTML = html;
+  tooltip.hidden = false;
+  const pageRect = page.getBoundingClientRect();
+  const x = Math.min(
+    Math.max(event.clientX - pageRect.left + 12, 8),
+    Math.max(8, pageRect.width - tooltip.offsetWidth - 8),
+  );
+  const y = Math.min(
+    Math.max(event.clientY - pageRect.top + 12, 8),
+    Math.max(8, pageRect.height - tooltip.offsetHeight - 8),
+  );
+  tooltip.style.left = x + "px";
+  tooltip.style.top = y + "px";
+}
+
+function hideUsageTooltip(): void {
+  const tooltip = document.querySelector<HTMLElement>("#usage-tooltip");
+  if (tooltip) tooltip.hidden = true;
+}
+
+function onUsageChartPointer(event: PointerEvent): void {
+  const target = (event.target as HTMLElement).closest<HTMLElement>("[data-series-index]");
+  if (!target) {
+    hideUsageTooltip();
+    return;
+  }
+  const index = Number(target.dataset.seriesIndex);
+  const point = usageOverview.series[index];
+  if (!point) return;
+  placeUsageTooltip(event, usageTooltipContent(point));
+}
+
+function onUsageHeatPointer(event: PointerEvent): void {
+  const target = (event.target as HTMLElement).closest<HTMLElement>("[data-heat-index]");
+  if (!target) {
+    hideUsageTooltip();
+    return;
+  }
+  const index = Number(target.dataset.heatIndex);
+  const cell = usageOverview.heatmap[index];
+  if (!cell) return;
+  placeUsageTooltip(event, heatTooltipContent(cell));
 }
 
 function setLogFilter(status: "all" | "success" | "error"): void {
   logFilterStatus = status;
+  logPageIndex = 1;
   document.querySelector<HTMLElement>("#insp-filter-all")?.classList.toggle("chip-active", status === "all");
   document.querySelector<HTMLElement>("#insp-filter-success")?.classList.toggle("chip-active", status === "success");
   document.querySelector<HTMLElement>("#insp-filter-error")?.classList.toggle("chip-active", status === "error");
   renderInspectorPage();
 }
 
+function filteredRequestLogs(): RequestLogItem[] {
+  if (logFilterStatus === "success") {
+    return requestLogs.filter((item) => inspectorRowKind(item) === "completed");
+  }
+  if (logFilterStatus === "error") {
+    return requestLogs.filter((item) => inspectorRowKind(item) === "error");
+  }
+  return requestLogs;
+}
+
+function inspectorRowKind(item: RequestLogItem): "running" | "completed" | "error" {
+  if (item.streamError || item.status === 0 || item.status >= 400) {
+    return "error";
+  }
+  if (item.streamCompleted) return "completed";
+  if (item.status >= 200 && item.status < 300) return "running";
+  return "error";
+}
+
+function formatCallTime(value: number | string | undefined, fallback = ""): string {
+  const date = typeof value === "number"
+    ? new Date(value)
+    : typeof value === "string" && /^\d{1,2}:\d{2}:\d{2}$/.test(value)
+      ? null
+      : value
+        ? new Date(value)
+        : null;
+  if (date && !Number.isNaN(date.getTime())) {
+    const month = String(date.getMonth() + 1);
+    const day = String(date.getDate());
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    const seconds = String(date.getSeconds()).padStart(2, "0");
+    return `${date.getFullYear()}/${month}/${day} ${hours}:${minutes}:${seconds}`;
+  }
+  return fallback || String(value ?? "—");
+}
+
+function formatCallDuration(item: RequestLogItem): string {
+  const ms = item.streamDurationMs ?? item.durationMs;
+  if (!ms) return inspectorRowKind(item) === "running" ? "—" : "0";
+  return String(ms);
+}
+
+function reasoningEffortLabel(value?: string): string {
+  const effort = (value || "").toLowerCase();
+  if (effort === "xhigh" || effort === "x-high") return "极高";
+  if (effort === "high") return "高";
+  if (effort === "medium") return "中";
+  if (effort === "low") return "低";
+  if (effort === "minimal" || effort === "none") return "最低";
+  return value || "—";
+}
+
+function isFastCall(item: RequestLogItem): boolean {
+  return (item.serviceTier || "").toLowerCase() === "fast";
+}
+
+function callTypeLabel(item: RequestLogItem): string {
+  return item.endpoint.includes("compact") ? "Compact" : "LLM";
+}
+
+function routeLabel(): string {
+  return "BYOK";
+}
+
+function displayNameForLog(item: RequestLogItem): string {
+  if (item.displayName) return item.displayName;
+  const slug = item.model;
+  for (const profile of dashboard.profiles) {
+    const model = profile.models.find((entry) => entry.id === slug);
+    if (model?.display_name) return model.display_name;
+  }
+  return slug;
+}
+
+function finishReasonLabel(item: RequestLogItem): string {
+  if (inspectorRowKind(item) === "running") return "—";
+  return item.finishReason || (inspectorRowKind(item) === "error" ? "error" : "—");
+}
+
+function inspectorStatusMarkup(item: RequestLogItem): string {
+  const kind = inspectorRowKind(item);
+  const label = kind === "running" ? "running" : kind === "completed" ? "completed" : "error";
+  return "<span class=\"call-status call-status-" + kind + "\">" + label + "</span>";
+}
+
+function inspectorEyeIcon(): string {
+  return "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z\" /><circle cx=\"12\" cy=\"12\" r=\"3\" /></svg>";
+}
+
 async function fetchProxyRequestLogs(): Promise<void> {
-  if (!nativeAvailable) return;
+  if (!nativeAvailable) {
+    refreshInspectorUi();
+    return;
+  }
   try {
     const realLogs = await invoke<RequestLogItem[]>("get_proxy_request_logs");
-    if (Array.isArray(realLogs) && realLogs.length > 0) {
+    if (Array.isArray(realLogs)) {
       requestLogs = realLogs;
-      if (!selectedLogId || !requestLogs.some((l) => l.id === selectedLogId)) {
-        selectedLogId = requestLogs[0]?.id ?? null;
+      if (selectedLogId && !requestLogs.some((item) => item.id === selectedLogId)) {
+        selectedLogId = null;
       }
-      renderDashboardPage();
-      if (!required<HTMLElement>("#inspector-view").hidden) {
-        renderInspectorPage();
-      }
+      refreshInspectorUi();
     }
   } catch (e) {
     console.warn("Failed to load proxy request logs:", e);
@@ -1423,8 +1931,9 @@ async function clearRequestLogs(): Promise<void> {
   }
   requestLogs = [];
   selectedLogId = null;
-  renderInspectorPage();
-  renderDashboardPage();
+  logPageIndex = 1;
+  closeInspectorDetail();
+  refreshInspectorUi();
   setStatus("已清空所有本地调用日志。", "info");
 }
 
@@ -1439,12 +1948,15 @@ async function mockPingEndpoint(): Promise<void> {
 
     const newItem: RequestLogItem = {
       id: "req-" + Date.now().toString(36),
-      time: new Date().toLocaleTimeString(),
+      time: formatCallTime(Date.now()),
       provider: proxyProfile ? proxyProfile.display_name : "OpenAI 官方",
       model: currentModel,
-      endpoint: targetEndpoint,
+      endpoint: "/v1/responses",
       status: 200,
       durationMs: latency,
+      startedAtMs: Date.now(),
+      streamCompleted: true,
+      finishReason: "stop",
       details: JSON.stringify({
         probe: "speed_test",
         timestamp: new Date().toISOString(),
@@ -1456,52 +1968,111 @@ async function mockPingEndpoint(): Promise<void> {
     };
     requestLogs.unshift(newItem);
     selectedLogId = newItem.id;
-    renderDashboardPage();
-    renderInspectorPage();
+    logPageIndex = 1;
+    refreshInspectorUi();
     return "端点连通成功，握手耗时 " + latency + " ms。";
   });
 }
 
 function renderInspectorPage(): void {
   const tbody = document.querySelector<HTMLElement>("#inspector-log-tbody");
+  const pager = document.querySelector<HTMLElement>("#inspector-pager");
   if (!tbody) return;
 
-  let filtered = requestLogs;
-  if (logFilterStatus === "success") {
-    filtered = requestLogs.filter((l) => l.status >= 200 && l.status < 300);
-  } else if (logFilterStatus === "error") {
-    filtered = requestLogs.filter((l) => l.status >= 400 || l.status === 0);
-  }
+  const filtered = filteredRequestLogs();
+  const pageCount = Math.max(1, Math.ceil(filtered.length / logPageSize));
+  if (logPageIndex > pageCount) logPageIndex = pageCount;
+  if (logPageIndex < 1) logPageIndex = 1;
+  const start = (logPageIndex - 1) * logPageSize;
+  const pageItems = filtered.slice(start, start + logPageSize);
 
-  if (filtered.length === 0) {
-    tbody.innerHTML = "<tr><td colspan=\"6\" class=\"table-empty-row\">暂无符合条件的请求记录</td></tr>";
+  if (pageItems.length === 0) {
+    tbody.innerHTML = "<tr><td colspan=\"12\" class=\"table-empty-row\">暂无符合条件的请求记录</td></tr>";
   } else {
-    tbody.innerHTML = filtered.map((item) => {
-      const pillClass = item.status >= 200 && item.status < 300 ? "pill-success" : "pill-danger";
-      const isSelected = selectedLogId === item.id ? "inspector-row-selected" : "";
-      return "<tr class=\"inspector-row " + isSelected + "\" data-log-id=\"" + item.id + "\">" +
-        "<td><span class=\"status-pill " + pillClass + "\">" + item.status + "</span></td>" +
-        "<td>" + escapeHtml(item.time) + "</td>" +
-        "<td><strong>" + escapeHtml(item.model) + "</strong></td>" +
-        "<td class=\"cell-endpoint\" title=\"" + escapeHtml(item.endpoint) + "\">" + escapeHtml(item.endpoint) + "</td>" +
-        "<td>" + item.durationMs + " ms</td>" +
-        "<td><button class=\"button button-quiet button-compact\" type=\"button\" data-log-id=\"" + item.id + "\">检视</button></td>" +
+    tbody.innerHTML = pageItems.map((item) => {
+      const isSelected = selectedLogId === item.id ? " inspector-row-selected" : "";
+      return "<tr class=\"inspector-row" + isSelected + "\" data-log-id=\"" + escapeHtml(item.id) + "\">" +
+        "<td>" + inspectorStatusMarkup(item) + "</td>" +
+        "<td class=\"cell-name\">" + escapeHtml(displayNameForLog(item)) + "</td>" +
+        "<td class=\"cell-time\">" + escapeHtml(formatCallTime(item.startedAtMs, item.time)) + "</td>" +
+        "<td class=\"cell-model\">" + escapeHtml(item.model) + "</td>" +
+        "<td>" + escapeHtml(reasoningEffortLabel(item.reasoningEffort)) + "</td>" +
+        "<td>" + (isFastCall(item) ? "是" : "否") + "</td>" +
+        "<td>" + escapeHtml(callTypeLabel(item)) + "</td>" +
+        "<td>" + escapeHtml(routeLabel()) + "</td>" +
+        "<td class=\"cell-finish\">" + escapeHtml(finishReasonLabel(item)) + "</td>" +
+        "<td class=\"cell-http\">" + item.status + "</td>" +
+        "<td class=\"cell-duration\">" + escapeHtml(formatCallDuration(item)) + "</td>" +
+        "<td class=\"cell-action\">" +
+          "<button class=\"inspector-eye\" type=\"button\" data-inspect-id=\"" + escapeHtml(item.id) + "\" aria-label=\"查看请求详情\">" +
+            inspectorEyeIcon() +
+          "</button>" +
+        "</td>" +
         "</tr>";
     }).join("");
   }
 
-  tbody.querySelectorAll<HTMLElement>("[data-log-id]").forEach((el) => {
-    el.addEventListener("click", () => {
-      const logId = el.dataset.logId;
-      if (logId) {
-        selectedLogId = logId;
-        renderInspectorDetail();
-        renderInspectorPage();
-      }
+  tbody.querySelectorAll<HTMLElement>(".inspector-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const logId = row.dataset.logId;
+      if (!logId) return;
+      selectedLogId = logId;
+      renderInspectorPage();
+    });
+  });
+  tbody.querySelectorAll<HTMLButtonElement>("[data-inspect-id]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const logId = button.dataset.inspectId;
+      if (!logId) return;
+      selectedLogId = logId;
+      renderInspectorPage();
+      openInspectorDetail(logId);
     });
   });
 
-  renderInspectorDetail();
+  if (pager) pager.innerHTML = inspectorPagerMarkup(filtered.length, pageCount);
+  pager?.querySelectorAll<HTMLButtonElement>("[data-log-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const next = Number(button.dataset.logPage);
+      if (!Number.isFinite(next)) return;
+      logPageIndex = next;
+      renderInspectorPage();
+    });
+  });
+  pager?.querySelector<HTMLSelectElement>("#insp-page-size")?.addEventListener("change", (event) => {
+    const value = Number((event.target as HTMLSelectElement).value);
+    if (!Number.isFinite(value) || value <= 0) return;
+    logPageSize = value;
+    logPageIndex = 1;
+    renderInspectorPage();
+  });
+}
+
+function refreshInspectorUi(): void {
+  if (required<HTMLElement>("#inspector-view").hidden) return;
+  renderInspectorPage();
+  const dialog = document.querySelector<HTMLDialogElement>("#inspector-detail");
+  if (dialog?.open) renderInspectorDetail();
+}
+
+function inspectorPagerMarkup(total: number, pageCount: number): string {
+  const sizeOptions = [10, 20, 50]
+    .map((size) => "<option value=\"" + size + "\"" + (size === logPageSize ? " selected" : "") + ">" + size + "条/页</option>")
+    .join("");
+  return "<span class=\"pager-total\">共 " + total + " 条</span>" +
+    "<div class=\"pager-controls\">" +
+      "<label class=\"pager-size\">" +
+        "<select id=\"insp-page-size\" aria-label=\"每页条数\">" + sizeOptions + "</select>" +
+      "</label>" +
+      "<div class=\"pager-pages\">" +
+        "<button class=\"pager-btn\" type=\"button\" data-log-page=\"1\" aria-label=\"首页\"" + (logPageIndex <= 1 ? " disabled" : "") + ">«</button>" +
+        "<button class=\"pager-btn\" type=\"button\" data-log-page=\"" + Math.max(1, logPageIndex - 1) + "\" aria-label=\"上一页\"" + (logPageIndex <= 1 ? " disabled" : "") + ">‹</button>" +
+        "<span class=\"pager-current\">第 " + logPageIndex + " / " + pageCount + " 页</span>" +
+        "<button class=\"pager-btn\" type=\"button\" data-log-page=\"" + Math.min(pageCount, logPageIndex + 1) + "\" aria-label=\"下一页\"" + (logPageIndex >= pageCount ? " disabled" : "") + ">›</button>" +
+        "<button class=\"pager-btn\" type=\"button\" data-log-page=\"" + pageCount + "\" aria-label=\"末页\"" + (logPageIndex >= pageCount ? " disabled" : "") + ">»</button>" +
+      "</div>" +
+    "</div>";
 }
 
 function agentGuardLabel(guard?: string): string {
@@ -1510,36 +2081,60 @@ function agentGuardLabel(guard?: string): string {
   return "未启用";
 }
 
+function openInspectorDetail(logId: string): void {
+  selectedLogId = logId;
+  renderInspectorDetail();
+  const dialog = required<HTMLDialogElement>("#inspector-detail");
+  if (!dialog.open) {
+    dialog.show();
+    void animateDialogIn(dialog);
+  }
+}
+
+function closeInspectorDetail(): void {
+  const dialog = document.querySelector<HTMLDialogElement>("#inspector-detail");
+  if (!dialog?.open) return;
+  void animateDialogOut(dialog).then(() => dialog.close());
+}
+
 function renderInspectorDetail(): void {
-  const idEl = document.querySelector<HTMLElement>("#detail-panel-id");
-  const contentEl = document.querySelector<HTMLElement>("#detail-panel-content");
+  const idEl = document.querySelector<HTMLElement>("#inspector-detail-id");
+  const titleEl = document.querySelector<HTMLElement>("#inspector-detail-title");
+  const contentEl = document.querySelector<HTMLElement>("#inspector-detail-content");
   if (!idEl || !contentEl) return;
 
-  const item = requestLogs.find((l) => l.id === selectedLogId);
+  const item = requestLogs.find((log) => log.id === selectedLogId);
   if (!item) {
     idEl.textContent = "未选中请求";
-    contentEl.innerHTML = "<div class=\"detail-empty-placeholder\">" +
-      "<svg viewBox=\"0 0 24 24\" width=\"40\" height=\"40\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><polyline points=\"14 2 14 8 20 8\"/><line x1=\"16\" y1=\"13\" x2=\"8\" y2=\"13\"/><line x1=\"16\" y1=\"17\" x2=\"8\" y2=\"17\"/><polyline points=\"10 9 9 9 8 9\"/></svg>" +
-      "<p>在左侧列表中点击任意一次请求记录，查看端点元数据与详细 JSON 报文。</p>" +
-      "</div>";
+    if (titleEl) titleEl.textContent = "调用记录";
+    contentEl.innerHTML = "<div class=\"detail-empty-placeholder\"><p>选择一条请求，查看元数据与报文。</p></div>";
     return;
   }
 
   idEl.textContent = "#" + item.id;
-  const statusClass = item.status >= 200 && item.status < 300 ? "text-success" : "text-danger";
+  if (titleEl) titleEl.textContent = displayNameForLog(item);
+  const statusClass = inspectorRowKind(item) === "error" ? "text-danger" : "text-success";
   contentEl.innerHTML = "<div class=\"detail-meta-list\">" +
-    "<div class=\"meta-row\"><span>时间</span><strong>" + escapeHtml(item.time) + "</strong></div>" +
-    "<div class=\"meta-row\"><span>状态</span><strong class=\"" + statusClass + "\">HTTP " + item.status + "</strong></div>" +
+    "<div class=\"meta-row\"><span>状态</span><strong>" + inspectorStatusMarkup(item) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>时间</span><strong>" + escapeHtml(formatCallTime(item.startedAtMs, item.time)) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>HTTP</span><strong class=\"" + statusClass + "\">" + item.status + "</strong></div>" +
     "<div class=\"meta-row\"><span>接入供应商</span><strong>" + escapeHtml(item.provider) + "</strong></div>" +
-    "<div class=\"meta-row\"><span>客户端模型</span><strong>" + escapeHtml(item.requestedModel || item.model) + "</strong></div>" +
-    "<div class=\"meta-row\"><span>实际上游</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>显示名称</span><strong>" + escapeHtml(displayNameForLog(item)) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>模型名称</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>路由</span><strong>" + escapeHtml(routeLabel()) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>思考强度</span><strong>" + escapeHtml(reasoningEffortLabel(item.reasoningEffort)) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>Fast</span><strong>" + (isFastCall(item) ? "是" : "否") + "</strong></div>" +
+    "<div class=\"meta-row\"><span>调用类型</span><strong>" + escapeHtml(callTypeLabel(item)) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>Finish Reason</span><strong>" + escapeHtml(finishReasonLabel(item)) + "</strong></div>" +
     "<div class=\"meta-row\"><span>工具循环</span><strong>" + escapeHtml(agentGuardLabel(item.agentGuard)) + "</strong></div>" +
     "<div class=\"meta-row\"><span>无工具结束</span><strong>" + (item.completedWithoutTools ? "是" : "否") + "</strong></div>" +
     "<div class=\"meta-row\"><span>已自动续跑</span><strong>" + (item.agentNudged ? "是" : "否") + "</strong></div>" +
-    "<div class=\"meta-row\"><span>往返耗时</span><strong>" + item.durationMs + " ms</strong></div>" +
+    "<div class=\"meta-row\"><span>往返耗时</span><strong>" + escapeHtml(formatCallDuration(item)) + (inspectorRowKind(item) === "running" ? "" : " ms") + "</strong></div>" +
     "<div class=\"meta-row\"><span>重试次数</span><strong>" + (item.retryCount ?? 0) + "</strong></div>" +
     "<div class=\"meta-row\"><span>首字节延时</span><strong>" + (item.firstByteMs != null ? item.firstByteMs + " ms" : "未收到") + "</strong></div>" +
     "<div class=\"meta-row\"><span>响应字节</span><strong>" + (item.responseBytes ?? 0) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>输入 Token</span><strong>" + (item.promptTokens ?? 0) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>输出 Token</span><strong>" + (item.completionTokens ?? 0) + "</strong></div>" +
     "<div class=\"meta-row\"><span>流状态</span><strong class=\"" + (item.streamCompleted ? "text-success" : item.streamError ? "text-danger" : "") + "\">" +
       (item.streamCompleted ? "完整结束" : item.streamError ? "中途断流" : "未开始/非流式") + "</strong></div>" +
     (item.streamError ? "<div class=\"meta-row\"><span>断流原因</span><strong class=\"text-danger\">" + escapeHtml(item.streamError) + "</strong></div>" : "") +
@@ -1553,6 +2148,7 @@ function renderInspectorDetail(): void {
 
 async function refreshDashboard(): Promise<void> {
   if (!nativeAvailable) {
+    usageOverview = emptyUsageOverview(usageRange);
     renderDashboard();
     setStatus("通过桌面应用打开后，会自动读取当前接入和模型。", "info");
     return;
@@ -1563,6 +2159,7 @@ async function refreshDashboard(): Promise<void> {
     await refreshProxyStatus();
         await refreshOutboundProxy(false);
     await fetchProxyRequestLogs();
+    await fetchUsageOverview();
     renderDashboard();
     if (dashboard.recoveryWarnings > 0) {
       return "检测到无法自动完成的恢复记录。应用已停止配置写入，请人工检查恢复文件后刷新。";
@@ -1695,7 +2292,6 @@ function renderRetrySettings(): void {
 
 function renderOfficialProfile(): void {
   const root = required<HTMLElement>("#official-profile");
-  const badge = required<HTMLElement>("#official-badge");
   const proxyIsActive =
     localProxy.enabled && localProxy.running && !localProxy.recoveryRequired;
   const builtInRoute = isBuiltInOpenAiRoute(proxyIsActive);
@@ -1709,83 +2305,85 @@ function renderOfficialProfile(): void {
     localProxy.manualRecoveryRequired ||
     localProxy.recoveryRequired;
 
+  let badgeText = "未登录";
+  let badgeClass = "badge badge-neutral";
   if (dashboard.officialProfileWarning) {
-    badge.textContent = "需检查";
-    badge.className = "badge badge-warning";
+    badgeText = "需检查";
+    badgeClass = "badge badge-warning";
   } else if (!codexAccountAvailable) {
-    badge.textContent = "状态不可用";
-    badge.className = "badge badge-warning";
+    badgeText = "状态不可用";
+    badgeClass = "badge badge-warning";
   } else if (accessTokenEnvironmentConflict) {
-    badge.textContent = "环境冲突";
-    badge.className = "badge badge-warning";
+    badgeText = "环境冲突";
+    badgeClass = "badge badge-warning";
   } else if (current) {
-    badge.textContent = "当前使用";
-    badge.className = "badge badge-official";
+    badgeText = "当前";
+    badgeClass = "badge badge-official";
   } else if (loggedIn) {
-    badge.textContent = "已登录";
-    badge.className = "badge badge-neutral";
+    badgeText = "已登录";
+    badgeClass = "badge badge-neutral";
   } else if (codexAccount.authMode === "apiKey") {
-    badge.textContent = "OpenAI API Key";
-    badge.className = "badge badge-neutral";
-  } else {
-    badge.textContent = codexAccount.authMode === "none" ? "未登录" : "其他认证";
-    badge.className = "badge badge-neutral";
+    badgeText = "API Key";
+    badgeClass = "badge badge-neutral";
+  } else if (codexAccount.authMode !== "none") {
+    badgeText = "其他认证";
   }
 
-  const explanation = officialAccountExplanation(current);
   const email = loggedIn
     ? (codexAccount.email ?? dashboard.officialProfile?.email ?? "Codex 未返回邮箱")
-    : "登录后显示";
+    : "";
   const plan = loggedIn
     ? formatPlanType(codexAccount.planType ?? dashboard.officialProfile?.planType)
-    : codexAccount.authMode === "apiKey"
-      ? "OpenAI API Key"
-      : "登录后显示";
-  const accountMetadata = loggedIn
+    : "";
+  const subtitle = loggedIn
+    ? [email, plan].filter(Boolean).join(" · ")
+    : officialAccountExplanation(current);
+  const primaryDisabled = blocked || Boolean(dashboard.officialProfileWarning);
+  const primaryAction = !loggedIn
+    ? `<button class="button button-primary button-compact" data-official-action="login" type="button" ${primaryDisabled ? "disabled" : ""}>登录</button>`
+    : !builtInRoute
+      ? `<button class="button button-primary button-compact" data-official-action="activate" type="button" ${primaryDisabled ? "disabled" : ""}>使用</button>`
+      : "";
+  const overflowItems = loggedIn
     ? `
-      <dl class="official-account-meta">
-        <div>
-          <dt>账号邮箱</dt>
-          <dd>${escapeHtml(email)}</dd>
+        <button class="row-menu-item" data-official-action="relogin" type="button" role="menuitem" ${blocked ? "disabled" : ""}>${builtInRoute ? "重新登录" : "登录其他账号"}</button>
+        ${builtInRoute ? `<button class="row-menu-item danger-text" data-official-action="logout" type="button" role="menuitem" ${blocked ? "disabled" : ""}>退出账号</button>` : ""}
+      `
+    : "";
+  const overflow = overflowItems
+    ? `
+      <div class="row-more">
+        <button class="button button-icon" data-row-more type="button" aria-label="更多操作" aria-haspopup="true" aria-expanded="false">
+          ${MORE_ICON}
+        </button>
+        <div class="row-menu" role="menu" hidden>
+          ${overflowItems}
         </div>
-        <div>
-          <dt>订阅</dt>
-          <dd>${escapeHtml(plan)}</dd>
-        </div>
-      </dl>
+      </div>
     `
     : "";
-  const accountActions = !loggedIn
-    ? `<button class="button button-primary" data-official-action="login" type="button" ${blocked || dashboard.officialProfileWarning ? "disabled" : ""}>登录 OpenAI</button>`
-    : !builtInRoute
-      ? `
-        <button class="button button-primary" data-official-action="activate" type="button" ${blocked || dashboard.officialProfileWarning ? "disabled" : ""}>使用此账号</button>
-        <button class="button button-secondary" data-official-action="relogin" type="button" ${blocked ? "disabled" : ""}>登录其他账号</button>
-      `
-      : `
-        <button class="button button-secondary" data-official-action="relogin" type="button" ${blocked ? "disabled" : ""}>重新登录</button>
-        <button class="button button-quiet danger-text" data-official-action="logout" type="button" ${blocked ? "disabled" : ""}>退出账号</button>
-      `;
-  const environmentWarning = codexAccount.codexAccessTokenEnvironmentPresent
+  const extra = codexAccount.codexAccessTokenEnvironmentPresent
     ? `
-      <p class="official-account-warning">
-        检测到 CODEX_ACCESS_TOKEN。若 Codex 从同一环境启动，该外部访问令牌会优先于已保存的 ChatGPT 登录；清除后请完整退出并重新打开本软件和 Codex。
-      </p>
+      <div class="list-row list-row-note">
+        <p class="official-account-warning">检测到 CODEX_ACCESS_TOKEN。若 Codex 从同一环境启动，该外部访问令牌会优先于已保存的 ChatGPT 登录；清除后请完整退出并重新打开本软件和 Codex。</p>
+      </div>
     `
     : "";
 
   root.innerHTML = `
-    <div class="official-main">
-      <div class="official-copy">
-        <p>${escapeHtml(explanation)}</p>
+    <div class="list-row provider-row ${current ? "provider-row-current" : ""}">
+      <div class="provider-icon provider-icon-official" aria-hidden="true">O</div>
+      <div class="list-copy">
+        <strong id="official-title">OpenAI 官方账号</strong>
+        <span>${escapeHtml(subtitle)}</span>
       </div>
-      ${accountMetadata}
-      ${environmentWarning}
+      <span id="official-badge" class="${badgeClass}">${badgeText}</span>
+      ${primaryAction}
+      ${overflow}
     </div>
-    <div class="official-actions">
-      ${accountActions}
-    </div>
+    ${extra}
   `;
+  bindOverflowMenus(root);
 }
 
 function isOfficialActive(proxyIsActive = false): boolean {
@@ -2094,39 +2692,39 @@ function renderProfiles(): void {
           : profile.models[0]?.id;
       const actionLabel =
         manualRecoveryBlocked
-          ? "请先人工处理"
+          ? "请先处理"
           : switchMode === "directConfig"
-          ? "写入配置"
+          ? "写入"
           : localProxy.recoveryRequired
-            ? "请先完成修复"
-            : "使用此模型";
+            ? "请先修复"
+            : "使用";
       const initial =
         Array.from(profile.display_name.trim())[0]?.toLocaleUpperCase() ?? "A";
       return `
-        <article class="profile-card ${isCurrent ? "profile-card-current" : ""}">
-          <div class="profile-heading">
-            <div class="provider-icon provider-icon-api" aria-hidden="true">${escapeHtml(initial)}</div>
-            <div>
-              <h3>${escapeHtml(profile.display_name)}</h3>
-              <p>${escapeHtml(readableEndpoint(profile.base_url))}</p>
-            </div>
-            ${isCurrent ? '<span class="badge">当前</span>' : ""}
+        <article class="list-row provider-row ${isCurrent ? "provider-row-current" : ""}">
+          <div class="provider-icon provider-icon-api" aria-hidden="true">${escapeHtml(initial)}</div>
+          <div class="list-copy">
+            <strong>${escapeHtml(profile.display_name)}</strong>
+            <span>${escapeHtml(readableEndpoint(profile.base_url))}</span>
           </div>
-          <label class="profile-model">
-            <span>选择模型</span>
-            <select data-profile-model="${escapeHtml(profile.id)}">
-              ${profile.models
-                .map(
-                  (model) =>
-                    `<option value="${escapeHtml(model.id)}" ${model.id === selected ? "selected" : ""}>${escapeHtml(model.display_name || model.id)}</option>`,
-                )
-                .join("")}
-            </select>
-          </label>
-          <div class="profile-actions">
-            <button class="button button-primary" data-switch-profile="${escapeHtml(profile.id)}" type="button" ${manualRecoveryBlocked || (switchMode === "localProxy" && localProxy.recoveryRequired) ? "disabled" : ""}>${actionLabel}</button>
-            <button class="button button-secondary" data-edit-profile="${escapeHtml(profile.id)}" type="button">编辑配置</button>
-            <button class="button button-quiet danger-text" data-delete-profile="${escapeHtml(profile.id)}" type="button">移除</button>
+          ${isCurrent ? '<span class="badge">当前</span>' : ""}
+          <select class="row-select" data-profile-model="${escapeHtml(profile.id)}" aria-label="选择模型">
+            ${profile.models
+              .map(
+                (model) =>
+                  `<option value="${escapeHtml(model.id)}" ${model.id === selected ? "selected" : ""}>${escapeHtml(model.display_name || model.id)}</option>`,
+              )
+              .join("")}
+          </select>
+          <button class="button button-primary button-compact" data-switch-profile="${escapeHtml(profile.id)}" type="button" ${manualRecoveryBlocked || (switchMode === "localProxy" && localProxy.recoveryRequired) ? "disabled" : ""}>${actionLabel}</button>
+          <div class="row-more">
+            <button class="button button-icon" data-row-more type="button" aria-label="更多操作" aria-haspopup="true" aria-expanded="false">
+              ${MORE_ICON}
+            </button>
+            <div class="row-menu" role="menu" hidden>
+              <button class="row-menu-item" data-edit-profile="${escapeHtml(profile.id)}" type="button" role="menuitem">编辑</button>
+              <button class="row-menu-item danger-text" data-delete-profile="${escapeHtml(profile.id)}" type="button" role="menuitem">移除</button>
+            </div>
           </div>
         </article>
       `;
@@ -2138,12 +2736,17 @@ function renderProfiles(): void {
   });
   root.querySelectorAll<HTMLButtonElement>("[data-edit-profile]").forEach((button) => {
     button.addEventListener("click", () => {
+      closeAllMenus();
       void openProfileEditor(button.dataset.editProfile ?? "");
     });
   });
   root.querySelectorAll<HTMLButtonElement>("[data-delete-profile]").forEach((button) => {
-    button.addEventListener("click", () => deleteSavedProfile(button.dataset.deleteProfile ?? ""));
+    button.addEventListener("click", () => {
+      closeAllMenus();
+      deleteSavedProfile(button.dataset.deleteProfile ?? "");
+    });
   });
+  bindOverflowMenus(root);
 }
 
 async function activateOfficial(): Promise<void> {
@@ -3694,6 +4297,7 @@ async function run(
 
 function setBusy(value: boolean): void {
   busy = value;
+  if (value) closeAllMenus();
   document.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
     // Keep dialog actions (restart/update/editor) out of the global busy lock.
     // Otherwise save-flow disables #restart-later/#restart-now before the
@@ -3821,6 +4425,19 @@ function friendlyError(error: unknown): string {
   }
   if (message.includes("saved connections")) {
     return "无法保存快捷接入；原有快捷接入和 Codex 配置没有被覆盖。";
+  }
+  if (
+    message.includes("expected exactly one registered official OpenAI.Codex") ||
+    message.includes("expected exactly one launchable application") ||
+    message.includes("expected exactly one OpenAI.Codex install location") ||
+    message.includes("no registered official OpenAI.Codex") ||
+    message.includes("no launchable application in the OpenAI.Codex") ||
+    message.includes("could not activate Codex") ||
+    message.includes("Windows declined to activate Codex") ||
+    message.includes("Windows could not activate Codex") ||
+    message.includes("未找到可启动的官方 Codex")
+  ) {
+    return "未能重新打开官方 Codex。请确认 Microsoft Store 里的 ChatGPT/Codex 仍可打开，然后重试。";
   }
   if (
     message.includes("built-in OpenAI login") ||

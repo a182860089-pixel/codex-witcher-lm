@@ -188,6 +188,47 @@ Releases. Older 0.3.3/0.3.4 package evidence below still points at the
 original `grey0758/codex-provider-switcher` Actions runs, because those jobs
 did not run on this account.
 
+## 2026-09-18 GitHub 0.3.21
+
+[LM Codex Switch v0.3.21](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.21)
+is a Windows-only overlay release. Grok plan sentences after a tool result
+no longer complete the Codex turn, including when the plan is only in the
+current SSE output and omitted from `input`. The proxy still forces
+`tool_choice=required` when the last assistant message is an unfinished
+one-liner, even if the current hop already has `function_call_output`.
+Status matching now covers phrases such as “路径写错了”, “接着看”, and
+“切回”. Live bash `ls` / `find` / `pwd` / `cat` `exec_command` payloads are
+rewritten to PowerShell before Codex's Windows unified exec sees them. The
+last-resort synthetic `exec_command` also uses PowerShell
+(`Set-Location` + `Get-ChildItem`) instead of bash `ls/find`, and it is
+emitted after a tool result when the leftover text is still a plan.
+
+Installer filename:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.21_Windows-x64-Setup.exe`.
+  SHA-256 `a00f471f9e5675d078eda23c1b6fb3ce560d8269d052aa1fac473ed85c5d1355`.
+
+## 2026-09-18 GitHub 0.3.20
+
+[LM Codex Switch v0.3.20](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.20)
+is a Windows-only overlay release. Codex `/v1/responses` now opens the SSE
+stream before upstream headers arrive, emits a local `response.created`, and
+keeps the EventSource idle timer armed with `response.keep_alive` while Grok
+is still thinking. Live `output_text.delta` events are forwarded as
+commentary instead of being held until `response.completed`. SSE framing
+accepts LF, CRLF, and CR delimiters. Upstream 4xx/5xx errors, mid-stream
+resets, and silent closes without `response.completed` are converted into
+`response.failed` events on the already-open stream. Restart Codex and
+sandbox repair now hide the extra Windows consoles that used to flash on
+each helper command.
+
+Installer filename:
+
+- Windows x64 NSIS:
+  `Codex.Provider.Switcher_0.3.20_Windows-x64-Setup.exe`.
+  SHA-256 `d59e3bde9f4e7ad114dbd7f24ecd77575a4128e8b322ed053264759fdf508327`.
+
 ## 2026-09-17 GitHub 0.3.19
 
 [LM Codex Switch v0.3.19](https://github.com/a182860089-pixel/codex-witcher-lm/releases/tag/v0.3.19)

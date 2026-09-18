@@ -89,6 +89,8 @@ use codex_provider_switcher_local_proxy::ProxyRequestLog;
 use codex_provider_switcher_local_proxy::ProxyStartOptions;
 use codex_provider_switcher_local_proxy::ReasoningLevelDescriptor;
 use codex_provider_switcher_local_proxy::RouteConfig;
+use codex_provider_switcher_local_proxy::UsageOverview;
+use codex_provider_switcher_local_proxy::load_usage_overview;
 use codex_provider_switcher_local_proxy::read_proxy_bindings;
 use directories::BaseDirs;
 use fs4::FileExt;
@@ -682,6 +684,27 @@ async fn clear_proxy_request_logs(runtime: tauri::State<'_, ProxyRuntime>) -> Re
         handle.clear_request_logs();
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn get_usage_overview(
+    runtime: tauri::State<'_, ProxyRuntime>,
+    range: String,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+) -> Result<UsageOverview, String> {
+    let paths = app_paths()?;
+    let runtime = runtime.inner.lock().await;
+    if let Some(handle) = runtime.handle.as_ref() {
+        Ok(handle.usage_overview(&range, from_ms, to_ms))
+    } else {
+        Ok(load_usage_overview(
+            &usage_stats_path(&paths),
+            &range,
+            from_ms,
+            to_ms,
+        ))
+    }
 }
 
 #[tauri::command]
@@ -1459,6 +1482,7 @@ pub fn run() {
             proxy_status,
             get_proxy_request_logs,
             clear_proxy_request_logs,
+            get_usage_overview,
             set_upstream_retry_settings,
             enable_proxy,
             switch_proxy_route,
@@ -2573,6 +2597,7 @@ async fn start_proxy_handle(
         upstream_retry_max_elapsed: UPSTREAM_RETRY_MAX_ELAPSED,
         use_system_proxy,
         bindings_path: Some(proxy_bindings_path(paths)),
+        usage_stats_path: Some(usage_stats_path(paths)),
         ..ProxyStartOptions::default()
     };
     let handle = LocalProxy::start(options, entry_bearer)
@@ -2620,6 +2645,10 @@ async fn rollback_proxy_runtime(
 
 fn proxy_bindings_path(paths: &AppPaths) -> PathBuf {
     paths.state.join("proxy-bindings.json")
+}
+
+fn usage_stats_path(paths: &AppPaths) -> PathBuf {
+    paths.state.join("usage-stats.json")
 }
 
 fn remember_saved_proxy_routes(paths: &AppPaths, handle: &ProxyHandle) {

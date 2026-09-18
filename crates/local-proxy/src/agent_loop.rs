@@ -3,10 +3,14 @@
 //!
 //! Codex ends a turn as soon as the model emits assistant text without a
 //! `function_call`. Grok (and similar models) often do exactly that after
-//! Continue. The proxy therefore:
+//! Continue, and again after a tool result when the leftover text is only a
+//! plan ("路径写错了，接着看截图"). The proxy therefore:
 //! - appends a loop instruction whenever tools are present
 //! - names the Codex app MCP server when those tools are present
-//! - forces `tool_choice=required` on Continue / prior one-liners
+//! - forces `tool_choice=required` on Continue / prior one-liners, and on a
+//!   mid-turn hop whose last assistant message is still an unfinished plan
+//! - after a tool result, retries a short leftover plan even when that plan
+//!   is only in the current SSE output (Codex often omits it from `input`)
 //! - holds `response.completed` and retries without a tool call: first the
 //!   original Responses body, then a compact Responses body, then a slim
 //!   Chat Completions request (`tool_choice=required`, then a named
@@ -15,7 +19,11 @@
 //! - if Chat still cannot produce tool_calls, emits one synthetic
 //!   `exec_command` instead of `response.completed` with assistant text.
 //!   Codex 0.154 still ends the turn on `response.completed` even when the
-//!   leftover status is `phase: "commentary"`.
+//!   leftover status is `phase: "commentary"`. The synthetic command is
+//!   PowerShell, including after a tool result whose leftover text is still
+//!   an unfinished plan.
+//! - rewrites bash `ls` / `find` / `pwd` / `cat` exec_command payloads to
+//!   PowerShell before Codex's Windows unified exec sees them.
 //! - Chat fallback advertises only exec_command / apply_patch / wait so
 //!   Grok cannot loop get_goal / open_in_codex / a fake mcp__codex_app.
 //! - collapses repeated status sentences and does not replay them when a
@@ -23,6 +31,8 @@
 //! - rewrites apply_patch `*** Begin Patch ***` to Codex's `*** Begin Patch`.
 //! - emits `response.keep_alive` SSE events so Codex's event-level idle
 //!   timer stays armed (comment lines are discarded by EventSource)
+//! - maps a mid-stream reset or a silent close without `response.completed`
+//!   to `response.failed` instead of dropping the HTTP body
 
 use serde_json::{Value, json};
 use url::Url;
@@ -36,27 +46,43 @@ pub const AGENT_LOOP_INSTRUCTION: &str = "Codex ends the turn if you output only
 
 pub const AGENT_LOOP_NUDGE: &str = "You ended this turn without a tool call. The previous assistant message is not completion. Immediately call the required tools. Do not output another status sentence.";
 
-pub const AGENT_LOOP_TOOL_STYLE: &str = "Prefer exec_command and apply_patch. Never call get_goal, open_in_codex, list_mcp_resources, or a tool named mcp__codex_app. apply_patch must start with *** Begin Patch with no trailing stars. Do not repeat a status sentence.";
+pub const AGENT_LOOP_TOOL_STYLE: &str = "Prefer exec_command and apply_patch. The shell is Windows PowerShell: use Get-ChildItem, Get-Content, Set-Location, and -LiteralPath. Never emit bash ls, find, pwd, or cat. Never call get_goal, open_in_codex, list_mcp_resources, or a tool named mcp__codex_app. apply_patch must start with *** Begin Patch with no trailing stars. A plan sentence is not completion; emit the next function_call in the same response.";
 
 const STATUS_MARKERS: &[&str] = &[
     "不再空转",
     "残渣",
     "对着",
     "直接改",
-    "改完",
     "清掉",
     "过一遍",
-    "不再",
     "我来",
+    "我先",
     "该改",
     "摸清",
     "下手",
     "骨架",
     "先把",
+    "先读",
+    "再按",
+    "再动手",
+    "再看",
+    "接着看",
+    "继续看",
+    "接着",
+    "写错",
+    "切回",
+    "回到项目",
+    "工作目录",
+    "路径刚才",
+    "接下来",
+    "先看",
+    "先改",
     "let me",
     "i'll",
     "i will",
     "i am going to",
+    "let's",
+    "next i",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,9 +132,17 @@ impl SseAgentState {
     }
 
     pub fn should_nudge(&self, allow_force: bool) -> bool {
-        !self.saw_function_call
-            && self.held_completed.is_some()
-            && (allow_force || is_status_one_liner(self.status_text()))
+        if self.saw_function_call || self.held_completed.is_none() {
+            return false;
+        }
+        let text = self.status_text();
+        if is_substantial_completion(text) {
+            return false;
+        }
+        if is_status_one_liner(text) {
+            return true;
+        }
+        allow_force
     }
 }
 
@@ -195,17 +229,23 @@ pub fn request_has_tools(body: &Value) -> bool {
 }
 
 pub fn should_force_tools(body: &Value) -> bool {
-    if !request_has_tools(body) || has_tool_result_after_last_user(body) {
+    if !request_has_tools(body) {
         return false;
+    }
+    if has_tool_result_after_last_user(body) {
+        return last_assistant_is_unfinished(body);
     }
     should_force_nudge(body)
 }
 
 pub fn should_force_nudge(body: &Value) -> bool {
-    continue_nudge_in_request(body)
-        || last_role_text(body, "assistant")
-            .as_deref()
-            .is_some_and(is_status_one_liner)
+    continue_nudge_in_request(body) || last_assistant_is_unfinished(body)
+}
+
+fn last_assistant_is_unfinished(body: &Value) -> bool {
+    last_role_text(body, "assistant")
+        .as_deref()
+        .is_some_and(is_status_one_liner)
 }
 
 pub fn has_tool_result(body: &Value) -> bool {
@@ -254,13 +294,42 @@ pub fn is_status_one_liner(text: &str) -> bool {
         return true;
     }
     let chars = collapsed.chars().count();
-    if chars > 80 || collapsed.lines().count() > 2 {
+    if chars > 120 || collapsed.lines().count() > 3 {
         return false;
     }
     let lower = collapsed.to_lowercase();
     STATUS_MARKERS
         .iter()
         .any(|marker| lower.contains(marker) || collapsed.contains(marker))
+}
+
+fn is_substantial_completion(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_status_one_liner(trimmed) {
+        return false;
+    }
+    let collapsed = collapse_repeated_text(trimmed);
+    let chars = collapsed.chars().count();
+    if chars >= 200 || collapsed.lines().count() >= 4 {
+        return true;
+    }
+    const DONE_MARKERS: &[&str] = &[
+        "完成了",
+        "改好了",
+        "装完",
+        "搞定",
+        "如下",
+        "已经",
+        "done.",
+        "finished",
+        "here's",
+        "here is",
+    ];
+    let lower = collapsed.to_lowercase();
+    chars >= 40
+        && DONE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker) || collapsed.contains(marker))
 }
 
 /// Grok often concatenates the same status sentence 10–20 times in one
@@ -352,12 +421,57 @@ fn repeated_char_unit(text: &str) -> Option<String> {
 pub fn drain_sse_events(tail: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut events = Vec::new();
     loop {
-        let Some(pos) = tail.windows(2).position(|window| window == b"\n\n") else {
+        let Some((start, delimiter_len)) = find_sse_delimiter(tail) else {
             break;
         };
-        events.push(tail.drain(..=pos + 1).collect());
+        events.push(normalize_sse_newlines(
+            &tail.drain(..start + delimiter_len).collect::<Vec<_>>(),
+        ));
     }
     events
+}
+
+/// SSE allows CR, LF, or CRLF line breaks. Grok/OpenAI-compatible proxies often
+/// emit `\r\n\r\n`, which does **not** contain the two consecutive `\n\n` bytes
+/// this parser originally required. Until the delimiter is found, every chunk
+/// stays in `sse_tail`, heartbeats are suppressed, and Codex sees silence.
+fn find_sse_delimiter(tail: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index + 1 < tail.len() {
+        if index + 3 < tail.len()
+            && tail[index] == b'\r'
+            && tail[index + 1] == b'\n'
+            && tail[index + 2] == b'\r'
+            && tail[index + 3] == b'\n'
+        {
+            return Some((index, 4));
+        }
+        if tail[index] == b'\n' && tail[index + 1] == b'\n' {
+            return Some((index, 2));
+        }
+        if tail[index] == b'\r' && tail[index + 1] == b'\r' {
+            return Some((index, 2));
+        }
+        index += 1;
+    }
+    None
+}
+
+pub fn normalize_sse_newlines(event: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(event.len());
+    let mut index = 0;
+    while index < event.len() {
+        if event[index] == b'\r' {
+            if index + 1 < event.len() && event[index + 1] == b'\n' {
+                index += 1;
+            }
+            out.push(b'\n');
+        } else {
+            out.push(event[index]);
+        }
+        index += 1;
+    }
+    out
 }
 
 pub fn is_sse_comment(event: &[u8]) -> bool {
@@ -378,6 +492,12 @@ pub fn is_response_created_event(event: &[u8]) -> bool {
 }
 
 pub fn is_assistant_text_event(event: &[u8]) -> bool {
+    is_live_text_event(event) || is_held_message_event(event)
+}
+
+/// Token deltas that Codex must see immediately. Holding these until
+/// `response.completed` makes grok-4.6 look idle for the whole generation.
+pub fn is_live_text_event(event: &[u8]) -> bool {
     if is_sse_comment(event) || is_keep_alive_event(event) || is_completed_event(event) {
         return false;
     }
@@ -386,19 +506,82 @@ pub fn is_assistant_text_event(event: &[u8]) -> bool {
         if kind.contains("function_call") || kind.contains("reasoning") {
             return false;
         }
-        if kind.contains("output_text") || kind.contains("content_part") {
-            return true;
-        }
-        if kind.contains("output_item") {
-            let item_type = json
-                .pointer("/item/type")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            return item_type == "message" || item_type == "output_text";
-        }
-        return false;
+        return kind.contains("output_text") || kind.contains("content_part");
     }
     contains_seq(event, b"output_text") && !contains_seq(event, b"function_call")
+}
+
+/// Completed assistant message items. These are still held so a Continue
+/// one-liner can be retried as a tool call instead of ending the Codex turn.
+pub fn is_held_message_event(event: &[u8]) -> bool {
+    if is_sse_comment(event) || is_keep_alive_event(event) || is_completed_event(event) {
+        return false;
+    }
+    if is_live_text_event(event) {
+        return false;
+    }
+    let Some(json) = sse_data_json(event) else {
+        return false;
+    };
+    let kind = json.get("type").and_then(Value::as_str).unwrap_or("");
+    if !kind.contains("output_item") {
+        return false;
+    }
+    if json_has_function_call(&json) {
+        return false;
+    }
+    let item_type = json
+        .pointer("/item/type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    item_type == "message" || item_type == "output_text"
+}
+
+pub fn sse_response_created(response_id: &str) -> Vec<u8> {
+    encode_sse_event(&json!({
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "status": "in_progress"
+        }
+    }))
+}
+
+pub fn sse_response_failed(response_id: &str, message: &str) -> Vec<u8> {
+    encode_sse_event(&json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": "api_error",
+                "message": message
+            }
+        }
+    }))
+}
+
+pub fn sse_response_completed(response_id: &str, payload: Option<&Value>) -> Vec<u8> {
+    let mut response = json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed"
+    });
+    if let (Some(extra), Some(object)) =
+        (payload.and_then(Value::as_object), response.as_object_mut())
+    {
+        for (key, value) in extra {
+            if key != "id" && key != "object" && key != "status" {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    encode_sse_event(&json!({
+        "type": "response.completed",
+        "response": response
+    }))
 }
 
 pub fn sse_response_id(event: &[u8]) -> Option<String> {
@@ -600,7 +783,7 @@ fn chat_tools(body: &Value, core_only: bool) -> Vec<Value> {
 }
 
 pub fn synthetic_tool_call_sse(body: &Value, response_id: &str) -> Option<Vec<u8>> {
-    if has_tool_result_after_last_user(body) {
+    if has_tool_result_after_last_user(body) && !last_assistant_is_unfinished(body) {
         return None;
     }
     let has_exec = body
@@ -616,7 +799,7 @@ pub fn synthetic_tool_call_sse(body: &Value, response_id: &str) -> Option<Vec<u8
     }
     let cwd = cwd_from_body(body).unwrap_or_else(|| ".".to_string());
     let args = serde_json::to_string(&json!({
-        "cmd": "Get-ChildItem -File | Select-Object -First 40 Name, Length, LastWriteTime",
+        "cmd": "Set-Location -LiteralPath (Get-Location); Get-ChildItem -Force | Select-Object -First 40 Name, Mode, Length, LastWriteTime",
         "workdir": cwd
     }))
     .ok()?;
@@ -708,6 +891,9 @@ pub fn chat_completion_to_responses_sse(chat: &Value, response_id: &str) -> Opti
         if name == "apply_patch" {
             args = normalize_apply_patch_args(&args);
         }
+        if name == "exec_command" {
+            args = rewrite_unix_exec_args(&args);
+        }
         let item = json!({
             "type": "function_call",
             "id": format!("fc_{id}"),
@@ -762,6 +948,135 @@ pub fn rewrite_apply_patch_event(event: &[u8]) -> Vec<u8> {
         return event.to_vec();
     }
     rebuild_sse_event(event, &json)
+}
+
+/// Grok often emits bash `ls` / `find` / `pwd` / `cat` on Windows. Codex's
+/// unified exec then fails with `os error 267` and the turn stalls.
+pub fn rewrite_exec_command_event(event: &[u8]) -> Vec<u8> {
+    if is_sse_comment(event) || is_keep_alive_event(event) {
+        return event.to_vec();
+    }
+    let Some(mut json) = sse_data_json(event) else {
+        return event.to_vec();
+    };
+    let mut changed = false;
+    if let Some(item) = json.get_mut("item") {
+        changed |= rewrite_exec_command_item(item);
+    }
+    if let Some(output) = json
+        .pointer_mut("/response/output")
+        .and_then(Value::as_array_mut)
+    {
+        for item in output {
+            changed |= rewrite_exec_command_item(item);
+        }
+    }
+    if !changed {
+        return event.to_vec();
+    }
+    rebuild_sse_event(event, &json)
+}
+
+fn rewrite_exec_command_item(item: &mut Value) -> bool {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    if name != "exec_command" {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(args) = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        let rewritten = rewrite_unix_exec_args(&args);
+        if rewritten != args
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert("arguments".to_string(), json!(rewritten));
+            changed = true;
+        }
+    }
+    if let Some(cmd) = item.get("cmd").and_then(Value::as_str).map(str::to_string) {
+        let rewritten = rewrite_unix_shell_cmd(&cmd);
+        if rewritten != cmd
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert("cmd".to_string(), json!(rewritten));
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn rewrite_unix_exec_args(args: &str) -> String {
+    match serde_json::from_str::<Value>(args) {
+        Ok(Value::Object(mut map)) => {
+            if let Some(Value::String(cmd)) = map.get("cmd").cloned() {
+                let rewritten = rewrite_unix_shell_cmd(&cmd);
+                if rewritten != cmd {
+                    map.insert("cmd".to_string(), json!(rewritten));
+                    return serde_json::to_string(&Value::Object(map))
+                        .unwrap_or_else(|_| args.to_string());
+                }
+            }
+            args.to_string()
+        }
+        _ => args.to_string(),
+    }
+}
+
+const WINDOWS_LIST_CMD: &str =
+    "Get-ChildItem -Force | Select-Object -First 40 Name, Mode, Length, LastWriteTime";
+
+fn rewrite_unix_shell_cmd(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() || looks_like_powershell(trimmed) {
+        return cmd.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "pwd" || lower.starts_with("pwd ") || lower.contains("&& pwd") {
+        return "Get-Location".to_string();
+    }
+    if let Some(path) = unix_cat_path(trimmed) {
+        return format!("Get-Content -LiteralPath {path}");
+    }
+    if is_unix_listing_cmd(trimmed) {
+        return WINDOWS_LIST_CMD.to_string();
+    }
+    cmd.to_string()
+}
+
+fn looks_like_powershell(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    lower.contains("get-childitem")
+        || lower.contains("get-content")
+        || lower.contains("set-location")
+        || lower.contains("get-location")
+        || lower.contains("-literalpath")
+}
+
+fn is_unix_listing_cmd(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    matches!(first, "ls" | "find" | "pwd" | "cat")
+        || lower.contains("&& ls")
+        || lower.contains("; ls")
+        || lower.contains("&& find")
+        || lower.contains("; find")
+        || lower.contains("| ls")
+        || lower.contains("| find")
+}
+
+fn unix_cat_path(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    let mut parts = trimmed.split_whitespace();
+    if parts.next()?.eq_ignore_ascii_case("cat") {
+        let path = parts.next()?.trim_matches(['\'', '"']);
+        if !path.is_empty() && !path.starts_with('-') && parts.next().is_none() {
+            return Some(path.to_string());
+        }
+    }
+    None
 }
 
 fn rewrite_apply_patch_item(item: &mut Value) -> bool {
@@ -869,6 +1184,17 @@ fn encode_sse_event(value: &Value) -> Vec<u8> {
 
 fn mark_commentary(value: &mut Value) -> bool {
     let mut changed = false;
+    if let Some(object) = value.as_object_mut() {
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if kind.contains("output_text") || kind.contains("content_part") {
+            object.insert("phase".to_string(), json!("commentary"));
+            changed = true;
+        }
+    }
     if let Some(item) = value.get_mut("item") {
         changed |= mark_item_commentary(item);
     }
@@ -1247,7 +1573,7 @@ fn text_from_content(content: &Value) -> String {
     }
 }
 
-fn sse_data_json(event: &[u8]) -> Option<Value> {
+pub fn sse_data_json(event: &[u8]) -> Option<Value> {
     let mut data = Vec::new();
     for line in event.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
@@ -1419,22 +1745,48 @@ mod tests {
         );
         assert!(body.get("tool_choice").is_none());
         assert!(continue_nudge_in_request(&body));
+        assert!(should_force_nudge(&body));
         assert!(has_tool_result(&body));
         assert!(has_tool_result_after_last_user(&body));
     }
 
     #[test]
-    fn historical_continue_with_tool_output_does_not_force() {
+    fn unfinished_plan_after_tool_output_still_forces_tools() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "把前端改成苹果风格"}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "路径刚才写错了，回到项目目录继续看截图和页面。"}]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Mode LastWriteTime Name"
+                }
+            ]
+        });
+        assert_eq!(
+            apply_agent_loop_guard(&mut body),
+            AgentLoopGuard::ForceTools
+        );
+        assert_eq!(body["tool_choice"], "required");
+        assert!(!should_force_nudge(&body));
+        assert!(last_assistant_is_unfinished(&body));
+    }
+
+    #[test]
+    fn historical_continue_with_plain_tool_output_does_not_force() {
         let mut body = json!({
             "tools": [{"type": "function", "name": "exec_command"}],
             "input": [
                 {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "继续完成任务"}]
-                },
-                {
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "先看截图和当前前端，再直接改。"}]
                 },
                 {
                     "type": "function_call_output",
@@ -1522,10 +1874,55 @@ mod tests {
         assert!(is_status_one_liner(
             "接下来把全局样式和故事页结构摸清，确认头图、日历和搜索提示该改哪。接下来把全局样式和故事页结构摸清，确认头图、日历和搜索提示该改哪。接下来把全局样式和故事页结构摸清，确认头图、日历和搜索提示该改哪。"
         ));
+        assert!(is_status_one_liner(
+            "路径刚才写错了，回到项目目录继续看截图和页面。"
+        ));
+        assert!(is_status_one_liner(
+            "工作目录切回项目，接着看现有截图和页面结构。"
+        ));
+        assert!(is_status_one_liner(
+            "先读 UI 技能和现有前端，再按苹果风格改界面。"
+        ));
         assert!(!is_status_one_liner("海鸥在线，你要整点薯条吗？"));
         assert!(!is_status_one_liner(
             "装完了。D 盘只剩 4.56GB，塞不下，已经落到 E 盘。Word / Excel 都能从开始菜单打开。"
         ));
+        assert!(is_substantial_completion(
+            "装完了。D 盘只剩 4.56GB，塞不下，已经落到 E 盘。Word / Excel 都能从开始菜单打开。"
+        ));
+        assert!(!is_substantial_completion(
+            "路径刚才写错了，回到项目目录继续看截图和页面。"
+        ));
+    }
+
+    #[test]
+    fn current_plan_sentence_nudges_without_request_force() {
+        let mut state = SseAgentState::default();
+        note_sse_event(
+            &mut state,
+            format!(
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"路径刚才写错了，回到项目目录继续看截图和页面。\"}}\n\n"
+            )
+            .as_bytes(),
+        );
+        note_sse_event(&mut state, b"data: {\"type\":\"response.completed\"}\n\n");
+        assert!(!state.saw_function_call);
+        assert!(state.should_nudge(false));
+    }
+
+    #[test]
+    fn substantial_completion_does_not_nudge() {
+        let mut state = SseAgentState::default();
+        note_sse_event(
+            &mut state,
+            format!(
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"装完了。D 盘只剩 4.56GB，塞不下，已经落到 E 盘。Word / Excel 都能从开始菜单打开。\"}}\n\n"
+            )
+            .as_bytes(),
+        );
+        note_sse_event(&mut state, b"data: {\"type\":\"response.completed\"}\n\n");
+        assert!(!state.should_nudge(false));
+        assert!(!state.should_nudge(true));
     }
 
     #[test]
@@ -1568,6 +1965,34 @@ mod tests {
         assert!(!state.saw_function_call);
         assert!(state.should_nudge(false));
         assert!(state.held_completed.is_some());
+    }
+
+    #[test]
+    fn drain_sse_events_splits_crlf_delimiters() {
+        let mut tail = b"data: {\"type\":\"a\"}\r\n\r\ndata: {\"type\":\"b\"}\n\npartial".to_vec();
+        let events = drain_sse_events(&mut tail);
+        assert_eq!(events.len(), 2);
+        assert_eq!(tail, b"partial");
+        assert!(events[0].windows(2).any(|window| window == b"\n\n"));
+        assert!(!events[0].contains(&b'\r'));
+        assert!(is_live_text_event(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n"
+        ));
+        assert!(!is_held_message_event(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n"
+        ));
+        assert!(is_held_message_event(
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n"
+        ));
+        let created = sse_response_created("resp_cps_test");
+        assert!(is_response_created_event(&created));
+        let failed = sse_response_failed("resp_cps_test", "upstream provider returned 502");
+        assert!(String::from_utf8_lossy(&failed).contains("response.failed"));
+        let completed = sse_response_completed("resp_cps_test", Some(&json!({"ok": true})));
+        let completed_text = String::from_utf8_lossy(&completed);
+        assert!(completed_text.contains("response.completed"));
+        assert!(completed_text.contains("resp_cps_test"));
+        assert!(completed_text.contains("\"ok\":true"));
     }
 
     #[test]
@@ -1868,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_tool_call_sse_skips_after_tool_result() {
+    fn synthetic_tool_call_sse_skips_after_plain_tool_result() {
         let body = json!({
             "tools": [{"type": "function", "name": "exec_command"}],
             "input": [
@@ -1877,6 +2302,54 @@ mod tests {
             ]
         });
         assert!(synthetic_tool_call_sse(&body, "resp_orig12345").is_none());
+    }
+
+    #[test]
+    fn synthetic_tool_call_sse_emits_after_unfinished_plan() {
+        let body = json!({
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "把前端改成苹果风格"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "路径刚才写错了，回到项目目录继续看截图和页面。"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "<environment_context>\n  <cwd>D:/proj</cwd>\n</environment_context>"}]},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+            ]
+        });
+        let sse = synthetic_tool_call_sse(&body, "resp_orig12345").unwrap();
+        let text = String::from_utf8(sse).unwrap();
+        assert!(text.contains("function_call"));
+        assert!(text.contains("exec_command"));
+        assert!(text.contains("Set-Location"));
+        assert!(text.contains("Get-ChildItem"));
+        assert!(!text.contains("ls -la"));
+        assert!(text.contains("D:/proj"));
+    }
+
+    #[test]
+    fn rewrite_unix_listing_becomes_powershell() {
+        let rewritten = rewrite_unix_exec_args(
+            r#"{"cmd":"ls -la && find . -name '*.tsx'","workdir":"D:/proj"}"#,
+        );
+        assert!(rewritten.contains("Get-ChildItem"));
+        assert!(!rewritten.contains("ls -la"));
+        assert!(rewritten.contains("D:/proj"));
+        assert_eq!(rewrite_unix_shell_cmd("pwd"), "Get-Location");
+        assert_eq!(
+            rewrite_unix_shell_cmd("cat README.md"),
+            "Get-Content -LiteralPath README.md"
+        );
+        assert!(rewrite_unix_shell_cmd("Get-ChildItem -Force").contains("Get-ChildItem"));
+    }
+
+    #[test]
+    fn rewrite_exec_command_sse_replaces_bash_ls() {
+        let event = format!(
+            "data: {{\"type\":\"response.output_item.added\",\"item\":{{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{{\\\"cmd\\\":\\\"ls -la\\\"}}\"}}}}\n\n"
+        );
+        let rewritten = rewrite_exec_command_event(event.as_bytes());
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(text.contains("Get-ChildItem"));
+        assert!(!text.contains("ls -la"));
     }
 
     #[test]

@@ -600,10 +600,22 @@ fn tcp_open(host: &str, port: u16) -> bool {
     TcpStream::connect_timeout(&addr, PORT_PROBE_TIMEOUT).is_ok()
 }
 
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn listener_process_hint(port: u16) -> Option<String> {
     #[cfg(windows)]
     {
-        let output = Command::new("netstat")
+        let output = hidden_command("netstat")
             .args(["-ano", "-p", "tcp"])
             .output()
             .ok()?;
@@ -621,7 +633,7 @@ fn listener_process_hint(port: u16) -> Option<String> {
             }
         }
         let pid = pid?;
-        let name = Command::new("tasklist")
+        let name = hidden_command("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .output()
             .ok()

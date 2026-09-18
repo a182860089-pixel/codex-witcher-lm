@@ -237,11 +237,17 @@ Responses turn would complete with assistant text and no `function_call`
 while tools remain available, the proxy holds that text and retries: first
 the original Responses body, then a compact Responses body that drops
 `previous_response_id`, then Chat Completions with `tool_choice=required`
-translated back into Responses `function_call` events. Leftover status
-text is rephased as `phase: "commentary"` so Codex does not treat it as a
-final answer. 4xx/5xx bodies are bounded and normalized to
-`{ "error": { "message", "type": "api_error" } }` so Codex can display the
-upstream failure.
+translated back into Responses `function_call` events. A short leftover
+plan after a tool result is retried even when Codex omitted that plan from
+`input`. Live bash `ls` / `find` / `pwd` / `cat` `exec_command` payloads are
+rewritten to PowerShell before they reach Codex's Windows unified exec.
+Leftover status text is rephased as `phase: "commentary"` so Codex does not
+treat it as a final answer. 4xx/5xx bodies are bounded and rewritten onto the already-open
+SSE as `response.failed`. A mid-stream upstream reset or a silent close
+without `response.completed` also emits `response.failed` instead of ending
+the HTTP body with an I/O error, so Codex does not report
+`stream closed before response.completed`. Compact JSON errors stay on the
+non-stream path.
 
 The local `/models` response is generated from the checked models on the active
 Route and includes an ETag. It is a wire response, not a

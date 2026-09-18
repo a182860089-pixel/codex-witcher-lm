@@ -120,8 +120,11 @@ redacted and never contain the keyring backend's detailed payload.
 - Successful response bodies are streamed without accumulating a full SSE
   response. `response.keep_alive` SSE heartbeats are inserted only between
   complete events and are not counted as upstream payload. Upstream TCP keepalive is 10
-  seconds. 4xx/5xx bodies are bounded and rewritten into a JSON error so
-  Codex can display the provider failure instead of "Unknown error".
+  seconds. 4xx/5xx bodies are bounded and rewritten onto the already-open
+  SSE as `response.failed`. A mid-stream reset or silent close without
+  `response.completed` also emits `response.failed` instead of dropping the
+  HTTP body, so Codex can display the provider failure instead of a stream
+  disconnect.
   Hop-by-hop response headers and `Set-Cookie` are removed.
 - The local model catalog and health body contain no bearer or upstream Base
   URL. Route and bearer debug output is redacted.

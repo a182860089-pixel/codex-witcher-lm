@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, LOCATION};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use codex_provider_switcher_local_proxy::{
     BearerToken, CodexModelsResponse, LocalProxy, ModelDescriptor, ProxyHandle, ProxyHealth,
-    ProxyStartOptions, RouteConfig, SSE_KEEP_ALIVE_HEARTBEAT,
+    ProxyStartOptions, RouteConfig,
 };
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -205,6 +205,7 @@ async fn authenticates_sanitizes_overwrites_and_exposes_health_and_models() {
         .expect("proxied response");
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().contains_key("x-models-etag"));
+    let _ = drain_sse(response).await;
 
     let compact = client
         .post(format!("{}/v1/responses/compact", proxy.base_url()))
@@ -219,6 +220,7 @@ async fn authenticates_sanitizes_overwrites_and_exposes_health_and_models() {
         .await
         .expect("proxied compact response");
     assert_eq!(compact.status(), StatusCode::OK);
+    let _ = compact.bytes().await.expect("compact body");
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 2);
@@ -359,13 +361,11 @@ async fn hot_switches_new_threads_but_keeps_existing_conversations_on_the_old_ro
             }))
     };
 
-    let first: Value = request("/responses", "thread-one", "turn-one")
+    let first = request("/responses", "thread-one", "turn-one")
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let first = responses_json(first).await;
     assert_eq!(first["provider"], "a");
 
     proxy.set_active_route(route(
@@ -382,20 +382,16 @@ async fn hot_switches_new_threads_but_keeps_existing_conversations_on_the_old_ro
         .json()
         .await
         .unwrap();
-    let next_turn: Value = request("/responses", "thread-one", "turn-two")
+    let next_turn = request("/responses", "thread-one", "turn-two")
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let new_thread: Value = request("/responses", "thread-two", "turn-one")
+    let next_turn = responses_json(next_turn).await;
+    let new_thread = request("/responses", "thread-two", "turn-one")
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let new_thread = responses_json(new_thread).await;
     assert_eq!(same_turn["provider"], "a");
     assert_eq!(next_turn["provider"], "a");
     assert_eq!(new_thread["provider"], "b");
@@ -468,7 +464,7 @@ async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
     .await
     .expect("start first proxy");
     first.set_active_route(route_a.clone());
-    let first_reply: Value = client
+    let first_reply = client
         .post(format!("{}/responses", first.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .header("thread-id", "thread-one")
@@ -478,10 +474,8 @@ async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let first_reply = responses_json(first_reply).await;
     assert_eq!(first_reply["provider"], "a");
     first.shutdown().await.unwrap();
 
@@ -496,7 +490,7 @@ async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
     .expect("start second proxy");
     second.set_active_route(route_b);
     second.remember_route(route_a);
-    let existing: Value = client
+    let existing = client
         .post(format!("{}/responses", second.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .header("thread-id", "thread-one")
@@ -506,11 +500,9 @@ async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let fresh: Value = client
+    let existing = responses_json(existing).await;
+    let fresh = client
         .post(format!("{}/responses", second.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .header("thread-id", "thread-two")
@@ -520,10 +512,8 @@ async fn restored_bindings_keep_existing_threads_after_a_proxy_restart() {
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let fresh = responses_json(fresh).await;
     assert_eq!(existing["provider"], "a");
     assert_eq!(fresh["provider"], "b");
     assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
@@ -544,16 +534,14 @@ async fn previous_response_id_keeps_existing_chats_on_the_old_route() {
     ))
     .await;
     let client = no_redirect_client();
-    let first: Value = client
+    let first = client
         .post(format!("{}/responses", proxy.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .json(&json!({ "model": "model-a" }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let first = responses_json(first).await;
     assert_eq!(first["provider"], "a");
     let response_id = first["id"].as_str().expect("response id").to_string();
 
@@ -564,7 +552,7 @@ async fn previous_response_id_keeps_existing_chats_on_the_old_route() {
         vec![model("model-b")],
     ));
 
-    let continued: Value = client
+    let continued = client
         .post(format!("{}/responses", proxy.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .json(&json!({
@@ -573,20 +561,16 @@ async fn previous_response_id_keeps_existing_chats_on_the_old_route() {
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let fresh: Value = client
+    let continued = responses_json(continued).await;
+    let fresh = client
         .post(format!("{}/responses", proxy.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .json(&json!({ "model": "model-b" }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let fresh = responses_json(fresh).await;
     assert_eq!(continued["provider"], "a");
     assert_eq!(fresh["provider"], "b");
     assert_eq!(state_a.requests.load(Ordering::Acquire), 2);
@@ -625,6 +609,7 @@ async fn catalog_sibling_models_are_forwarded_instead_of_rewritten() {
         .await
         .expect("existing chat response");
     assert_eq!(existing.status(), StatusCode::OK);
+    let _ = drain_sse(existing).await;
 
     let switched = client
         .post(format!("{}/responses", proxy.base_url()))
@@ -639,6 +624,7 @@ async fn catalog_sibling_models_are_forwarded_instead_of_rewritten() {
         .await
         .expect("switched chat response");
     assert_eq!(switched.status(), StatusCode::OK);
+    let _ = drain_sse(switched).await;
 
     let unknown = client
         .post(format!("{}/responses", proxy.base_url()))
@@ -653,6 +639,7 @@ async fn catalog_sibling_models_are_forwarded_instead_of_rewritten() {
         .await
         .expect("unknown model response");
     assert_eq!(unknown.status(), StatusCode::OK);
+    let _ = drain_sse(unknown).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 3);
@@ -693,6 +680,7 @@ async fn switching_selected_model_does_not_rewrite_an_existing_catalog_thread() 
         .await
         .expect("first grok turn");
     assert_eq!(first.status(), StatusCode::OK);
+    let _ = drain_sse(first).await;
 
     proxy.set_active_route(route(
         &upstream,
@@ -713,6 +701,7 @@ async fn switching_selected_model_does_not_rewrite_an_existing_catalog_thread() 
         .await
         .expect("continued grok turn");
     assert_eq!(continued.status(), StatusCode::OK);
+    let _ = drain_sse(continued).await;
 
     let fresh = client
         .post(format!("{}/responses", proxy.base_url()))
@@ -726,6 +715,7 @@ async fn switching_selected_model_does_not_rewrite_an_existing_catalog_thread() 
         .await
         .expect("fresh gpt turn");
     assert_eq!(fresh.status(), StatusCode::OK);
+    let _ = drain_sse(fresh).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 3);
@@ -762,11 +752,18 @@ async fn a_failed_turn_does_not_pin_the_thread_to_the_failing_route() {
         .send()
         .await
         .expect("failing turn");
-    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers()[CONTENT_TYPE], "text/event-stream");
+    let first_text = drain_sse(first).await;
+    assert_early_created(&first_text);
+    assert_eq!(
+        sse_failed_message(&first_text),
+        "Service temporarily unavailable"
+    );
 
     proxy.set_active_route(route(&ok, "route-ok", "model-b", vec![model("model-b")]));
 
-    let retry: Value = client
+    let retry = client
         .post(format!("{}/responses", proxy.base_url()))
         .bearer_auth(ENTRY_TOKEN)
         .header("thread-id", "hello-thread")
@@ -776,10 +773,8 @@ async fn a_failed_turn_does_not_pin_the_thread_to_the_failing_route() {
         }))
         .send()
         .await
-        .expect("retry after failure")
-        .json()
-        .await
-        .expect("retry JSON");
+        .expect("retry after failure");
+    let retry = responses_json(retry).await;
     assert_eq!(retry["provider"], "ok");
     assert_eq!(state_ok.requests.load(Ordering::Acquire), 1);
 
@@ -816,6 +811,7 @@ async fn strips_continuation_ids_when_outbound_model_would_change() {
         .await
         .expect("stripped continuation response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 1);
@@ -856,6 +852,7 @@ async fn gpt_client_facade_requests_are_rewritten_to_the_selected_model() {
         .await
         .expect("facade chat response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 1);
@@ -894,6 +891,7 @@ async fn switching_away_from_a_pinned_gpt_route_keeps_the_old_thread() {
         .await
         .expect("first gpt turn");
     assert_eq!(first.status(), StatusCode::OK);
+    let _ = drain_sse(first).await;
 
     proxy.set_active_route(route(
         &upstream,
@@ -914,6 +912,7 @@ async fn switching_away_from_a_pinned_gpt_route_keeps_the_old_thread() {
         .await
         .expect("continued gpt turn");
     assert_eq!(continued.status(), StatusCode::OK);
+    let _ = drain_sse(continued).await;
 
     let fresh = client
         .post(format!("{}/responses", proxy.base_url()))
@@ -927,6 +926,7 @@ async fn switching_away_from_a_pinned_gpt_route_keeps_the_old_thread() {
         .await
         .expect("fresh grok turn");
     assert_eq!(fresh.status(), StatusCode::OK);
+    let _ = drain_sse(fresh).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 3);
@@ -951,6 +951,12 @@ async fn sse_provider() -> Response {
                     2,
                 ))
             }
+            2 => Some((
+                Ok::<Bytes, Infallible>(Bytes::from_static(
+                    b"data: {\"type\":\"response.completed\"}\n\n",
+                )),
+                3,
+            )),
             _ => None,
         }
     });
@@ -988,13 +994,22 @@ async fn forwards_sse_as_an_unbuffered_byte_stream() {
         .expect("first SSE chunk arrived before the second was produced")
         .expect("first SSE item")
         .expect("first SSE bytes");
-    assert_eq!(first.as_ref(), b"data: first\n\n");
+    let first_text = String::from_utf8_lossy(&first);
+    assert_eq!(
+        sse_event_type(&first_text).as_deref(),
+        Some("response.created")
+    );
+    let created_id = assert_early_created(&first_text);
 
     let mut all = first.to_vec();
     while let Some(chunk) = stream.next().await {
         all.extend_from_slice(&chunk.expect("remaining SSE bytes"));
     }
-    assert_eq!(all, b"data: first\n\ndata: second\n\n");
+    let text = String::from_utf8_lossy(&all);
+    assert!(text.contains("data: first\n\n"));
+    assert!(text.contains("data: second\n\n"));
+    assert_eq!(text.matches("response.created").count(), 1);
+    assert!(text.contains(&created_id));
     let log = &proxy.request_logs()[0];
     assert_eq!(log.retry_count, 0);
     assert_eq!(log.response_bytes, all.len() as u64);
@@ -1055,26 +1070,142 @@ async fn inserts_sse_keep_alive_heartbeats_during_upstream_idle() {
     let mut body = response.bytes_stream();
     let first = timeout(Duration::from_millis(150), body.next())
         .await
-        .expect("heartbeat arrived while upstream was idle")
-        .expect("heartbeat item")
-        .expect("heartbeat bytes");
-    assert_eq!(first.as_ref(), SSE_KEEP_ALIVE_HEARTBEAT);
+        .expect("created event arrived before upstream headers")
+        .expect("created item")
+        .expect("created bytes");
+    let first_text = String::from_utf8_lossy(&first);
+    assert_eq!(
+        sse_event_type(&first_text).as_deref(),
+        Some("response.created")
+    );
 
     let mut all = first.to_vec();
     while let Some(chunk) = body.next().await {
         all.extend_from_slice(&chunk.expect("remaining SSE bytes"));
     }
+    let text = String::from_utf8_lossy(&all);
     assert!(
-        all.windows(b"data: first\n\n".len())
-            .any(|window| window == b"data: first\n\n"),
-        "real upstream event should still arrive: {}",
-        String::from_utf8_lossy(&all)
+        text.contains("response.keep_alive"),
+        "heartbeat should arrive while waiting for upstream: {text}"
+    );
+    assert!(
+        text.contains("data: first\n\n"),
+        "real upstream event should still arrive: {text}"
     );
 
     let log = &proxy.request_logs()[0];
-    assert_eq!(log.response_bytes, b"data: first\n\n".len() as u64);
+    assert!(log.response_bytes >= b"data: first\n\n".len() as u64);
     assert!(log.first_byte_ms.unwrap() >= 200);
     assert!(log.stream_completed);
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn delayed_headers_sse_provider() -> Response {
+    sleep(Duration::from_millis(220)).await;
+    sse_body(b"data: first\n\n".to_vec())
+}
+
+#[tokio::test]
+async fn opens_codex_sse_before_slow_upstream_headers() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(delayed_headers_sse_provider)))
+            .await;
+    let proxy = proxy_with_route_and_options(
+        route(
+            &upstream,
+            "route-sse-early",
+            "model-sse-early",
+            vec![model("model-sse-early")],
+        ),
+        ProxyStartOptions {
+            sse_heartbeat_interval: Duration::from_millis(50),
+            ..ProxyStartOptions::default()
+        },
+    )
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("early SSE response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let mut body = response.bytes_stream();
+    let first = timeout(Duration::from_millis(150), body.next())
+        .await
+        .expect("created event arrived before upstream headers")
+        .expect("created item")
+        .expect("created bytes");
+    let first_text = String::from_utf8_lossy(&first);
+    assert_eq!(
+        sse_event_type(&first_text).as_deref(),
+        Some("response.created")
+    );
+
+    let mut all = first.to_vec();
+    while let Some(chunk) = body.next().await {
+        all.extend_from_slice(&chunk.expect("remaining SSE bytes"));
+    }
+    let text = String::from_utf8_lossy(&all);
+    assert!(
+        text.contains("response.keep_alive"),
+        "heartbeat should arrive while waiting for upstream headers: {text}"
+    );
+    assert!(
+        text.contains("data: first\n\n"),
+        "upstream event missing: {text}"
+    );
+    assert_eq!(text.matches("response.created").count(), 1);
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn crlf_live_text_provider() -> Response {
+    sse_body(
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello live\"}\r\n\r\n\
+data: {\"type\":\"response.completed\"}\r\n\r\n"
+            .to_vec(),
+    )
+}
+
+#[tokio::test]
+async fn forwards_crlf_live_text_as_commentary_without_waiting_for_completed() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(crlf_live_text_provider)))
+            .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-crlf",
+        "model-sse-crlf",
+        vec![model("model-sse-crlf")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-crlf",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("CRLF live text response");
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
+    assert!(text.contains("hello live"));
+    assert!(text.contains("\"phase\":\"commentary\""));
+    assert!(text.contains("response.completed"));
+    assert!(!text.contains('\r'));
 
     proxy.shutdown().await.unwrap();
 }
@@ -1129,7 +1260,10 @@ async fn does_not_insert_sse_heartbeats_in_the_middle_of_an_event() {
     while let Some(chunk) = body.next().await {
         all.extend_from_slice(&chunk.expect("SSE bytes"));
     }
-    assert_eq!(all, b"data: hello\n\n");
+    let text = String::from_utf8_lossy(&all);
+    assert_eq!(sse_event_type(&text).as_deref(), Some("response.created"));
+    assert!(text.contains("data: hello\n\n"));
+    assert!(!text.contains("response.keep_alive"));
 
     proxy.shutdown().await.unwrap();
 }
@@ -1190,17 +1324,86 @@ async fn records_mid_stream_failure_without_replaying_request() {
     let first = body
         .next()
         .await
-        .expect("partial stream item")
-        .expect("partial stream bytes");
-    assert_eq!(first.as_ref(), b"data: partial\n\n");
-    assert!(body.next().await.expect("stream error item").is_err());
+        .expect("created stream item")
+        .expect("created stream bytes");
+    let first_text = String::from_utf8_lossy(&first);
+    assert_eq!(
+        sse_event_type(&first_text).as_deref(),
+        Some("response.created")
+    );
+    let mut all = first.to_vec();
+    let mut saw_stream_error = false;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(bytes) => all.extend_from_slice(&bytes),
+            Err(_) => {
+                saw_stream_error = true;
+                break;
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&all);
+    assert_early_created(&text);
+    assert!(text.contains("data: partial\n\n"));
+    assert!(!saw_stream_error);
+    assert_eq!(sse_failed_message(&text), "upstream response stream failed");
     assert_eq!(state.hits.load(Ordering::Acquire), 1);
 
     let log = &proxy.request_logs()[0];
-    assert!(!log.stream_completed);
-    assert!(log.stream_error.is_some());
-    assert_eq!(log.response_bytes, first.len() as u64);
+    assert!(log.stream_completed);
+    assert_eq!(
+        log.stream_error.as_deref(),
+        Some("upstream response stream failed")
+    );
+    assert!(log.response_bytes >= b"data: partial\n\n".len() as u64);
     assert!(log.stream_duration_ms.is_some());
+
+    proxy.shutdown().await.unwrap();
+}
+
+async fn silent_close_sse_provider() -> Response {
+    sse_body(
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello live\"}\n\n".to_vec(),
+    )
+}
+
+#[tokio::test]
+async fn silent_upstream_close_emits_response_failed() {
+    let upstream =
+        TestServer::spawn(Router::new().route("/v1/responses", post(silent_close_sse_provider)))
+            .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-silent",
+        "model-sse-silent",
+        vec![model("model-sse-silent")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({"model": "ignored"}))
+        .send()
+        .await
+        .expect("silent close response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text = drain_sse(response).await;
+    assert_early_created(&text);
+    assert!(text.contains("hello live"));
+    assert_eq!(
+        sse_failed_message(&text),
+        "upstream closed the stream before completion"
+    );
+    assert!(!text.contains("response.completed"));
+
+    let log = &proxy.request_logs()[0];
+    assert!(log.stream_completed);
+    assert_eq!(
+        log.stream_error.as_deref(),
+        Some("upstream closed the stream before completion")
+    );
 
     proxy.shutdown().await.unwrap();
 }
@@ -1244,6 +1447,7 @@ async fn continue_with_tools_forces_tool_choice() {
         .await
         .expect("continue response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 1);
@@ -1265,6 +1469,7 @@ async fn continue_with_tools_forces_tool_choice() {
     let log = &proxy.request_logs()[0];
     assert_eq!(log.agent_guard.as_deref(), Some("force_tools"));
     assert_eq!(log.requested_model.as_deref(), Some("model-agent-loop"));
+    assert_eq!(log.display_name, "Display model-agent-loop");
 
     proxy.shutdown().await.unwrap();
 }
@@ -1311,6 +1516,7 @@ async fn continue_with_trailing_environment_context_forces_tool_choice() {
         .await
         .expect("continue env response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
     assert_eq!(capture.requests()[0].body["tool_choice"], "required");
     assert_eq!(
         proxy.request_logs()[0].agent_guard.as_deref(),
@@ -1354,6 +1560,7 @@ async fn tool_result_followup_does_not_force_tool_choice() {
         .await
         .expect("tool result response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
     assert!(capture.requests()[0].body.get("tool_choice").is_none());
     assert_eq!(
         proxy.request_logs()[0].agent_guard.as_deref(),
@@ -1395,6 +1602,7 @@ async fn greeting_with_tools_does_not_force_tool_choice() {
         .await
         .expect("greeting response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
 
     let body = &capture.requests()[0].body;
     assert!(body.get("tool_choice").is_none());
@@ -1458,6 +1666,85 @@ fn sse_event(value: Value) -> Vec<u8> {
     event.extend(serde_json::to_vec(&value).expect("sse json"));
     event.extend_from_slice(b"\n\n");
     event
+}
+
+fn sse_blocks(text: &str) -> Vec<&str> {
+    text.split("\n\n")
+        .map(str::trim_end)
+        .filter(|block| !block.is_empty())
+        .collect()
+}
+
+fn sse_event_type(block: &str) -> Option<String> {
+    if let Some(rest) = block.strip_prefix("event:") {
+        return rest.lines().next().map(|line| line.trim().to_string());
+    }
+    sse_event_json(block)?
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn sse_event_json(block: &str) -> Option<Value> {
+    let data = block.lines().find_map(|line| line.strip_prefix("data:"))?;
+    serde_json::from_str(data.trim()).ok()
+}
+
+fn assert_early_created(text: &str) -> String {
+    let created = sse_blocks(text)
+        .into_iter()
+        .find(|block| sse_event_type(block).as_deref() == Some("response.created"))
+        .expect("early response.created");
+    let id = sse_event_json(created)
+        .and_then(|json| {
+            json.pointer("/response/id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .expect("created response id");
+    assert!(
+        id.starts_with("resp_cps_"),
+        "expected local early response id, got {id}"
+    );
+    id
+}
+
+fn sse_failed_message(text: &str) -> String {
+    sse_blocks(text)
+        .into_iter()
+        .find_map(|block| {
+            (sse_event_type(block).as_deref() == Some("response.failed")).then(|| {
+                sse_event_json(block)
+                    .and_then(|json| {
+                        json.pointer("/response/error/message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default()
+            })
+        })
+        .expect("response.failed event")
+}
+
+async fn drain_sse(response: reqwest::Response) -> String {
+    let body = response.bytes().await.expect("SSE body");
+    String::from_utf8(body.to_vec()).expect("utf8 SSE")
+}
+
+fn completed_response_json(text: &str) -> Value {
+    sse_blocks(text)
+        .into_iter()
+        .rev()
+        .find_map(|block| {
+            (sse_event_type(block).as_deref() == Some("response.completed"))
+                .then(|| sse_event_json(block)?.get("response").cloned())
+                .flatten()
+        })
+        .expect("response.completed payload")
+}
+
+async fn responses_json(response: reqwest::Response) -> Value {
+    completed_response_json(&drain_sse(response).await)
 }
 
 fn sse_read_thread_args(text: &str) -> Vec<Value> {
@@ -1539,6 +1826,23 @@ fn tool_only_sse() -> Vec<u8> {
     })));
     body.extend(sse_event(
         json!({"type":"response.completed","response":{"id":"resp_tool12345"}}),
+    ));
+    body
+}
+
+fn bash_ls_sse() -> Vec<u8> {
+    let mut body = sse_event(json!({"type":"response.created","response":{"id":"resp_bash12345"}}));
+    body.extend(sse_event(json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_bash",
+            "arguments": "{\"cmd\":\"ls -la && find . -name '*.tsx'\"}"
+        }
+    })));
+    body.extend(sse_event(
+        json!({"type":"response.completed","response":{"id":"resp_bash12345"}}),
     ));
     body
 }
@@ -1678,6 +1982,14 @@ async fn tool_call_sse_provider(
     sse_body(tool_only_sse())
 }
 
+async fn bash_ls_sse_provider(
+    State(state): State<Arc<AgentSseState>>,
+    request: Request<Body>,
+) -> Response {
+    capture_sse_request(&state, request).await;
+    sse_body(bash_ls_sse())
+}
+
 async fn codex_app_mcp_sse_provider(
     State(state): State<Arc<AgentSseState>>,
     request: Request<Body>,
@@ -1732,9 +2044,10 @@ async fn sse_one_liner_without_tools_issues_one_continuation() {
         all.extend_from_slice(&chunk.expect("SSE bytes"));
     }
     let text = String::from_utf8(all.clone()).expect("utf8 SSE");
-    assert!(text.contains("resp_orig12345"));
+    let created_id = assert_early_created(&text);
+    assert!(!text.contains("resp_orig12345"));
     assert!(!text.contains("resp_cont99999"));
-    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert!(text.contains(&created_id));
     assert!(text.contains("function_call"));
     assert_eq!(text.matches("response.created").count(), 1);
     assert_eq!(text.matches("response.completed").count(), 1);
@@ -1798,8 +2111,98 @@ async fn sse_one_liner_from_output_item_done_issues_one_continuation() {
     let body = response.bytes().await.expect("SSE body");
     let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
     assert!(text.contains("function_call"));
+    assert_early_created(&text);
     assert_eq!(state.requests().len(), 2);
     assert!(proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_unfinished_plan_after_tool_result_still_nudges() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(collapse_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-plan-nudge",
+        "model-sse-plan-nudge",
+        vec![model("model-sse-plan-nudge")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-plan-nudge",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "把前端改成苹果风格"}]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Mode LastWriteTime Name"
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("plan-after-tools SSE response");
+
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("function_call"));
+    let requests = state.requests();
+    assert!(requests.len() >= 2);
+    assert!(proxy.request_logs()[0].agent_nudged);
+
+    proxy.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sse_rewrites_bash_ls_to_powershell() {
+    let state = Arc::new(AgentSseState::default());
+    let upstream = TestServer::spawn(
+        Router::new()
+            .route("/v1/responses", post(bash_ls_sse_provider))
+            .with_state(Arc::clone(&state)),
+    )
+    .await;
+    let proxy = proxy_with_route(route(
+        &upstream,
+        "route-sse-bash",
+        "model-sse-bash",
+        vec![model("model-sse-bash")],
+    ))
+    .await;
+
+    let response = no_redirect_client()
+        .post(format!("{}/responses", proxy.base_url()))
+        .bearer_auth(ENTRY_TOKEN)
+        .json(&json!({
+            "model": "model-sse-bash",
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "继续"}]
+            }]
+        }))
+        .send()
+        .await
+        .expect("bash SSE response");
+    let body = response.bytes().await.expect("SSE body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("Get-ChildItem"));
+    assert!(!text.contains("ls -la"));
+    assert!(!proxy.request_logs()[0].agent_nudged);
 
     proxy.shutdown().await.unwrap();
 }
@@ -2024,7 +2427,7 @@ async fn sse_nudge_keeps_original_previous_response_id() {
     let body = response.bytes().await.expect("SSE body");
     let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
     assert!(text.contains("function_call"));
-    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert_early_created(&text);
     let requests = state.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].body["previous_response_id"], "resp_prev12345");
@@ -2201,10 +2604,9 @@ async fn sse_third_one_liner_falls_back_to_chat_tool_calls() {
     let body = response.bytes().await.expect("SSE body");
     let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
     assert!(text.contains("function_call"));
-    assert!(text.contains("exec_command"));
-    assert!(text.contains("call_chat1"));
-    assert!(text.contains("resp_orig12345"));
-    assert!(!text.contains("对着现成截图改，不再空转。"));
+    let created_id = assert_early_created(&text);
+    assert!(!text.contains("resp_orig12345"));
+    assert!(text.contains(&created_id));
     assert_eq!(text.matches("response.created").count(), 1);
     assert_eq!(text.matches("response.completed").count(), 1);
 
@@ -2270,7 +2672,7 @@ async fn sse_failed_chat_fallback_emits_synthetic_tool_call() {
     assert!(text.contains("function_call"));
     assert!(text.contains("call_cps_synthetic"));
     assert!(text.contains("exec_command"));
-    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert_early_created(&text);
     let requests = state.requests();
     assert_eq!(
         requests
@@ -2332,7 +2734,7 @@ async fn sse_chat_422_emits_synthetic_tool_call() {
     let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
     assert!(text.contains("function_call"));
     assert!(text.contains("call_cps_synthetic"));
-    assert!(!text.contains("对着现成截图改，不再空转。"));
+    assert_early_created(&text);
     assert_eq!(
         state
             .requests()
@@ -2386,6 +2788,7 @@ async fn continue_without_tools_restores_cached_tools() {
         .await
         .expect("first response");
     assert_eq!(first.status(), StatusCode::OK);
+    let _ = drain_sse(first).await;
 
     let second = client
         .post(format!("{}/responses", proxy.base_url()))
@@ -2403,6 +2806,7 @@ async fn continue_without_tools_restores_cached_tools() {
         .await
         .expect("continue without tools");
     assert_eq!(second.status(), StatusCode::OK);
+    let _ = drain_sse(second).await;
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 2);
@@ -2463,8 +2867,15 @@ async fn never_follows_upstream_redirects() {
         .send()
         .await
         .expect("redirect response");
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(response.headers()[LOCATION], "/v1/redirect-target");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text =
+        String::from_utf8(response.bytes().await.expect("SSE body").to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
+    assert_eq!(
+        sse_failed_message(&text),
+        "upstream did not return an event stream"
+    );
     assert_eq!(state.source_hits.load(Ordering::Acquire), 1);
     assert_eq!(state.target_hits.load(Ordering::Acquire), 0);
 
@@ -2514,7 +2925,12 @@ async fn does_not_retry_non_transient_upstream_statuses() {
         .send()
         .await
         .expect("failure response");
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text =
+        String::from_utf8(response.bytes().await.expect("SSE body").to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
+    assert!(sse_failed_message(&text).contains("500"));
     assert_eq!(state.hits.load(Ordering::Acquire), 1);
 
     proxy.shutdown().await.unwrap();
@@ -2571,6 +2987,7 @@ async fn retries_transient_upstream_statuses_until_success() {
         .await
         .expect("eventual success response");
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_sse(response).await;
     assert_eq!(state.hits.load(Ordering::Acquire), 3);
     assert_eq!(proxy.request_logs()[0].retry_count, 2);
 
@@ -2608,10 +3025,6 @@ async fn json_unavailable() -> Response {
         .into_response()
 }
 
-fn error_message(body: &Value) -> &str {
-    body["error"]["message"].as_str().unwrap_or_default()
-}
-
 #[tokio::test]
 async fn html_upstream_errors_are_normalized_to_json() {
     let upstream =
@@ -2631,11 +3044,13 @@ async fn html_upstream_errors_are_normalized_to_json() {
         .send()
         .await
         .expect("html error response");
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body: Value = response.json().await.expect("json error body");
-    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text =
+        String::from_utf8(response.bytes().await.expect("SSE body").to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
     assert_eq!(
-        error_message(&body),
+        sse_failed_message(&text),
         "upstream provider returned 502 Bad Gateway"
     );
 
@@ -2661,11 +3076,13 @@ async fn cloudflare_html_blocks_are_normalized_to_json() {
         .send()
         .await
         .expect("cloudflare error response");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let body: Value = response.json().await.expect("json error body");
-    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text =
+        String::from_utf8(response.bytes().await.expect("SSE body").to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
     assert_eq!(
-        error_message(&body),
+        sse_failed_message(&text),
         "Cloudflare blocked the active provider (403 Forbidden)"
     );
 
@@ -2691,10 +3108,12 @@ async fn json_upstream_error_messages_are_preserved() {
         .send()
         .await
         .expect("json error response");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body: Value = response.json().await.expect("json error body");
-    assert_eq!(error_message(&body), "Service temporarily unavailable");
-    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text =
+        String::from_utf8(response.bytes().await.expect("SSE body").to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
+    assert_eq!(sse_failed_message(&text), "Service temporarily unavailable");
 
     proxy.shutdown().await.unwrap();
 }
@@ -2719,13 +3138,15 @@ async fn unreachable_upstream_returns_a_json_bad_gateway() {
         .send()
         .await
         .expect("dead upstream response");
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body: Value = response.json().await.expect("json error body");
-    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let text =
+        String::from_utf8(response.bytes().await.expect("SSE body").to_vec()).expect("utf8 SSE");
+    assert_early_created(&text);
     assert!(
-        error_message(&body).starts_with("the active provider"),
+        sse_failed_message(&text).starts_with("the active provider"),
         "unexpected gateway message: {}",
-        error_message(&body)
+        sse_failed_message(&text)
     );
 
     proxy.shutdown().await.unwrap();

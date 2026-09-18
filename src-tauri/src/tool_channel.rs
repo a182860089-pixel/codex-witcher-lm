@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -547,19 +548,28 @@ enum GrantAclOutcome {
     SkippedMissing,
 }
 
+const SANDBOX_ACL_ACCOUNTS: [&str; 4] = [
+    "CodexSandboxOffline",
+    "CodexSandboxOnline",
+    "Administrators",
+    "SYSTEM",
+];
+
 fn grant_sandbox_modify_acl(path: &Path) -> Result<GrantAclOutcome, String> {
     if !path.exists() {
         return Ok(GrantAclOutcome::SkippedMissing);
     }
 
-    // Root-only Full Control is enough for SetNamedSecurityInfo WRITE_DAC.
+    // One hidden icacls covers the common case. Fall back per-account if a
+    // principal is missing so a single unknown user cannot abort the repair.
+    match run_icacls_grant_many(path, &SANDBOX_ACL_ACCOUNTS) {
+        Ok(true) => return Ok(GrantAclOutcome::Granted),
+        Err(error) if error.contains("access denied") => return Err(error),
+        Ok(false) | Err(_) => {}
+    }
+
     let mut granted_any = false;
-    for account in [
-        "CodexSandboxOffline",
-        "CodexSandboxOnline",
-        "Administrators",
-        "SYSTEM",
-    ] {
+    for account in SANDBOX_ACL_ACCOUNTS {
         match run_icacls_grant(path, account) {
             Ok(true) => granted_any = true,
             Ok(false) => {}
@@ -573,14 +583,32 @@ fn grant_sandbox_modify_acl(path: &Path) -> Result<GrantAclOutcome, String> {
     }
 }
 
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn run_icacls_grant(path: &Path, account: &str) -> Result<bool, String> {
+    run_icacls_grant_many(path, &[account])
+}
+
+fn run_icacls_grant_many(path: &Path, accounts: &[&str]) -> Result<bool, String> {
     let path_text = path
         .to_str()
         .ok_or_else(|| "path is not valid UTF-8".to_string())?;
-    let output = Command::new("icacls")
-        .arg(path_text)
-        .arg("/grant:r")
-        .arg(format!("{account}:(OI)(CI)F"))
+    let mut command = hidden_command("icacls");
+    command.arg(path_text);
+    for account in accounts {
+        command.arg("/grant:r").arg(format!("{account}:(OI)(CI)F"));
+    }
+    let output = command
         .output()
         .map_err(|error| format!("无法运行 icacls：{error}"))?;
     if output.status.success() {
@@ -608,16 +636,16 @@ fn run_icacls_grant(path: &Path, account: &str) -> Result<bool, String> {
 fn sandbox_users_present() -> bool {
     #[cfg(windows)]
     {
-        Command::new("net")
-            .args(["user", "CodexSandboxOffline"])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-            || Command::new("net")
-                .args(["user", "CodexSandboxOnline"])
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            let output = hidden_command("net").args(["user"]).output().ok();
+            let Some(output) = output else {
+                return false;
+            };
+            let listing = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            listing.contains("codexsandboxoffline") || listing.contains("codexsandboxonline")
+        })
     }
     #[cfg(not(windows))]
     {
@@ -650,16 +678,20 @@ fn launch_elevated_acl_helper(codex_home: &Path, failing_paths: &[String]) -> Re
         .ok_or_else(|| "elevated script path is not valid UTF-8".to_string())?;
     let done_path = script_dir.join("repair-sandbox-acl-elevated.done");
     let _ = fs::remove_file(&done_path);
-    let status = Command::new("powershell")
+    let status = hidden_command("powershell")
         .args([
             "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             &format!(
-                "Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{script_arg}\"' | Out-Null"
+                "Start-Process -FilePath powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{script_arg}\"' | Out-Null"
             ),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|error| format!("无法启动 UAC：{error}"))?;
     if !status.success() {
@@ -695,13 +727,24 @@ fn build_elevated_acl_script(targets: &[PathBuf]) -> String {
     lines.push(")".to_string());
     lines.push(
         r#"
+function Invoke-Hidden([string]$File, [string]$Arguments) {
+  $info = New-Object System.Diagnostics.ProcessStartInfo
+  $info.FileName = $File
+  $info.Arguments = $Arguments
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  $info.RedirectStandardOutput = $true
+  $info.RedirectStandardError = $true
+  $proc = [System.Diagnostics.Process]::Start($info)
+  if ($proc) { [void]$proc.WaitForExit() }
+}
 foreach ($target in $targets) {
   if (-not (Test-Path -LiteralPath $target)) { continue }
   # Root-only: sandbox setup only needs WRITE_DAC on the workspace directory.
-  takeown /F $target /A | Out-Null
-  icacls $target /grant:r "${me}:(OI)(CI)F" | Out-Null
+  Invoke-Hidden 'takeown.exe' "/F `"$target`" /A"
+  Invoke-Hidden 'icacls.exe' "`"$target`" /grant:r `"${me}:(OI)(CI)F`""
   foreach ($account in $accounts) {
-    icacls $target /grant:r "${account}:(OI)(CI)F" | Out-Null
+    Invoke-Hidden 'icacls.exe' "`"$target`" /grant:r `"${account}:(OI)(CI)F`""
   }
 }
 $setup = Join-Path $env:USERPROFILE '.codex\.sandbox\setup_error.json'
