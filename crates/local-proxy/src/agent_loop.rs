@@ -1606,7 +1606,8 @@ impl FollowupFilter {
             return event.to_vec();
         };
         let kind = json.get("type").and_then(Value::as_str).unwrap_or("");
-        let changed = if kind.contains("output_text.delta") || kind == "response.output_text.delta" {
+        let changed = if kind.contains("output_text.delta") || kind == "response.output_text.delta"
+        {
             rewrite_delta(&mut json, self)
         } else if kind.contains("output_item") {
             rewrite_message_text(&mut json)
@@ -1681,7 +1682,10 @@ fn rewrite_delta(json: &mut Value, filter: &mut FollowupFilter) -> bool {
 
 fn rewrite_message_text(json: &mut Value) -> bool {
     let mut changed = false;
-    if let Some(items) = json.pointer_mut("/item/content").and_then(Value::as_array_mut) {
+    if let Some(items) = json
+        .pointer_mut("/item/content")
+        .and_then(Value::as_array_mut)
+    {
         for item in items {
             changed |= rewrite_output_text_item(item);
         }
@@ -1706,7 +1710,10 @@ fn rewrite_output_text_item(item: &mut Value) -> bool {
 }
 
 fn sanitize_followup_text_once(input: &str, kept: &mut usize) -> String {
-    let mut filter = FollowupFilter { carry: String::new(), kept: *kept };
+    let mut filter = FollowupFilter {
+        carry: String::new(),
+        kept: *kept,
+    };
     let mut out = filter.push(input);
     let tail = std::mem::take(&mut filter.carry);
     if !tail.contains(FOLLOWUP_MARKER) {
@@ -1717,7 +1724,11 @@ fn sanitize_followup_text_once(input: &str, kept: &mut usize) -> String {
 }
 
 fn followup_prefix_hold(text: &str) -> usize {
-    let patterns = [":codex-followup[", "- :codex-followup[", "* :codex-followup["];
+    let patterns = [
+        ":codex-followup[",
+        "- :codex-followup[",
+        "* :codex-followup[",
+    ];
     let bytes = text.as_bytes();
     let mut best = 0usize;
     for pattern in patterns {
