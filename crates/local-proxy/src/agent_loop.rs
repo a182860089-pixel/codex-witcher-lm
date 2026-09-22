@@ -1581,6 +1581,222 @@ fn text_from_content(content: &Value) -> String {
     }
 }
 
+const FOLLOWUP_MARKER: &str = ":codex-followup[";
+const MAX_CODEX_FOLLOWUPS: usize = 3;
+
+/// Codex only renders `:codex-followup[label]{...}` as suggestion chips when
+/// the directive is its own line. Grok often emits dozens of them as a
+/// Markdown bullet list, which the desktop UI draws as a broken wall of bullets.
+pub fn sanitize_followup_text(input: &str) -> String {
+    let mut filter = FollowupFilter::default();
+    let mut out = filter.push(input);
+    out.push_str(&filter.finish());
+    out
+}
+
+#[derive(Default)]
+pub struct FollowupFilter {
+    carry: String,
+    kept: usize,
+}
+
+impl FollowupFilter {
+    pub fn rewrite_event(&mut self, event: &[u8]) -> Vec<u8> {
+        let Some(mut json) = sse_data_json(event) else {
+            return event.to_vec();
+        };
+        let kind = json.get("type").and_then(Value::as_str).unwrap_or("");
+        let changed = if kind.contains("output_text.delta") || kind == "response.output_text.delta" {
+            rewrite_delta(&mut json, self)
+        } else if kind.contains("output_item") {
+            rewrite_message_text(&mut json)
+        } else {
+            false
+        };
+        if !changed {
+            return event.to_vec();
+        }
+        rebuild_sse_event(event, &json)
+    }
+
+    fn push(&mut self, chunk: &str) -> String {
+        self.carry.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            let Some(idx) = self.carry.find(FOLLOWUP_MARKER) else {
+                let hold = followup_prefix_hold(&self.carry);
+                let emit_to = self.carry.len().saturating_sub(hold);
+                out.push_str(&self.carry[..emit_to]);
+                self.carry.replace_range(..emit_to, "");
+                break;
+            };
+            let prose_end = strip_list_marker_len(&self.carry[..idx]);
+            out.push_str(&self.carry[..prose_end]);
+            match take_followup(&self.carry[idx..]) {
+                Some((directive, consumed)) => {
+                    if self.kept < MAX_CODEX_FOLLOWUPS {
+                        if !out.ends_with('\n') && !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(&directive);
+                        out.push('\n');
+                        self.kept += 1;
+                    }
+                    let drop_to = idx + consumed;
+                    self.carry.replace_range(..drop_to, "");
+                }
+                None => {
+                    self.carry.replace_range(..prose_end, "");
+                    if self.carry.len() > 12_000 {
+                        out.push_str(&self.carry);
+                        self.carry.clear();
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        let mut rest = std::mem::take(&mut self.carry);
+        if rest.contains(FOLLOWUP_MARKER) {
+            rest = sanitize_followup_text_once(&rest, &mut self.kept);
+        }
+        rest
+    }
+}
+
+fn rewrite_delta(json: &mut Value, filter: &mut FollowupFilter) -> bool {
+    let Some(delta) = json.get("delta").and_then(Value::as_str) else {
+        return false;
+    };
+    let cleaned = filter.push(delta);
+    if cleaned == delta {
+        return false;
+    }
+    json["delta"] = json!(cleaned);
+    true
+}
+
+fn rewrite_message_text(json: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(items) = json.pointer_mut("/item/content").and_then(Value::as_array_mut) {
+        for item in items {
+            changed |= rewrite_output_text_item(item);
+        }
+    }
+    changed
+}
+
+fn rewrite_output_text_item(item: &mut Value) -> bool {
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind != "output_text" && kind != "text" {
+        return false;
+    }
+    let Some(text) = item.get("text").and_then(Value::as_str) else {
+        return false;
+    };
+    let cleaned = sanitize_followup_text(text);
+    if cleaned == text {
+        return false;
+    }
+    item["text"] = json!(cleaned);
+    true
+}
+
+fn sanitize_followup_text_once(input: &str, kept: &mut usize) -> String {
+    let mut filter = FollowupFilter { carry: String::new(), kept: *kept };
+    let mut out = filter.push(input);
+    let tail = std::mem::take(&mut filter.carry);
+    if !tail.contains(FOLLOWUP_MARKER) {
+        out.push_str(&tail);
+    }
+    *kept = filter.kept;
+    out
+}
+
+fn followup_prefix_hold(text: &str) -> usize {
+    let patterns = [":codex-followup[", "- :codex-followup[", "* :codex-followup["];
+    let bytes = text.as_bytes();
+    let mut best = 0usize;
+    for pattern in patterns {
+        let pattern = pattern.as_bytes();
+        let max = pattern.len().min(bytes.len());
+        for len in 1..=max {
+            if bytes[bytes.len() - len..] == pattern[..len] && len > best {
+                best = len;
+            }
+        }
+    }
+    best
+}
+
+fn strip_list_marker_len(before: &str) -> usize {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    let bytes = trimmed.as_bytes();
+    if let Some(last) = bytes.last() {
+        if *last == b'-' || *last == b'*' {
+            let marker_at = trimmed.len() - 1;
+            let line_start = trimmed.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+            let prefix = &trimmed[line_start..marker_at];
+            if prefix.chars().all(|ch| ch == ' ' || ch == '\t') {
+                return line_start;
+            }
+        }
+    }
+    before.len()
+}
+
+fn take_followup(input: &str) -> Option<(String, usize)> {
+    let rest = input.strip_prefix(FOLLOWUP_MARKER)?;
+    let title_end = rest.find(']')?;
+    let title = &rest[..title_end];
+    if title.contains('\n') {
+        return None;
+    }
+    let after = &rest[title_end + 1..];
+    let body_len = followup_body_len(after)?;
+    let body = &after[..body_len];
+    let consumed = FOLLOWUP_MARKER.len() + title_end + 1 + body_len;
+    Some((format!("{FOLLOWUP_MARKER}{title}]{body}"), consumed))
+}
+
+fn followup_body_len(input: &str) -> Option<usize> {
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '{' {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in chars {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn sse_data_json(event: &[u8]) -> Option<Value> {
     let mut data = Vec::new();
     for line in event.split(|byte| *byte == b'\n') {
@@ -2191,6 +2407,18 @@ mod tests {
         assert!(instructions.contains("function_call"));
         assert!(!instructions.contains("read_mcp_resource"));
         assert!(instructions.contains("apply_patch"));
+    }
+
+    #[test]
+    fn followup_bullets_collapse_to_three_chips() {
+        let input = "别踩的坑\n\n- 这把 SK 是 Grok 分组。\n- :codex-followup[直接热更 r8]{prompt=\"做 r8\"}\n- :codex-followup[只做 SQL]{prompt=\"只改 SQL\"}\n- :codex-followup[映射到 4.6]{prompt=\"先映射\"}\n- :codex-followup[再探 176]{prompt=\"探测上游\"}\n";
+        let cleaned = sanitize_followup_text(input);
+        assert!(cleaned.contains("别踩的坑"));
+        assert!(cleaned.contains("这把 SK 是 Grok 分组"));
+        assert_eq!(cleaned.matches(":codex-followup[").count(), 3);
+        assert!(!cleaned.contains("- :codex-followup"));
+        assert!(!cleaned.contains("再探 176"));
+        assert!(cleaned.contains(":codex-followup[直接热更 r8]{prompt=\"做 r8\"}"));
     }
 
     #[test]

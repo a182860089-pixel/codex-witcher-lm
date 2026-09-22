@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
     IF_NONE_MATCH, RETRY_AFTER, USER_AGENT,
@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
-const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_MAX_PINNED_TURNS: usize = 4_096;
 const DEFAULT_MAX_PINNED_THREADS: usize = 4_096;
 const BINDINGS_SCHEMA_VERSION: u32 = 1;
@@ -684,6 +684,7 @@ impl LocalProxy {
             .route("/v1/responses", post(responses_handler))
             .route("/responses/compact", post(compact_handler))
             .route("/v1/responses/compact", post(compact_handler))
+            .layer(DefaultBodyLimit::max(options.max_request_bytes))
             .with_state(Arc::clone(&state));
 
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -1574,9 +1575,22 @@ fn with_codex_client_facade_models(
 
 fn outbound_model(route: &RouteConfig, requested: Option<&str>) -> String {
     match requested {
-        Some(model) if should_rewrite_client_model(model) => route.selected_model.clone(),
+        // A saved catalog id is an explicit choice, including a real gpt-5.6-sol.
+        // Rewriting it to the switcher's last grok selection hides the model the
+        // user picked in Codex and sends an id the upstream channel may not serve.
         Some(model) if route.contains_model(model) => model.to_string(),
+        Some(model) if should_rewrite_client_model(model) => route.selected_model.clone(),
         _ => route.selected_model.clone(),
+    }
+}
+
+fn routing_detail(requested: Option<&str>, outbound: &str) -> String {
+    match requested {
+        Some(requested) if requested == outbound => {
+            format!("model {outbound} forwarded unchanged")
+        }
+        Some(requested) => format!("model rewritten from {requested} to {outbound}"),
+        None => format!("model defaulted to {outbound}"),
     }
 }
 
@@ -2137,7 +2151,17 @@ async fn fetch_upstream(mut fetch: FetchUpstream) -> Result<(reqwest::Response, 
                 let status = response.status();
                 let retry_after = retry_after_duration(response.headers());
                 let error_body = response.bytes().await.ok();
-                if fetch.retry_count as usize >= fetch.max_retries
+                let message = error_body
+                    .as_deref()
+                    .and_then(json_error_message)
+                    .or_else(|| {
+                        error_body
+                            .as_deref()
+                            .and_then(|body| html_error_message(status, body))
+                    })
+                    .unwrap_or_else(|| format!("upstream provider returned {status}"));
+                if is_terminal_model_error(&message)
+                    || fetch.retry_count as usize >= fetch.max_retries
                     || !wait_before_retry(
                         fetch.start,
                         fetch.retry_max_elapsed,
@@ -2148,15 +2172,6 @@ async fn fetch_upstream(mut fetch: FetchUpstream) -> Result<(reqwest::Response, 
                     )
                     .await
                 {
-                    let message = error_body
-                        .as_deref()
-                        .and_then(json_error_message)
-                        .or_else(|| {
-                            error_body
-                                .as_deref()
-                                .and_then(|body| html_error_message(status, body))
-                        })
-                        .unwrap_or_else(|| format!("upstream provider returned {status}"));
                     return Err(FetchError::Status {
                         status,
                         message,
@@ -2210,6 +2225,10 @@ fn record_fetch_error(
             message,
             retry_count,
         } => {
+            let detail = format!(
+                "Upstream returned retryable status {status} after {retry_count} retries; {}",
+                routing_detail(requested_model.as_deref(), &log_model)
+            );
             state.record_request_log(ProxyRequestLog {
                 id: log_id,
                 time: log_time,
@@ -2221,9 +2240,7 @@ fn record_fetch_error(
                 duration_ms: 0,
                 thread_id: log_thread_id,
                 error: Some(message.clone()),
-                details: Some(format!(
-                    "Upstream returned retryable status {status} after {retry_count} retries"
-                )),
+                details: Some(detail),
                 retry_count,
                 first_byte_ms: None,
                 response_bytes: 0,
@@ -2455,6 +2472,7 @@ fn new_sse_forward(
         nudge_template,
         nudge_headers,
         nudge_url,
+        followups: agent_loop::FollowupFilter::default(),
         token_usage: usage::TokenUsage::default(),
     };
     if early_created {
@@ -2539,7 +2557,10 @@ async fn stream_responses_early(
         duration_ms: 0,
         thread_id: log_thread_id.clone(),
         error: None,
-        details: Some("opened Codex SSE before upstream headers".to_string()),
+        details: Some(format!(
+            "opened Codex SSE before upstream headers; {}",
+            routing_detail(requested_model.as_deref(), &log_model)
+        )),
         retry_count: 0,
         first_byte_ms: Some(0),
         response_bytes: 0,
@@ -2938,6 +2959,7 @@ struct SseForward {
     live_text_forwarded: bool,
     continuation_id: Option<String>,
     held_messages: Vec<Vec<u8>>,
+    followups: agent_loop::FollowupFilter,
     nudge_template: Value,
     nudge_headers: HeaderMap,
     nudge_url: Url,
@@ -2969,6 +2991,7 @@ impl SseForward {
     fn ingest_sse_event(&mut self, mut event: Vec<u8>) {
         event = agent_loop::rewrite_apply_patch_event(&event);
         event = agent_loop::rewrite_exec_command_event(&event);
+        event = self.followups.rewrite_event(&event);
         if let Some(usage) = usage::extract_token_usage_from_sse(&event) {
             self.token_usage.merge(usage);
         }
@@ -3380,6 +3403,19 @@ impl SseForward {
             }
         });
     }
+}
+
+fn is_terminal_model_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("no available channel")
+        || lowered.contains("no available account")
+        || lowered.contains("model_not_found")
+        || lowered.contains("model not found")
+        || lowered.contains("unsupported model")
+        || lowered.contains("does not exist")
+        || message.contains("无可用")
+        || message.contains("没有可用")
+        || message.contains("模型不存在")
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
@@ -4070,11 +4106,23 @@ mod tests {
             token("upstream-token-for-tests"),
         )
         .unwrap();
-        assert_eq!(outbound_model(&route, Some("gpt-5.6-sol")), "grok-4.6");
+        assert_eq!(outbound_model(&route, Some("gpt-5.6-sol")), "gpt-5.6-sol");
         assert_eq!(outbound_model(&route, Some("gpt-5.4")), "grok-4.6");
         assert_eq!(outbound_model(&route, Some("model-a")), "model-a");
         assert_eq!(outbound_model(&route, Some("unknown")), "grok-4.6");
         assert_eq!(outbound_model(&route, None), "grok-4.6");
+        let facade_only = RouteConfig::new(
+            "route-facade",
+            "https://provider.example/v1",
+            "grok-4.6",
+            vec![ModelDescriptor::new("grok-4.6", "Grok 4.6")],
+            token("upstream-token-for-tests"),
+        )
+        .unwrap();
+        assert_eq!(
+            outbound_model(&facade_only, Some("gpt-5.6-sol")),
+            "grok-4.6"
+        );
     }
 
     #[test]
@@ -4120,7 +4168,7 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.summary().id, "route-grok");
         assert_eq!(fresh.summary().selected_model, "grok-4.6");
-        assert_eq!(outbound_model(&fresh, Some("gpt-5.6-sol")), "grok-4.6");
+        assert_eq!(outbound_model(&fresh, Some("gpt-5.6-sol")), "gpt-5.6-sol");
     }
 
     #[test]
@@ -4274,6 +4322,10 @@ mod tests {
             json_error_message(b"<html><body>Bad Gateway</body></html>"),
             None
         );
+        assert!(is_terminal_model_error(
+            "No available channel for model grok-4.7"
+        ));
+        assert!(!is_terminal_model_error("Service temporarily unavailable"));
         assert_eq!(
             html_error_message(
                 StatusCode::BAD_GATEWAY,

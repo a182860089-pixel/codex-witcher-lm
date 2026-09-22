@@ -110,7 +110,7 @@ redacted and never contain the keyring backend's detailed payload.
   `/responses` and `/responses/compact` for one turn from being split across
   providers.
 - The proxy overwrites the JSON `model` field with the active selection and
-  bounds request bodies to 16 MiB. Non-object or malformed JSON is rejected.
+  bounds request bodies to 1 GiB. Non-object or malformed JSON is rejected.
 - Remote upstreams require HTTPS; plain HTTP is allowed only for loopback
   providers. The client honors normal system proxy policy, uses HTTP/1.1
   only, follows no redirects, and disables automatic request retries.

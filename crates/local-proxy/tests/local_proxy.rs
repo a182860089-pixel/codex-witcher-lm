@@ -856,7 +856,7 @@ async fn gpt_client_facade_requests_are_rewritten_to_the_selected_model() {
 
     let requests = capture.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].body["model"], "grok-4.6");
+    assert_eq!(requests[0].body["model"], "gpt-5.6-sol");
 
     proxy.shutdown().await.unwrap();
 }
@@ -932,7 +932,7 @@ async fn switching_away_from_a_pinned_gpt_route_keeps_the_old_thread() {
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].body["model"], "gpt-5.6-sol");
     assert_eq!(requests[1].body["model"], "gpt-5.6-sol");
-    assert_eq!(requests[2].body["model"], "grok-4.6");
+    assert_eq!(requests[2].body["model"], "gpt-5.6-sol");
 
     proxy.shutdown().await.unwrap();
 }

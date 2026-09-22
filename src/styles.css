@@ -3443,3 +3443,21 @@ textarea:focus-visible {
     transform: none;
   }
 }
+
+.diagnostics-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.diagnostics-log {
+  margin: 12px 0 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
+  color: inherit;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

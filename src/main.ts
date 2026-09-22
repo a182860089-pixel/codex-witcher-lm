@@ -803,6 +803,24 @@ app.innerHTML = `
             </div>
           </section>
 
+          <section class="settings-group" aria-labelledby="diagnostics-heading">
+            <div class="settings-group-heading">
+              <h3 id="diagnostics-heading">诊断日志</h3>
+              <p>记录 Codex 请求的模型、实际转发出去的模型、上游错误和重试。密钥不会写入这里。</p>
+            </div>
+            <div class="mode-summary">
+              <div class="diagnostics-copy">
+                <strong id="diagnostics-summary-title">尚未读取</strong>
+                <p id="diagnostics-summary-copy">打开本页后会显示最近的转发记录。grok-4.7 若返回 503，多半是中转渠道没有这个模型。</p>
+                <pre id="diagnostics-log" class="diagnostics-log" aria-label="诊断日志">正在等待日志…</pre>
+              </div>
+              <div class="mode-summary-actions">
+                <button id="diagnostics-refresh" class="button button-secondary" type="button">刷新日志</button>
+                <button id="diagnostics-download" class="button button-primary" type="button">下载诊断包</button>
+              </div>
+            </div>
+          </section>
+
           <aside class="privacy-note">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 3 5 6v5c0 4.7 2.9 8 7 10 4.1-2 7-5.3 7-10V6l-7-3Z" />
@@ -1237,6 +1255,12 @@ required<HTMLButtonElement>("#insp-clear-logs").addEventListener("click", () => 
 required<HTMLButtonElement>("#insp-refresh").addEventListener("click", () => {
   void fetchProxyRequestLogs();
 });
+required<HTMLButtonElement>("#diagnostics-refresh").addEventListener("click", () => {
+  void fetchProxyRequestLogs();
+});
+required<HTMLButtonElement>("#diagnostics-download").addEventListener("click", () => {
+  downloadDiagnosticLogs();
+});
 required<HTMLButtonElement>("#inspector-detail-close").addEventListener("click", () => {
   closeInspectorDetail();
 });
@@ -1473,6 +1497,8 @@ function switchAppPage(page: AppPage): void {
   } else if (page === "inspector") {
     renderInspectorPage();
     void fetchProxyRequestLogs();
+  } else if (page === "advanced") {
+    void fetchProxyRequestLogs().then(() => renderDiagnosticLogs());
   }
 
   required<HTMLElement>(".content-scroll").scrollTo({
@@ -2307,6 +2333,7 @@ async function fetchProxyRequestLogs(): Promise<void> {
         selectedLogId = null;
       }
       refreshInspectorUi();
+      renderDiagnosticLogs();
     }
   } catch (e) {
     console.warn("Failed to load proxy request logs:", e);
@@ -2438,10 +2465,82 @@ function renderInspectorPage(): void {
 }
 
 function refreshInspectorUi(): void {
-  if (required<HTMLElement>("#inspector-view").hidden) return;
-  renderInspectorPage();
-  const dialog = document.querySelector<HTMLDialogElement>("#inspector-detail");
-  if (dialog?.open) renderInspectorDetail();
+  if (!required<HTMLElement>("#inspector-view").hidden) {
+    renderInspectorPage();
+    const dialog = document.querySelector<HTMLDialogElement>("#inspector-detail");
+    if (dialog?.open) renderInspectorDetail();
+  }
+  if (!required<HTMLElement>("#advanced-settings").hidden) renderDiagnosticLogs();
+}
+
+function diagnosticLine(item: RequestLogItem): string {
+  const requested = item.requestedModel || "—";
+  const outbound = item.model || "—";
+  const route = requested === outbound ? "原样转发" : `改写 ${requested} → ${outbound}`;
+  const error = item.error || item.streamError || "";
+  return [
+    formatCallTime(item.startedAtMs, item.time),
+    inspectorRowKind(item),
+    `HTTP ${item.status}`,
+    route,
+    `耗时 ${formatCallDuration(item)} ms`,
+    `重试 ${item.retryCount ?? 0}`,
+    error ? `错误 ${error}` : "",
+    item.details || "",
+  ].filter(Boolean).join(" | ");
+}
+
+function renderDiagnosticLogs(): void {
+  const title = document.querySelector<HTMLElement>("#diagnostics-summary-title");
+  const copy = document.querySelector<HTMLElement>("#diagnostics-summary-copy");
+  const log = document.querySelector<HTMLElement>("#diagnostics-log");
+  if (!log) return;
+  const items = requestLogs.slice(0, 80);
+  const errors = items.filter((item) => inspectorRowKind(item) === "error").length;
+  const rewritten = items.filter((item) => item.requestedModel && item.requestedModel !== item.model).length;
+  if (title) title.textContent = items.length === 0 ? "还没有转发记录" : `最近 ${items.length} 条，异常 ${errors}，模型被改写 ${rewritten}`;
+  if (copy) {
+    copy.textContent = rewritten > 0
+      ? "Codex 请求的模型和实际上游模型不一致。目录里已有的模型现在会原样转发，不再改成上一次选中的 grok。"
+      : "每一行是一次本地转发。Codex 请求模型与上游模型相同，表示没有被改写。";
+  }
+  log.textContent = items.length === 0
+    ? "暂无日志。在 Codex 里发一条消息后再刷新。"
+    : items.map(diagnosticLine).join("\n");
+}
+
+function downloadDiagnosticLogs(): void {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const body = [
+    "LM Codex Switch diagnostic log",
+    `exported ${new Date().toISOString()}`,
+    "API keys are not included.",
+    "",
+    ...requestLogs.map(diagnosticLine),
+    "",
+    "JSON",
+    JSON.stringify(requestLogs.map((item) => ({
+      id: item.id,
+      time: formatCallTime(item.startedAtMs, item.time),
+      requestedModel: item.requestedModel || null,
+      outboundModel: item.model,
+      status: item.status,
+      error: item.error || null,
+      streamError: item.streamError || null,
+      retryCount: item.retryCount || 0,
+      durationMs: item.streamDurationMs ?? item.durationMs,
+      reasoningEffort: item.reasoningEffort || null,
+      finishReason: item.finishReason || null,
+      details: item.details || null,
+    })), null, 2),
+  ].join("\n");
+  const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `lm-codex-switch-diagnostics-${stamp}.txt`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+  setStatus("已下载诊断日志。", "info");
 }
 
 function inspectorPagerMarkup(total: number, pageCount: number): string {
@@ -2509,6 +2608,8 @@ function renderInspectorDetail(): void {
     "<div class=\"meta-row\"><span>接入供应商</span><strong>" + escapeHtml(item.provider) + "</strong></div>" +
     "<div class=\"meta-row\"><span>显示名称</span><strong>" + escapeHtml(displayNameForLog(item)) + "</strong></div>" +
     "<div class=\"meta-row\"><span>模型名称</span><strong>" + escapeHtml(item.model) + "</strong></div>" +
+    "<div class=\"meta-row\"><span>Codex 请求模型</span><strong>" + escapeHtml(item.requestedModel || "未提供") + "</strong></div>" +
+    (item.error ? "<div class=\"meta-row\"><span>上游错误</span><strong class=\"text-danger\">" + escapeHtml(item.error) + "</strong></div>" : "") +
     "<div class=\"meta-row\"><span>路由</span><strong>" + escapeHtml(routeLabel()) + "</strong></div>" +
     "<div class=\"meta-row\"><span>思考强度</span><strong>" + escapeHtml(reasoningEffortLabel(item.reasoningEffort)) + "</strong></div>" +
     "<div class=\"meta-row\"><span>Fast</span><strong>" + (isFastCall(item) ? "是" : "否") + "</strong></div>" +
